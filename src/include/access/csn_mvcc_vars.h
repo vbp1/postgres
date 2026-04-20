@@ -21,6 +21,7 @@ extern void AdvanceNextCommitSeqNoPast(CommitSeqNo csn);
 
 extern TransactionId ReadCSNOldestActiveXid(void);
 extern void SetCSNOldestActiveXid(TransactionId xid);
+extern void SetCSNOldestActiveXidIfEarlier(TransactionId xid);
 extern void AdvanceCSNOldestActiveXid(TransactionId xid);
 
 #endif							/* CSN_MVCC_VARS_H */

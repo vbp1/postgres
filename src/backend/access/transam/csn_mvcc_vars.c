@@ -80,6 +80,10 @@ ReadCSNOldestActiveXid(void)
 {
 	TransactionId xid;
 
+	if (LWLockHeldByMeInMode(ProcArrayLock, LW_SHARED) ||
+		LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE))
+		return TransamVariables->csnOldestActiveXid;
+
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 	xid = TransamVariables->csnOldestActiveXid;
 	LWLockRelease(ProcArrayLock);
@@ -92,8 +96,34 @@ SetCSNOldestActiveXid(TransactionId xid)
 {
 	Assert(!TransactionIdIsValid(xid) || TransactionIdIsNormal(xid));
 
+	if (LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE))
+	{
+		TransamVariables->csnOldestActiveXid = xid;
+		return;
+	}
+
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	TransamVariables->csnOldestActiveXid = xid;
+	LWLockRelease(ProcArrayLock);
+}
+
+void
+SetCSNOldestActiveXidIfEarlier(TransactionId xid)
+{
+	Assert(TransactionIdIsNormal(xid));
+
+	if (LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE))
+	{
+		if (!TransactionIdIsValid(TransamVariables->csnOldestActiveXid) ||
+			TransactionIdPrecedes(xid, TransamVariables->csnOldestActiveXid))
+			TransamVariables->csnOldestActiveXid = xid;
+		return;
+	}
+
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	if (!TransactionIdIsValid(TransamVariables->csnOldestActiveXid) ||
+		TransactionIdPrecedes(xid, TransamVariables->csnOldestActiveXid))
+		TransamVariables->csnOldestActiveXid = xid;
 	LWLockRelease(ProcArrayLock);
 }
 

@@ -58,7 +58,10 @@ xids or for code paths that are explicitly outside Stage 1 scope.
 `oldest_active_xid` in Stage 1 does not replace existing procarray, GlobalVis,
 or nonremovable-horizon machinery.  Vacuum, pruning, index recycling, and
 related cleanup horizons continue to use existing procarray + GlobalVis
-contracts unless a later phase explicitly migrates them.
+contracts unless a later phase explicitly migrates them.  Phase F may keep
+the prototype-owned lower bound synchronized with backend lifecycle events so
+that `csnlog` can stay conservative, but it must not become an input to vacuum
+or horizon selection.
 
 
 Subxid Decision for the Prototype
@@ -291,6 +294,11 @@ Cleanup and nonremovable-horizon consumers remain on existing legacy horizon
 semantics in Stage 1, including `pruneheap.c`, `nbtpage.c`, vacuum/index
 recycling, and related GlobalVis users, unless a later phase explicitly
 migrates them.
+
+In particular, Phase F keeps `csnOldestActiveXid` as a CSN-local bookkeeping
+bound only.  It is not the authoritative source for `GetOldestNonRemovable`
+style decisions, and it must not change vacuum, pruning, or standby/recovery
+cleanup semantics.
 
 This boundary is deliberate.  The first commit should introduce a designable,
 compile-ready foundation without changing SQL-visible behavior.

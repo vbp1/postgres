@@ -290,6 +290,12 @@ GetNewTransactionId(bool isSubXact)
 
 	LWLockRelease(XidGenLock);
 
+	if (!isSubXact)
+	{
+		/* Initialize or tighten the prototype-owned CSN lower bound. */
+		SetCSNOldestActiveXidIfEarlier(xid);
+	}
+
 	return full_xid;
 }
 

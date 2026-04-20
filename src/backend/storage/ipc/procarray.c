@@ -47,6 +47,7 @@
 
 #include <signal.h>
 
+#include "access/csn_mvcc_vars.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -381,6 +382,7 @@ static inline void ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId l
 static void ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid);
 static void MaintainLatestCompletedXid(TransactionId latestXid);
 static void MaintainLatestCompletedXidRecovery(TransactionId latestXid);
+static void RecomputeCSNOldestActiveXid(void);
 
 static inline FullTransactionId FullXidRelativeTo(FullTransactionId rel,
 												  TransactionId xid);
@@ -637,6 +639,8 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 		allProcs[procno].pgxactoff = index;
 	}
 
+	RecomputeCSNOldestActiveXid();
+
 	/*
 	 * Release in reversed acquisition order, to reduce frequency of having to
 	 * wait for XidGenLock while holding ProcArrayLock.
@@ -680,6 +684,7 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		if (LWLockConditionalAcquire(ProcArrayLock, LW_EXCLUSIVE))
 		{
 			ProcArrayEndTransactionInternal(proc, latestXid);
+			RecomputeCSNOldestActiveXid();
 			LWLockRelease(ProcArrayLock);
 		}
 		else
@@ -860,6 +865,8 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 		nextidx = pg_atomic_read_u32(&nextproc->procArrayGroupNext);
 	}
 
+	RecomputeCSNOldestActiveXid();
+
 	/* We're done with the lock now. */
 	LWLockRelease(ProcArrayLock);
 
@@ -935,6 +942,7 @@ ProcArrayClearTransaction(PGPROC *proc)
 	 * because it might not count the prepared transaction as running.
 	 */
 	TransamVariables->xactCompletionCount++;
+	RecomputeCSNOldestActiveXid();
 
 	/* Clear the subtransaction-XID cache too */
 	Assert(ProcGlobal->subxidStates[pgxactoff].count == proc->subxidStatus.count &&
@@ -1001,6 +1009,40 @@ MaintainLatestCompletedXidRecovery(TransactionId latestXid)
 	}
 
 	Assert(FullTransactionIdIsNormal(TransamVariables->latestCompletedXid));
+}
+
+/*
+ * Recompute the prototype-owned CSN lower bound from the current ProcArray.
+ *
+ * This is deliberately conservative: the resulting lower bound must never be
+ * newer than any xid that could still be active on the primary.  We therefore
+ * scan the proc array under ProcArrayLock and keep the oldest xid we can see,
+ * falling back to latestCompletedXid + 1 when no active xid remains.
+ */
+static void
+RecomputeCSNOldestActiveXid(void)
+{
+	ProcArrayStruct *arrayP = procArray;
+	TransactionId oldestActiveXid;
+
+	Assert(LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE));
+
+	oldestActiveXid = XidFromFullTransactionId(TransamVariables->latestCompletedXid);
+	Assert(TransactionIdIsNormal(oldestActiveXid));
+	TransactionIdAdvance(oldestActiveXid);
+
+	for (int index = 0; index < arrayP->numProcs; index++)
+	{
+		TransactionId xid = UINT32_ACCESS_ONCE(ProcGlobal->xids[index]);
+
+		if (!TransactionIdIsValid(xid))
+			continue;
+
+		if (TransactionIdPrecedes(xid, oldestActiveXid))
+			oldestActiveXid = xid;
+	}
+
+	SetCSNOldestActiveXid(oldestActiveXid);
 }
 
 /*
