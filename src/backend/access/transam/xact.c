@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
+#include "access/csn_mvcc_vars.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
 #include "access/subtrans.h"
@@ -710,8 +711,14 @@ AssignTransactionId(TransactionState s)
 		XactTopFullTransactionId = s->fullTransactionId;
 
 	if (isSubXact)
+	{
 		SubTransSetParent(XidFromFullTransactionId(s->fullTransactionId),
 						  XidFromFullTransactionId(s->parent->fullTransactionId));
+		SubTransactionIdSetCSNParent(XidFromFullTransactionId(s->fullTransactionId),
+									 XidFromFullTransactionId(s->parent->fullTransactionId));
+	}
+	else
+		TransactionIdSetCSNInProgress(XidFromFullTransactionId(s->fullTransactionId));
 
 	/*
 	 * If it's a top-level transaction, the predicate locking system needs to
@@ -1357,6 +1364,7 @@ RecordTransactionCommit(void)
 	SharedInvalidationMessage *invalMessages = NULL;
 	bool		RelcacheInitFileInval = false;
 	bool		wrote_xlog;
+	CommitSeqNo commitSeqNo = InvalidCommitSeqNo;
 
 	/*
 	 * Log pending invalidations for logical decoding of in-progress
@@ -1478,6 +1486,9 @@ RecordTransactionCommit(void)
 		 */
 		pg_write_barrier();
 
+		TransactionIdSetCSNCommitting(xid);
+		commitSeqNo = GetNewCommitSeqNo();
+
 		/*
 		 * Insert the commit XLOG record.
 		 */
@@ -1547,7 +1558,10 @@ RecordTransactionCommit(void)
 		 * Now we may update the CLOG, if we wrote a COMMIT record above
 		 */
 		if (markXidCommitted)
+		{
+			TransactionIdSetCSNCommittedTree(xid, nchildren, children, commitSeqNo);
 			TransactionIdCommitTree(xid, nchildren, children);
+		}
 	}
 	else
 	{
@@ -1570,7 +1584,10 @@ RecordTransactionCommit(void)
 		 * flushed before the CLOG may be updated.
 		 */
 		if (markXidCommitted)
+		{
+			TransactionIdSetCSNCommittedTree(xid, nchildren, children, commitSeqNo);
 			TransactionIdAsyncCommitTree(xid, nchildren, children, XactLastRecEnd);
+		}
 	}
 
 	/*
@@ -1881,6 +1898,8 @@ RecordTransactionAbort(bool isSubXact)
 	 */
 	if (!isSubXact)
 		XLogSetAsyncXactLSN(XactLastRecEnd);
+
+	TransactionIdSetCSNAbortedTree(xid, nchildren, children);
 
 	/*
 	 * Mark the transaction aborted in clog.  This is not absolutely necessary
@@ -6185,6 +6204,7 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 {
 	TransactionId max_xid;
 	TimestampTz commit_time;
+	CommitSeqNo commitSeqNo;
 
 	Assert(TransactionIdIsValid(xid));
 
@@ -6192,6 +6212,8 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 
 	/* Make sure nextXid is beyond any XID mentioned in the record. */
 	AdvanceNextFullTransactionIdPastXid(max_xid);
+	TransactionIdSetCSNCommitting(xid);
+	commitSeqNo = GetNewCommitSeqNo();
 
 	Assert(((parsed->xinfo & XACT_XINFO_HAS_ORIGIN) == 0) ==
 		   (origin_id == InvalidReplOriginId));
@@ -6210,6 +6232,8 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		/*
 		 * Mark the transaction committed in pg_xact.
 		 */
+		TransactionIdSetCSNCommittedTree(xid, parsed->nsubxacts,
+										 parsed->subxacts, commitSeqNo);
 		TransactionIdCommitTree(xid, parsed->nsubxacts, parsed->subxacts);
 	}
 	else
@@ -6234,6 +6258,8 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		 * bits set on changes made by transactions that haven't yet
 		 * recovered. It's unlikely but it's good to be safe.
 		 */
+		TransactionIdSetCSNCommittedTree(xid, parsed->nsubxacts,
+										 parsed->subxacts, commitSeqNo);
 		TransactionIdAsyncCommitTree(xid, parsed->nsubxacts, parsed->subxacts, lsn);
 
 		/*
@@ -6344,6 +6370,7 @@ xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
 								  parsed->nsubxacts,
 								  parsed->subxacts);
 	AdvanceNextFullTransactionIdPastXid(max_xid);
+	TransactionIdSetCSNAbortedTree(xid, parsed->nsubxacts, parsed->subxacts);
 
 	if (standbyState == STANDBY_DISABLED)
 	{

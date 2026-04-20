@@ -25,6 +25,8 @@ extern void StartupCSNLOG(TransactionId oldestActiveXID);
 extern void CheckPointCSNLOG(void);
 extern void ExtendCSNLOG(TransactionId newestXact);
 
+extern void CSNLogSetSubTransParent(TransactionId xid, TransactionId parentXid);
+extern bool CSNLogGetSubTransParent(TransactionId xid, TransactionId *parentXid);
 extern void TransactionIdSetCommitSeqNo(TransactionId xid, CommitSeqNo csn);
 extern bool TransactionIdGetCommitSeqNoIfAny(TransactionId xid, CommitSeqNo *csn);
 extern CommitSeqNo TransactionIdGetCommitSeqNo(TransactionId xid);

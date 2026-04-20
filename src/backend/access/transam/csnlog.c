@@ -4,8 +4,8 @@
  *		Stage 1 CSN log storage manager
  *
  * This module provides a conservative, non-WAL-backed SLRU skeleton for
- * xid-to-CSN storage.  It does not claim crash-safe semantics and does not
- * yet participate in commit-path publication.
+ * xid-to-CSN storage.  It does not claim crash-safe semantics.  Runtime
+ * truncation and its retained-range bookkeeping remain deferred.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -41,6 +41,7 @@ TransactionIdToCSNPage(TransactionId xid)
 static bool CsnlogPagePrecedes(int64 page1, int64 page2);
 static int	csnlog_errdetail_for_io_error(const void *opaque_data);
 static bool TransactionIdInCSNLogRange(TransactionId xid);
+static int	CSNLogReadPageForWrite(int64 pageno, TransactionId xid);
 
 static SlruDesc CsnlogSlruDesc;
 
@@ -163,14 +164,41 @@ TransactionIdSetCommitSeqNo(TransactionId xid, CommitSeqNo csn)
 
 	lock = SimpleLruGetBankLock(CsnlogCtl, pageno);
 	LWLockAcquire(lock, LW_EXCLUSIVE);
-
-	slotno = SimpleLruReadPage(CsnlogCtl, pageno, true, &xid);
+	slotno = CSNLogReadPageForWrite(pageno, xid);
 	ptr = (CommitSeqNo *) CsnlogCtl->shared->page_buffer[slotno];
 	ptr += entryno;
 	*ptr = csn;
 	CsnlogCtl->shared->page_dirty[slotno] = true;
 
 	LWLockRelease(lock);
+}
+
+void
+CSNLogSetSubTransParent(TransactionId xid, TransactionId parentXid)
+{
+	Assert(TransactionIdIsNormal(xid));
+	Assert(TransactionIdIsNormal(parentXid));
+
+	TransactionIdSetCommitSeqNo(xid, CommitSeqNoFromSubTransParent(parentXid));
+}
+
+bool
+CSNLogGetSubTransParent(TransactionId xid, TransactionId *parentXid)
+{
+	CommitSeqNo csn;
+
+	Assert(parentXid != NULL);
+
+	*parentXid = InvalidTransactionId;
+
+	if (!TransactionIdGetCommitSeqNoIfAny(xid, &csn))
+		return false;
+	if (!CommitSeqNoIsSubTransParent(csn))
+		return false;
+
+	*parentXid = TransactionIdFromCommitSeqNoParent(csn);
+
+	return true;
 }
 
 bool
@@ -199,6 +227,37 @@ TransactionIdGetCommitSeqNoIfAny(TransactionId xid, CommitSeqNo *csn)
 	LWLockRelease(SimpleLruGetBankLock(CsnlogCtl, pageno));
 
 	return CommitSeqNoIsValid(*csn);
+}
+
+static int
+CSNLogReadPageForWrite(int64 pageno, TransactionId xid)
+{
+	SlruShared	shared = CsnlogCtl->shared;
+	int			bankno = pageno % CsnlogCtl->nbanks;
+	int			slots_per_bank = shared->num_slots / CsnlogCtl->nbanks;
+	int			bankstart = bankno * slots_per_bank;
+	int			bankend = bankstart + slots_per_bank;
+	int			slotno;
+
+	Assert(LWLockHeldByMeInMode(SimpleLruGetBankLock(CsnlogCtl, pageno),
+								LW_EXCLUSIVE));
+
+	/*
+	 * A csnlog page can be dirty in shared memory before its backing file
+	 * exists on disk. Re-zero only when the page is absent both from the SLRU
+	 * buffers and from disk.
+	 */
+	for (slotno = bankstart; slotno < bankend; slotno++)
+	{
+		if (shared->page_status[slotno] != SLRU_PAGE_EMPTY &&
+			shared->page_number[slotno] == pageno)
+			return SimpleLruReadPage(CsnlogCtl, pageno, true, &xid);
+	}
+
+	if (!SimpleLruDoesPhysicalPageExist(CsnlogCtl, pageno))
+		return SimpleLruZeroPage(CsnlogCtl, pageno);
+
+	return SimpleLruReadPage(CsnlogCtl, pageno, true, &xid);
 }
 
 CommitSeqNo

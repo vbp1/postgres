@@ -47,8 +47,9 @@
 #include <unistd.h>
 
 #include "access/clog.h"
-#include "access/csnlog.h"
 #include "access/commit_ts.h"
+#include "access/csn_mvcc_vars.h"
+#include "access/csnlog.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
@@ -5862,6 +5863,7 @@ StartupXLOG(void)
 	XLogRecPtr	abortedRecPtr;
 	XLogRecPtr	missingContrecPtr;
 	TransactionId oldestActiveXID;
+	bool		csnlogStarted = false;
 	bool		promoted = false;
 	char		timebuf[128];
 
@@ -6233,11 +6235,12 @@ StartupXLOG(void)
 			ProcArrayInitRecovery(XidFromFullTransactionId(TransamVariables->nextXid));
 
 			/*
-			 * Startup xid-indexed transient SLRUs only.  CLOG, MultiXact and
-			 * commit timestamp have already been started up and other SLRUs
-			 * are not maintained during recovery and need not be started yet.
+			 * Startup xid-indexed transient SLRUs needed during recovery.
+			 * CLOG, MultiXact and commit timestamp have already been started
+			 * up and other SLRUs still need not be started yet.
 			 */
 			StartupCSNLOG(oldestActiveXID);
+			csnlogStarted = true;
 			StartupSUBTRANS(oldestActiveXID);
 
 			/*
@@ -6273,6 +6276,12 @@ StartupXLOG(void)
 
 				ProcArrayApplyRecoveryInfo(&running);
 			}
+		}
+		else
+		{
+			oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
+			StartupCSNLOG(oldestActiveXID);
+			csnlogStarted = true;
 		}
 
 		/*
@@ -6357,6 +6366,13 @@ StartupXLOG(void)
 	 * as potential problems are detected before any on-disk change is done.
 	 */
 	oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
+	if (!csnlogStarted)
+	{
+		StartupCSNLOG(oldestActiveXID);
+		csnlogStarted = true;
+	}
+	else
+		SetCSNOldestActiveXid(oldestActiveXID);
 
 	/*
 	 * Allow ordinary WAL segment creation before possibly switching to a new
@@ -6519,11 +6535,10 @@ StartupXLOG(void)
 	LWLockRelease(ProcArrayLock);
 
 	/*
-	 * Start up xid-indexed transient SLRUs, if not already done for hot
-	 * standby.  (commit timestamps are started below, if necessary.)
+	 * Start up xid-indexed transient SLRUs not maintained during replay, if
+	 * not already done for hot standby.  (commit timestamps are started
+	 * below, if necessary.)
 	 */
-	if (standbyState == STANDBY_DISABLED)
-		StartupCSNLOG(oldestActiveXID);
 	if (standbyState == STANDBY_DISABLED)
 		StartupSUBTRANS(oldestActiveXID);
 
