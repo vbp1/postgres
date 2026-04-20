@@ -1033,10 +1033,24 @@ RecomputeCSNOldestActiveXid(void)
 
 	for (int index = 0; index < arrayP->numProcs; index++)
 	{
+		PGPROC	   *proc = &allProcs[arrayP->pgprocnos[index]];
 		TransactionId xid = UINT32_ACCESS_ONCE(ProcGlobal->xids[index]);
+		TransactionId xmin = UINT32_ACCESS_ONCE(proc->xmin);
 
 		if (!TransactionIdIsValid(xid))
-			continue;
+		{
+			/*
+			 * Read-only transactions can hold a stable xact snapshot without
+			 * ever advertising an xid.  Their xmin still has to keep CSN
+			 * lookup conservative for the life of that snapshot.
+			 */
+			if (!TransactionIdIsValid(xmin))
+				continue;
+			xid = xmin;
+		}
+		else if (TransactionIdIsValid(xmin) &&
+				 TransactionIdPrecedes(xmin, xid))
+			xid = xmin;
 
 		if (TransactionIdPrecedes(xid, oldestActiveXid))
 			oldestActiveXid = xid;

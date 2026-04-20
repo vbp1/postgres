@@ -83,6 +83,12 @@ The minimal parent-to-top-xid resolution described above is only a
 compatibility aid for excluded or transitional cases, not a claim that
 ordinary subtransaction execution is supported by the CSN prototype.
 
+There is also no SQL-visible CSN counter in Stage 1. Monotonic allocation is
+therefore exercised only indirectly through commit ordering and snapshot
+visibility in the regression and isolation tests. The existing
+`subxid-overflow` isolation test remains an explicit excluded-path check, not
+a claim of general subtransaction support.
+
 This keeps Wave 1 and Wave 2 small while preserving a clear upgrade path to a
 later design that can stamp subxids directly or encode parent information in
 `csnlog`.
