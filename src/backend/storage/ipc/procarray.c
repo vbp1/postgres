@@ -2022,6 +2022,35 @@ GetMaxSnapshotSubxidCount(void)
 }
 
 /*
+ * CSN snapshot helpers for GetSnapshotData().
+ */
+static bool
+GetSnapshotDataBuildsCSN(bool takenDuringRecovery, bool suboverflowed)
+{
+	/*
+	 * Phase D only exposes snapshot_csn for primary MVCC snapshots in the
+	 * prototype's supported RC/RR scope.
+	 */
+	return !takenDuringRecovery &&
+		!suboverflowed &&
+		!IsolationIsSerializable();
+}
+
+static CommitSeqNo
+GetSnapshotDataSnapshotCSN(bool takenDuringRecovery, bool suboverflowed,
+						   bool commitCriticalSectionSeen,
+						   CommitSeqNo snapshotCsnCandidate)
+{
+	if (!GetSnapshotDataBuildsCSN(takenDuringRecovery, suboverflowed))
+		return InvalidCommitSeqNo;
+
+	if (commitCriticalSectionSeen)
+		return InvalidCommitSeqNo;
+
+	return snapshotCsnCandidate;
+}
+
+/*
  * Helper function for GetSnapshotData() that checks if the bulk of the
  * visibility information in the snapshot is still valid. If so, it updates
  * the fields that need to change and returns true. Otherwise it returns
@@ -2036,6 +2065,14 @@ GetSnapshotDataReuse(Snapshot snapshot)
 	uint64		curXactCompletionCount;
 
 	Assert(LWLockHeldByMe(ProcArrayLock));
+
+	/*
+	 * xactCompletionCount remains part of the snapshot contract, but Phase D
+	 * intentionally rebuilds CSN snapshots until a stronger reuse contract
+	 * exists for snapshot_csn.
+	 */
+	if (SnapshotUsesCSN(snapshot))
+		return false;
 
 	if (unlikely(snapshot->snapXactCompletionCount == 0))
 		return false;
@@ -2120,11 +2157,14 @@ GetSnapshotData(Snapshot snapshot)
 	int			count = 0;
 	int			subcount = 0;
 	bool		suboverflowed = false;
+	bool		commitCriticalSectionSeen = false;
 	FullTransactionId latest_completed;
 	TransactionId oldestxid;
 	int			mypgxactoff;
 	TransactionId myxid;
 	uint64		curXactCompletionCount;
+	CommitSeqNo snapshotCsnCandidate = InvalidCommitSeqNo;
+	bool		snapshotCsnLocked = false;
 
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
@@ -2175,6 +2215,21 @@ GetSnapshotData(Snapshot snapshot)
 		return snapshot;
 	}
 
+	snapshot->takenDuringRecovery = RecoveryInProgress();
+
+	/*
+	 * Capture a candidate CSN boundary before we walk the procarray. Holding
+	 * XidGenLock while scanning prevents new CSNs from being assigned during
+	 * the capture, and we fall back if we observe a backend that is already
+	 * in the commit critical section.
+	 */
+	if (GetSnapshotDataBuildsCSN(snapshot->takenDuringRecovery, false))
+	{
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		snapshotCsnLocked = true;
+		snapshotCsnCandidate = TransamVariables->nextCommitSeqNo;
+	}
+
 	latest_completed = TransamVariables->latestCompletedXid;
 	mypgxactoff = MyProc->pgxactoff;
 	myxid = other_xids[mypgxactoff];
@@ -2195,15 +2250,12 @@ GetSnapshotData(Snapshot snapshot)
 	if (TransactionIdIsNormal(myxid) && NormalTransactionIdPrecedes(myxid, xmin))
 		xmin = myxid;
 
-	snapshot->takenDuringRecovery = RecoveryInProgress();
-
 	if (!snapshot->takenDuringRecovery)
 	{
 		int			numProcs = arrayP->numProcs;
 		TransactionId *xip = snapshot->xip;
 		int		   *pgprocnos = arrayP->pgprocnos;
 		XidCacheStatus *subxidStates = ProcGlobal->subxidStates;
-		uint8	   *allStatusFlags = ProcGlobal->statusFlags;
 
 		/*
 		 * First collect set of pgxactoff/xids that need to be included in the
@@ -2213,9 +2265,12 @@ GetSnapshotData(Snapshot snapshot)
 		{
 			/* Fetch xid just once - see GetNewTransactionId */
 			TransactionId xid = UINT32_ACCESS_ONCE(other_xids[pgxactoff]);
+			int			pgprocno = arrayP->pgprocnos[pgxactoff];
+			PGPROC	   *proc = &allProcs[pgprocno];
+			uint8		delayChkptFlags;
 			uint8		statusFlags;
 
-			Assert(allProcs[arrayP->pgprocnos[pgxactoff]].pgxactoff == pgxactoff);
+			Assert(proc->pgxactoff == pgxactoff);
 
 			/*
 			 * If the transaction has no XID assigned, we can skip it; it
@@ -2223,6 +2278,15 @@ GetSnapshotData(Snapshot snapshot)
 			 */
 			if (likely(xid == InvalidTransactionId))
 				continue;
+
+			/*
+			 * Check commit-critical-section state before any xid-based skip.
+			 * A backend that already reserved or published a CSN can still
+			 * make this snapshot's CSN unsafe even if its xid is >= xmax.
+			 */
+			delayChkptFlags = proc->delayChkptFlags;
+			if (delayChkptFlags & DELAY_CHKPT_IN_COMMIT)
+				commitCriticalSectionSeen = true;
 
 			/*
 			 * We don't include our own XIDs (if any) in the snapshot. It
@@ -2252,7 +2316,7 @@ GetSnapshotData(Snapshot snapshot)
 			 * Skip over backends doing logical decoding which manages xmin
 			 * separately (check below) and ones running LAZY VACUUM.
 			 */
-			statusFlags = allStatusFlags[pgxactoff];
+			statusFlags = ProcGlobal->statusFlags[pgxactoff];
 			if (statusFlags & (PROC_IN_LOGICAL_DECODING | PROC_IN_VACUUM))
 				continue;
 
@@ -2288,13 +2352,13 @@ GetSnapshotData(Snapshot snapshot)
 
 					if (nsubxids > 0)
 					{
-						int			pgprocno = pgprocnos[pgxactoff];
-						PGPROC	   *proc = &allProcs[pgprocno];
+						int			subpgprocno = pgprocnos[pgxactoff];
+						PGPROC	   *subproc = &allProcs[subpgprocno];
 
 						pg_read_barrier();	/* pairs with GetNewTransactionId */
 
 						memcpy(snapshot->subxip + subcount,
-							   proc->subxids.xids,
+							   subproc->subxids.xids,
 							   nsubxids * sizeof(TransactionId));
 						subcount += nsubxids;
 					}
@@ -2340,6 +2404,17 @@ GetSnapshotData(Snapshot snapshot)
 			suboverflowed = true;
 	}
 
+	/*
+	 * Capture the prototype CSN boundary while still holding the lock domain
+	 * for the procarray view. Unsupported shapes, overflowed snapshots, or
+	 * procarray views that already contain a backend in the commit critical
+	 * section fall back to explicit xid-array semantics.
+	 */
+	snapshot->snapshot_csn =
+		GetSnapshotDataSnapshotCSN(snapshot->takenDuringRecovery,
+								   suboverflowed,
+								   commitCriticalSectionSeen,
+								   snapshotCsnCandidate);
 
 	/*
 	 * Fetch into local variable while ProcArrayLock is held - the
@@ -2351,6 +2426,9 @@ GetSnapshotData(Snapshot snapshot)
 
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = xmin;
+
+	if (snapshotCsnLocked)
+		LWLockRelease(XidGenLock);
 
 	LWLockRelease(ProcArrayLock);
 

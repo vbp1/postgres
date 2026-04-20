@@ -546,6 +546,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 			   sourcesnap->subxcnt * sizeof(TransactionId));
 	CurrentSnapshot->suboverflowed = sourcesnap->suboverflowed;
 	CurrentSnapshot->takenDuringRecovery = sourcesnap->takenDuringRecovery;
+	CurrentSnapshot->snapshot_csn = InvalidCommitSeqNo;
 	/* NB: curcid should NOT be copied, it's a local matter */
 
 	CurrentSnapshot->snapXactCompletionCount = 0;
@@ -1516,6 +1517,7 @@ ImportSnapshot(const char *idstr)
 	}
 
 	snapshot.takenDuringRecovery = parseIntFromText("rec:", &filebuf, path);
+	snapshot.snapshot_csn = InvalidCommitSeqNo;
 
 	/*
 	 * Do some additional sanity checking, just to protect ourselves.  We
@@ -1820,6 +1822,7 @@ RestoreSnapshot(char *start_address)
 	snapshot->takenDuringRecovery = serialized_snapshot.takenDuringRecovery;
 	snapshot->curcid = serialized_snapshot.curcid;
 	snapshot->snapXactCompletionCount = 0;
+	snapshot->snapshot_csn = InvalidCommitSeqNo;
 
 	/* Copy XIDs, if present. */
 	if (serialized_snapshot.xcnt > 0)

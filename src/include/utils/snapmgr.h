@@ -74,6 +74,16 @@ extern PGDLLIMPORT SnapshotData SnapshotToastData;
 #define IsMVCCLikeSnapshot(snapshot)  \
 	(IsMVCCSnapshot(snapshot) || IsHistoricMVCCSnapshot(snapshot))
 
+/*
+ * Stage 1 CSN snapshots carry a prototype committed-visibility boundary in
+ * snapshot_csn. InvalidCommitSeqNo means this snapshot remains on the legacy
+ * xid-array path.
+ */
+#define SnapshotHasCSN(snapshot) \
+	(CommitSeqNoIsValid((snapshot)->snapshot_csn))
+#define SnapshotUsesCSN(snapshot) \
+	(IsMVCCSnapshot(snapshot) && SnapshotHasCSN(snapshot))
+
 extern Snapshot GetTransactionSnapshot(void);
 extern Snapshot GetLatestSnapshot(void);
 extern void SnapshotSetCommandId(CommandId curcid);

@@ -97,6 +97,14 @@ For supported MVCC paths:
 * `snapXactCompletionCount` remains part of snapshot reuse validation
 * `xip`/`subxip` data is compatibility state, not the semantic source of truth
 
+Phase D keeps this conservative:
+
+* only primary, non-overflowed MVCC snapshots get a valid `snapshot_csn`
+* unsupported snapshot shapes keep `snapshot_csn = InvalidCommitSeqNo` and
+  stay on the legacy xid-array path
+* fast snapshot reuse is disabled for CSN snapshots until the reuse contract
+  is widened beyond `snapXactCompletionCount`
+
 For `REPEATABLE READ` and other xact-snapshot modes, the first transaction
 snapshot must hold one stable `snapshot_csn` for the life of that
 FirstXactSnapshot-style snapshot.  Per-statement recomputation is acceptable
