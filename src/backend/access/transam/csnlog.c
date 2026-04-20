@@ -1,0 +1,264 @@
+/*-------------------------------------------------------------------------
+ *
+ * csnlog.c
+ *		Stage 1 CSN log storage manager
+ *
+ * This module provides a conservative, non-WAL-backed SLRU skeleton for
+ * xid-to-CSN storage.  It does not claim crash-safe semantics and does not
+ * yet participate in commit-path publication.
+ *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * src/backend/access/transam/csnlog.c
+ *
+ *-------------------------------------------------------------------------
+ */
+
+#include "postgres.h"
+
+#include "access/csn_mvcc_vars.h"
+#include "access/csnlog.h"
+#include "access/slru.h"
+
+/* We store one 64-bit CSN per xid. */
+#define CSNLOG_XACTS_PER_PAGE		(BLCKSZ / sizeof(CommitSeqNo))
+#define CSNLOG_NBUFFERS			16
+
+/*
+ * Although we return an int64 the actual value can't currently exceed
+ * 0xFFFFFFFF/CSNLOG_XACTS_PER_PAGE.
+ */
+static inline int64
+TransactionIdToCSNPage(TransactionId xid)
+{
+	return xid / (int64) CSNLOG_XACTS_PER_PAGE;
+}
+
+#define TransactionIdToCSNEntry(xid) \
+	((xid) % (TransactionId) CSNLOG_XACTS_PER_PAGE)
+
+static bool CsnlogPagePrecedes(int64 page1, int64 page2);
+static int	csnlog_errdetail_for_io_error(const void *opaque_data);
+static bool TransactionIdInCSNLogRange(TransactionId xid);
+
+static SlruDesc CsnlogSlruDesc;
+
+#define CsnlogCtl (&CsnlogSlruDesc)
+
+void
+CSNLOGShmemRequest(void)
+{
+	SimpleLruRequest(.desc = &CsnlogSlruDesc,
+					 .name = "csnlog",
+					 .Dir = "pg_csnlog",
+					 .long_segment_names = false,
+					 .nslots = CSNLOG_NBUFFERS,
+					 .sync_handler = SYNC_HANDLER_NONE,
+					 .PagePrecedes = CsnlogPagePrecedes,
+					 .errdetail_for_io_error = csnlog_errdetail_for_io_error,
+		);
+}
+
+void
+CSNLOGShmemInit(void)
+{
+	SlruPagePrecedesUnitTests(CsnlogCtl, CSNLOG_XACTS_PER_PAGE);
+}
+
+void
+BootStrapCSNLOG(void)
+{
+	SimpleLruZeroAndWritePage(CsnlogCtl, 0);
+}
+
+void
+StartupCSNLOG(TransactionId oldestActiveXID)
+{
+	FullTransactionId nextXid;
+	int64		startPage;
+	int64		endPage;
+	LWLock	   *prevlock = NULL;
+	LWLock	   *lock;
+
+	if (!TransactionIdIsNormal(oldestActiveXID))
+		oldestActiveXID = ReadNextTransactionId();
+
+	startPage = TransactionIdToCSNPage(oldestActiveXID);
+	nextXid = TransamVariables->nextXid;
+	endPage = TransactionIdToCSNPage(XidFromFullTransactionId(nextXid));
+
+	for (;;)
+	{
+		lock = SimpleLruGetBankLock(CsnlogCtl, startPage);
+		if (prevlock != lock)
+		{
+			if (prevlock)
+				LWLockRelease(prevlock);
+			LWLockAcquire(lock, LW_EXCLUSIVE);
+			prevlock = lock;
+		}
+
+		(void) SimpleLruZeroPage(CsnlogCtl, startPage);
+		if (startPage == endPage)
+			break;
+
+		startPage++;
+		if (startPage > TransactionIdToCSNPage(MaxTransactionId))
+			startPage = 0;
+	}
+
+	LWLockRelease(lock);
+
+	SetCSNOldestActiveXid(oldestActiveXID);
+}
+
+void
+CheckPointCSNLOG(void)
+{
+	SimpleLruWriteAll(CsnlogCtl, true);
+}
+
+/*
+ * Phase B intentionally omits runtime truncation wiring.  A later phase must
+ * introduce truncation together with retained-range tracking that can account
+ * for explicit removal of older csnlog segments.
+ */
+void
+ExtendCSNLOG(TransactionId newestXact)
+{
+	int64		pageno;
+	LWLock	   *lock;
+
+	/*
+	 * No work except at first XID of a page.  But beware: just after
+	 * wraparound, the first XID of page zero is FirstNormalTransactionId.
+	 */
+	if (TransactionIdToCSNEntry(newestXact) != 0 &&
+		!TransactionIdEquals(newestXact, FirstNormalTransactionId))
+		return;
+
+	pageno = TransactionIdToCSNPage(newestXact);
+
+	lock = SimpleLruGetBankLock(CsnlogCtl, pageno);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	SimpleLruZeroPage(CsnlogCtl, pageno);
+	LWLockRelease(lock);
+}
+
+void
+TransactionIdSetCommitSeqNo(TransactionId xid, CommitSeqNo csn)
+{
+	int64		pageno;
+	int			entryno;
+	int			slotno;
+	LWLock	   *lock;
+	CommitSeqNo *ptr;
+
+	Assert(TransactionIdIsNormal(xid));
+	Assert(CommitSeqNoIsValid(csn));
+
+	pageno = TransactionIdToCSNPage(xid);
+	entryno = TransactionIdToCSNEntry(xid);
+
+	lock = SimpleLruGetBankLock(CsnlogCtl, pageno);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+
+	slotno = SimpleLruReadPage(CsnlogCtl, pageno, true, &xid);
+	ptr = (CommitSeqNo *) CsnlogCtl->shared->page_buffer[slotno];
+	ptr += entryno;
+	*ptr = csn;
+	CsnlogCtl->shared->page_dirty[slotno] = true;
+
+	LWLockRelease(lock);
+}
+
+bool
+TransactionIdGetCommitSeqNoIfAny(TransactionId xid, CommitSeqNo *csn)
+{
+	int64		pageno;
+	int			entryno;
+	int			slotno;
+	CommitSeqNo *ptr;
+
+	Assert(csn != NULL);
+
+	*csn = InvalidCommitSeqNo;
+
+	if (!TransactionIdInCSNLogRange(xid))
+		return false;
+
+	pageno = TransactionIdToCSNPage(xid);
+	entryno = TransactionIdToCSNEntry(xid);
+
+	slotno = SimpleLruReadPage_ReadOnly(CsnlogCtl, pageno, &xid);
+	ptr = (CommitSeqNo *) CsnlogCtl->shared->page_buffer[slotno];
+	ptr += entryno;
+	*csn = *ptr;
+
+	LWLockRelease(SimpleLruGetBankLock(CsnlogCtl, pageno));
+
+	return CommitSeqNoIsValid(*csn);
+}
+
+CommitSeqNo
+TransactionIdGetCommitSeqNo(TransactionId xid)
+{
+	CommitSeqNo csn;
+
+	if (!TransactionIdGetCommitSeqNoIfAny(xid, &csn))
+		return InvalidCommitSeqNo;
+
+	return csn;
+}
+
+static bool
+TransactionIdInCSNLogRange(TransactionId xid)
+{
+	TransactionId oldestActiveXid;
+	TransactionId nextXid;
+
+	if (!TransactionIdIsNormal(xid))
+		return false;
+
+	/*
+	 * csnOldestActiveXid is only prototype-owned csnlog bookkeeping.  It is
+	 * not an authoritative replacement for procarray, GlobalVis, or
+	 * nonremovable horizon state.
+	 */
+	oldestActiveXid = ReadCSNOldestActiveXid();
+	if (!TransactionIdIsValid(oldestActiveXid))
+		return false;
+
+	nextXid = ReadNextTransactionId();
+
+	if (TransactionIdPrecedes(xid, oldestActiveXid))
+		return false;
+	if (!TransactionIdPrecedes(xid, nextXid))
+		return false;
+
+	return true;
+}
+
+static bool
+CsnlogPagePrecedes(int64 page1, int64 page2)
+{
+	TransactionId xid1;
+	TransactionId xid2;
+
+	xid1 = ((TransactionId) page1) * CSNLOG_XACTS_PER_PAGE;
+	xid1 += FirstNormalTransactionId + 1;
+	xid2 = ((TransactionId) page2) * CSNLOG_XACTS_PER_PAGE;
+	xid2 += FirstNormalTransactionId + 1;
+
+	return (TransactionIdPrecedes(xid1, xid2) &&
+			TransactionIdPrecedes(xid1, xid2 + CSNLOG_XACTS_PER_PAGE - 1));
+}
+
+static int
+csnlog_errdetail_for_io_error(const void *opaque_data)
+{
+	TransactionId xid = *(const TransactionId *) opaque_data;
+
+	return errdetail("Could not access CSN status of transaction %u.", xid);
+}

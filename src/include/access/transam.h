@@ -87,6 +87,60 @@ FullTransactionIdFromU64(uint64 value)
 	return result;
 }
 
+/*
+ * Commit sequence numbers for the Stage 1 CSN prototype.
+ *
+ * Zeroed SLRU pages must read as InvalidCommitSeqNo, and FrozenCommitSeqNo is
+ * ordered before every normal CSN.  State sentinels are kept at the high end
+ * of the range so that normal committed CSNs remain dense and monotonic.
+ */
+typedef uint64 CommitSeqNo;
+
+#define InvalidCommitSeqNo		((CommitSeqNo) 0)
+#define FrozenCommitSeqNo		((CommitSeqNo) 1)
+#define FirstNormalCommitSeqNo	((CommitSeqNo) 2)
+#define MaxNormalCommitSeqNo	((CommitSeqNo) (PG_UINT64_MAX - 3))
+#define CommittingCommitSeqNo	((CommitSeqNo) (PG_UINT64_MAX - 2))
+#define InProgressCommitSeqNo	((CommitSeqNo) (PG_UINT64_MAX - 1))
+#define AbortedCommitSeqNo		((CommitSeqNo) PG_UINT64_MAX)
+
+#define CommitSeqNoIsValid(csn)		((csn) != InvalidCommitSeqNo)
+#define CommitSeqNoIsFrozen(csn)	((csn) == FrozenCommitSeqNo)
+#define CommitSeqNoIsNormal(csn) \
+	((csn) >= FirstNormalCommitSeqNo && (csn) <= MaxNormalCommitSeqNo)
+#define CommitSeqNoIsCommitting(csn)	((csn) == CommittingCommitSeqNo)
+#define CommitSeqNoIsInProgress(csn)	((csn) == InProgressCommitSeqNo)
+#define CommitSeqNoIsAborted(csn)		((csn) == AbortedCommitSeqNo)
+#define CommitSeqNoIsSpecial(csn)		(!CommitSeqNoIsNormal(csn))
+
+static inline void
+CommitSeqNoAdvance(CommitSeqNo *dest)
+{
+	Assert(dest != NULL);
+	Assert(CommitSeqNoIsNormal(*dest));
+	Assert(*dest < MaxNormalCommitSeqNo);
+
+	(*dest)++;
+}
+
+static inline bool
+CommitSeqNoPrecedes(CommitSeqNo csn1, CommitSeqNo csn2)
+{
+	Assert(CommitSeqNoIsNormal(csn1));
+	Assert(CommitSeqNoIsNormal(csn2));
+
+	return csn1 < csn2;
+}
+
+static inline bool
+CommitSeqNoPrecedesOrEquals(CommitSeqNo csn1, CommitSeqNo csn2)
+{
+	Assert(CommitSeqNoIsNormal(csn1));
+	Assert(CommitSeqNoIsNormal(csn2));
+
+	return csn1 <= csn2;
+}
+
 /* advance a transaction ID variable, handling wraparound correctly */
 #define TransactionIdAdvance(dest)	\
 	do { \
@@ -218,6 +272,7 @@ typedef struct TransamVariablesData
 	 * These fields are protected by XidGenLock.
 	 */
 	FullTransactionId nextXid;	/* next XID to assign */
+	CommitSeqNo nextCommitSeqNo;	/* next CSN to assign */
 
 	TransactionId oldestXid;	/* cluster-wide minimum datfrozenxid */
 	TransactionId xidVacLimit;	/* start forcing autovacuums here */
@@ -246,6 +301,12 @@ typedef struct TransamVariablesData
 	 * not. There are likely other users of this.  Always above 1.
 	 */
 	uint64		xactCompletionCount;
+
+	/*
+	 * Prototype-owned CSN bookkeeping lower bound.  This does not replace
+	 * existing procarray, GlobalVis, or nonremovable horizon machinery.
+	 */
+	TransactionId csnOldestActiveXid;
 
 	/*
 	 * These fields are protected by XactTruncationLock

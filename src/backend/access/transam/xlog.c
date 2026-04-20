@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include "access/clog.h"
+#include "access/csnlog.h"
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
@@ -5605,6 +5606,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	/* Bootstrap the commit log, too */
 	BootStrapCLOG();
 	BootStrapCommitTs();
+	BootStrapCSNLOG();
 	BootStrapSUBTRANS();
 	BootStrapMultiXact();
 
@@ -6231,10 +6233,11 @@ StartupXLOG(void)
 			ProcArrayInitRecovery(XidFromFullTransactionId(TransamVariables->nextXid));
 
 			/*
-			 * Startup subtrans only.  CLOG, MultiXact and commit timestamp
-			 * have already been started up and other SLRUs are not maintained
-			 * during recovery and need not be started yet.
+			 * Startup xid-indexed transient SLRUs only.  CLOG, MultiXact and
+			 * commit timestamp have already been started up and other SLRUs
+			 * are not maintained during recovery and need not be started yet.
 			 */
+			StartupCSNLOG(oldestActiveXID);
 			StartupSUBTRANS(oldestActiveXID);
 
 			/*
@@ -6516,9 +6519,11 @@ StartupXLOG(void)
 	LWLockRelease(ProcArrayLock);
 
 	/*
-	 * Start up subtrans, if not already done for hot standby.  (commit
-	 * timestamps are started below, if necessary.)
+	 * Start up xid-indexed transient SLRUs, if not already done for hot
+	 * standby.  (commit timestamps are started below, if necessary.)
 	 */
+	if (standbyState == STANDBY_DISABLED)
+		StartupCSNLOG(oldestActiveXID);
 	if (standbyState == STANDBY_DISABLED)
 		StartupSUBTRANS(oldestActiveXID);
 
@@ -8056,6 +8061,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckpointStats.ckpt_write_t = GetCurrentTimestamp();
 	CheckPointCLOG();
 	CheckPointCommitTs();
+	CheckPointCSNLOG();
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();

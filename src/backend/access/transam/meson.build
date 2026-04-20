@@ -2,6 +2,8 @@
 
 backend_sources += files(
   'clog.c',
+  'csn_mvcc_vars.c',
+  'csnlog.c',
   'commit_ts.c',
   'generic_xlog.c',
   'multixact.c',
