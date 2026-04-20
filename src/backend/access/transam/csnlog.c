@@ -114,6 +114,44 @@ StartupCSNLOG(TransactionId oldestActiveXID)
 	SetCSNOldestActiveXid(oldestActiveXID);
 }
 
+/*
+ * This must be called ONCE at the end of startup/recovery.
+ */
+void
+TrimCSNLOG(void)
+{
+	TransactionId nextXid;
+	int64		pageno;
+	int			entryno;
+	int			slotno;
+	CommitSeqNo *ptr;
+	LWLock	   *lock;
+
+	nextXid = XidFromFullTransactionId(TransamVariables->nextXid);
+	pageno = TransactionIdToCSNPage(nextXid);
+	entryno = TransactionIdToCSNEntry(nextXid);
+
+	/*
+	 * Zero out the remainder of the current csnlog page.  This is purely a
+	 * restart/recovery hygiene step; later pages remain zeroed on demand.
+	 */
+	if (entryno == 0)
+		return;
+
+	lock = SimpleLruGetBankLock(CsnlogCtl, pageno);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+
+	slotno = SimpleLruReadPage(CsnlogCtl, pageno, false, &nextXid);
+	ptr = (CommitSeqNo *) CsnlogCtl->shared->page_buffer[slotno];
+	ptr += entryno;
+
+	MemSet(ptr, 0, BLCKSZ - entryno * sizeof(CommitSeqNo));
+
+	CsnlogCtl->shared->page_dirty[slotno] = true;
+
+	LWLockRelease(lock);
+}
+
 void
 CheckPointCSNLOG(void)
 {

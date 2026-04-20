@@ -17,7 +17,8 @@ it is conservative by design:
   intentionally rebuilt instead of reused.
 - `csnOldestActiveXid` is runtime bookkeeping, not a persisted truth across
   restart.
-- `csnlog` has storage and read/write plumbing, but no runtime truncation or
+- `csnlog` has storage and read/write plumbing, plus a conservative
+  end-of-recovery tail trim for the current page, but no runtime truncation or
   crash-safe retention policy yet.
 
 
@@ -34,7 +35,7 @@ Supported / Fallback / Forbidden Matrix
 | `ImportSnapshot()` / `ExportSnapshot()` | Forbidden for CSN-sensitive snapshots | The wire format has no `snapshot_csn`, and import resets the field to invalid. CSN snapshots would silently downgrade today. |
 | `SerializeSnapshot()` / `RestoreSnapshot()` consumers | Forbidden for CSN-sensitive snapshots | Parallel scan handoff, file-based snapshot transport, and other consumers currently lose `snapshot_csn`. |
 | `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` | Implemented but not yet accepted for Stage 2 closure | The current tree already publishes conservative CSN state for prepared transactions, but Stage 2 still treats 2PC correctness as incomplete until retention, restart, and visibility contracts are closed. |
-| Crash / restart CSN retention | Fallback | Startup reinitializes runtime state conservatively; there is no durable CSN reconstruction path yet. |
+| Crash / restart CSN retention | Fallback | Startup reinitializes runtime state conservatively, and end-of-recovery trims the unused tail of the current `pg_csnlog` page; there is still no durable CSN reconstruction path or runtime truncation policy. |
 | Serializable, standby, recovery, logical decoding | Forbidden | Stage 2 does not claim CSN support for these paths. |
 
 
@@ -107,6 +108,9 @@ Lifecycle wiring, including `varsup.c`
   `csnOldestActiveXid` at shared-memory init time.
 - `xlog.c` starts `csnlog` during recovery or restart and seeds it from the
   oldest active xid it can currently determine.
+- `xlog.c` now calls `TrimCSNLOG()` at end of recovery so the current
+  `pg_csnlog` page cannot keep stale tail entries from the previous
+  lifecycle.
 - `StartupCSNLOG()` zeroes pages for the active CSN range and then publishes a
   runtime lower bound via `SetCSNOldestActiveXid()`.
 - The wiring is conservative, but it is not durable state reconstruction. A

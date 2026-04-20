@@ -6545,6 +6545,7 @@ StartupXLOG(void)
 	/*
 	 * Perform end of recovery actions for any SLRUs that need it.
 	 */
+	TrimCSNLOG();
 	TrimCLOG();
 	TrimMultiXact();
 

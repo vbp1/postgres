@@ -22,6 +22,7 @@ extern void CSNLOGShmemInit(void);
 
 extern void BootStrapCSNLOG(void);
 extern void StartupCSNLOG(TransactionId oldestActiveXID);
+extern void TrimCSNLOG(void);
 extern void CheckPointCSNLOG(void);
 extern void ExtendCSNLOG(TransactionId newestXact);
 
