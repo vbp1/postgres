@@ -1,0 +1,166 @@
+<!-- markdownlint-disable MD012 MD013 -->
+
+Stage 2 CSN Audit Baseline
+==========================
+
+This note records the Phase A audit baseline for the current CSN Stage 1
+state in this tree. It is a source-backed snapshot of what is currently safe,
+what still falls back to legacy behavior, and what is forbidden for Stage 2
+until later phases close the gap.
+
+The current tree is still a primary-only prototype. The CSN model exists, but
+it is conservative by design:
+
+- `snapshot_csn` is present on `SnapshotData`, but only some MVCC snapshots
+  get a valid CSN boundary.
+- `snapXactCompletionCount` remains a reuse guard, but CSN snapshots are
+  intentionally rebuilt instead of reused.
+- `csnOldestActiveXid` is runtime bookkeeping, not a persisted truth across
+  restart.
+- `csnlog` has storage and read/write plumbing, but no runtime truncation or
+  crash-safe retention policy yet.
+
+
+Supported / Fallback / Forbidden Matrix
+--------------------------------------
+
+| Path | Status | Current baseline |
+| --- | --- | --- |
+| `GetSnapshotData()` for primary MVCC `READ COMMITTED` / `REPEATABLE READ` | Supported | Builds `snapshot_csn` only for primary, non-overflowed, non-serializable MVCC snapshots that do not observe a backend in the commit critical section. |
+| `HeapTupleSatisfiesMVCCCSN()` | Supported | Uses `TransactionIdGetCSNStatus()` and `snapshot_csn`; local-buffer relations still fall back to the legacy path. |
+| `TransactionIdGetCSNStatus()` | Supported chokepoint | Central status API for CSN-aware callers; returns `INVALID` instead of inventing a committed answer when the CSN story is not safe. |
+| `GetSnapshotDataReuse()` | Fallback | Reuse is disabled for CSN snapshots, so the snapshot is rebuilt instead of assuming a stable CSN boundary. |
+| `TransactionIdGetLegacyCSNStatus()` | Fallback | Used when `pg_csnlog` has no safe answer and the caller must consult legacy status sources. |
+| `ImportSnapshot()` / `ExportSnapshot()` | Forbidden for CSN-sensitive snapshots | The wire format has no `snapshot_csn`, and import resets the field to invalid. CSN snapshots would silently downgrade today. |
+| `SerializeSnapshot()` / `RestoreSnapshot()` consumers | Forbidden for CSN-sensitive snapshots | Parallel scan handoff, file-based snapshot transport, and other consumers currently lose `snapshot_csn`. |
+| `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` | Implemented but not yet accepted for Stage 2 closure | The current tree already publishes conservative CSN state for prepared transactions, but Stage 2 still treats 2PC correctness as incomplete until retention, restart, and visibility contracts are closed. |
+| Crash / restart CSN retention | Fallback | Startup reinitializes runtime state conservatively; there is no durable CSN reconstruction path yet. |
+| Serializable, standby, recovery, logical decoding | Forbidden | Stage 2 does not claim CSN support for these paths. |
+
+
+Audit Findings
+-------------
+
+Status-sensitive readers and chokepoints
+
+- `TransactionIdGetCSNStatus()` in `transam.c` is the real CSN chokepoint.
+- It resolves normal xids through `pg_csnlog` first, then falls back to
+  legacy status sources when the CSN entry is missing or too old.
+- `TransactionIdDidCommit()`, `TransactionIdDidAbort()`, and
+  `TransactionIdGetCommitLSN()` remain legacy helpers. They are still used by
+  non-CSN code paths and hint-bit logic, but they are not the semantic source
+  of truth for supported CSN snapshots.
+- The current audit rule is strict: supported CSN paths must not combine
+  `TransactionIdIsInProgress()`, `TransactionIdDidCommit()`, and
+  `TransactionIdDidAbort()` as ad hoc visibility logic.
+
+Snapshot install, reuse, import, and export
+
+- `GetSnapshotData()` in `procarray.c` only assigns `snapshot_csn` when the
+  snapshot is primary-side, non-overflowed, and not serializable.
+- `GetSnapshotDataReuse()` deliberately returns false for CSN snapshots, so
+  the code rebuilds them instead of relying on reuse after any transaction
+  completion.
+- `ImportSnapshot()` parses the exported xid arrays, but it unconditionally
+  sets `snapshot_csn` to `InvalidCommitSeqNo`.
+- `ExportSnapshot()` writes only the legacy xid/subxid text format, so a CSN
+  snapshot would be downgraded on export even though the call succeeds.
+- That means import/export is currently only safe for legacy snapshots. For
+  CSN-sensitive snapshots it is effectively forbidden until the format and the
+  install path carry `snapshot_csn` explicitly.
+
+Internal snapshot transport consumers
+
+- `SerializeSnapshot()` and `RestoreSnapshot()` currently serialize only the
+  legacy snapshot fields.
+- `parallel.c` uses them for transaction and active snapshot handoff.
+- `tableam.c` uses them for parallel table scans.
+- `indexam.c` uses them for parallel index scans.
+- `repack_worker.c` writes snapshots to files and `repack.c` restores them
+  from those files.
+- The audit conclusion is simple: every current consumer of
+  `SerializeSnapshot()` / `RestoreSnapshot()` is a CSN hazard until the
+  transport format preserves `snapshot_csn` or the consumer is explicitly
+  excluded from CSN support.
+
+Horizon holders and truncation constraints
+
+- `procarray.c` still owns the shared visibility horizons, including snapshot
+  xmin, prepared xacts, replication-slot xmin/catalog_xmin, and the
+  `xactCompletionCount` reuse counter.
+- `csnOldestActiveXid` is only a prototype-owned lower bound. It helps
+  `pg_csnlog` decide whether an xid is still in range, but it does not replace
+  procarray, GlobalVis, or vacuum horizons.
+- `csnlog.c` explicitly says runtime truncation is not wired yet. That means
+  the cleanup policy still has to be defined around the full conservative
+  minimum of active xids, prepared xacts, replication slots, and any
+  `pg_xact` / `pg_subtrans` fallback constraints.
+- `TransactionIdGetLegacyCSNStatus()` already encodes the safe fallback rule:
+  if both CSN storage and clog have forgotten an xid, the answer is
+  `TRANSACTION_CSN_STATUS_INVALID`, not "committed".
+
+Lifecycle wiring, including `varsup.c`
+
+- `varsup.c` wires `TransamVariables` and `csnlog` into the shared-memory
+  startup path.
+- `csn_mvcc_vars.c` initializes `nextCommitSeqNo` and clears
+  `csnOldestActiveXid` at shared-memory init time.
+- `xlog.c` starts `csnlog` during recovery or restart and seeds it from the
+  oldest active xid it can currently determine.
+- `StartupCSNLOG()` zeroes pages for the active CSN range and then publishes a
+  runtime lower bound via `SetCSNOldestActiveXid()`.
+- The wiring is conservative, but it is not durable state reconstruction. A
+  later phase still needs a restart-stable policy for the retained CSN range.
+
+2PC and restart-sensitive paths
+
+- `twophase.c` publishes prepared transactions as in-progress to the CSN API
+  during redo and restart, not as final committed CSNs.
+- `PublishPreparedTransactionCSNState()` only marks the prepared xid as
+  in-progress and records parent links for subxids.
+- `FinishPreparedTransaction()` follows the safe order: publish the finish
+  record, update transaction status, remove the procarray entry, and only then
+  run callbacks and cleanup.
+- The current restart behavior is conservative, but it does not yet prove a
+  restart-stable CSN story for prepared xacts. That remains a later-phase
+  closure item.
+
+
+Concrete Touchpoints for Next Phases
+-----------------------------------
+
+- `src/backend/access/transam/csnlog.c`
+- `src/backend/access/transam/csn_mvcc_vars.c`
+- `src/backend/access/transam/transam.c`
+- `src/backend/access/transam/xact.c`
+- `src/backend/storage/ipc/procarray.c`
+- `src/backend/access/transam/varsup.c`
+- `src/backend/access/transam/xlog.c`
+- `src/backend/utils/time/snapmgr.c`
+- `src/include/utils/snapmgr.h`
+- `src/include/utils/snapshot.h`
+- `src/backend/access/heap/heapam_visibility.c`
+- `src/backend/access/transam/twophase.c`
+- `src/backend/access/transam/parallel.c`
+- `src/backend/access/table/tableam.c`
+- `src/backend/access/index/indexam.c`
+- `src/backend/commands/repack_worker.c`
+- `src/backend/commands/repack.c`
+
+
+Open Risks
+---------
+
+- CSN snapshots still lose their boundary when exported, imported, or
+  serialized through the current transport helpers.
+- `pg_csnlog` has no runtime truncation policy yet, so truncation safety must
+  still be defined and tested against every relevant horizon holder.
+- Restart and prepared-transaction paths are conservative, but not yet backed
+  by a restart-stable CSN retention contract.
+- Subxid overflow remains a risk until the fallback and parent-resolution
+  behavior is closed out under explicit tests.
+- Any future Stage 2 work must keep the current "no silent downgrade" rule:
+  if a path cannot preserve `snapshot_csn`, it must fail or be explicitly
+  forbidden for CSN-sensitive snapshots.
+
+<!-- markdownlint-enable MD012 MD013 -->
