@@ -119,6 +119,27 @@ either:
 The prototype must not claim a CSN-based visibility model while still making
 semantic decisions from `XidInMVCCSnapshot()` in supported paths.
 
+Phase E enforces that rule in `HeapTupleSatisfiesMVCC()`:
+
+* supported MVCC snapshots (`SnapshotUsesCSN(snapshot)`) make semantic
+  visibility decisions from `TransactionIdGetCSNStatus()` plus
+  `snapshot_csn`
+* `COMMITTING` is treated as not visible
+* `COMMITTING` is a visibility guard only for the window where a final CSN is
+  already present in `csnlog` but `pg_xact` is not yet `COMMITTED`
+* once `pg_xact` is `COMMITTED`, the xid is visibility-ready even if the
+  commit record is still async / not yet flushed; WAL durability is not part
+  of the MVCC semantic answer
+* `INVALID` from the CSN status API means "no safe general-status answer",
+  not "aborted"; Stage 1 falls back to the legacy tuple-visibility path for
+  that tuple instead of inventing a CSN result
+* local-buffer relations (temporary-table heap access) remain on the legacy
+  path explicitly in Stage 1
+* current-transaction and command-id rules stay on the existing self-visible
+  path
+* unsupported snapshot shapes remain on the legacy xid-array path explicitly,
+  rather than mixing CSN and xid-array answers within one supported branch
+
 
 Minimal Publish and Locking Assumptions
 ---------------------------------------

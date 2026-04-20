@@ -39,7 +39,7 @@ static XLogRecPtr cachedCommitLSN;
 
 /* Local functions */
 static XidStatus TransactionLogFetch(TransactionId transactionId);
-static bool TransactionIdCSNIsDurablyCommitted(TransactionId xid);
+static bool TransactionIdCSNIsVisibilityCommitted(TransactionId xid);
 static TransactionCSNStatus TransactionIdGetLegacyCSNStatus(TransactionId xid,
 															CommitSeqNo *csn);
 
@@ -389,7 +389,7 @@ TransactionIdGetCSNStatus(TransactionId xid, CommitSeqNo *csn)
 		if (CommitSeqNoIsCommitted(storedCsn))
 		{
 			if (!CommitSeqNoIsFrozen(storedCsn) &&
-				!TransactionIdCSNIsDurablyCommitted(currentXid))
+				!TransactionIdCSNIsVisibilityCommitted(currentXid))
 				return TRANSACTION_CSN_STATUS_COMMITTING;
 
 			if (csn != NULL)
@@ -476,11 +476,10 @@ TransactionIdGetCommitLSN(TransactionId xid)
 }
 
 static bool
-TransactionIdCSNIsDurablyCommitted(TransactionId xid)
+TransactionIdCSNIsVisibilityCommitted(TransactionId xid)
 {
 	XidStatus	xidstatus;
-	XLogRecPtr	commitLSN;
-	bool		isDurable;
+	XLogRecPtr	ignored;
 
 	LWLockAcquire(XactTruncationLock, LW_SHARED);
 	if (TransactionIdPrecedes(xid, TransamVariables->oldestClogXid))
@@ -489,15 +488,10 @@ TransactionIdCSNIsDurablyCommitted(TransactionId xid)
 		return true;
 	}
 
-	xidstatus = TransactionIdGetStatus(xid, &commitLSN);
+	xidstatus = TransactionIdGetStatus(xid, &ignored);
 	LWLockRelease(XactTruncationLock);
 
-	if (xidstatus != TRANSACTION_STATUS_COMMITTED)
-		return false;
-
-	isDurable = !XLogRecPtrIsValid(commitLSN) || !XLogNeedsFlush(commitLSN);
-
-	return isDurable;
+	return xidstatus == TRANSACTION_STATUS_COMMITTED;
 }
 
 static TransactionCSNStatus

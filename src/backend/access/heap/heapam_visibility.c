@@ -30,9 +30,12 @@
  * that were in progress during a crash as aborted.  We determine that
  * transactions aborted/crashed through process of elimination instead.
  *
- * When using an MVCC snapshot, we rely on XidInMVCCSnapshot rather than
- * TransactionIdIsInProgress, but the logic is otherwise the same: do not
- * check pg_xact until after deciding that the xact is no longer in progress.
+ * When using a legacy MVCC snapshot, we rely on XidInMVCCSnapshot rather
+ * than TransactionIdIsInProgress, but the logic is otherwise the same: do
+ * not check pg_xact until after deciding that the xact is no longer in
+ * progress. Stage 1 CSN snapshots take a separate path that asks transam for
+ * a centralized CSN status and compares committed xacts against
+ * snapshot_csn.
  *
  *
  * Summary of visibility functions:
@@ -97,6 +100,16 @@ typedef enum SetHintBitsState
 	/* allowed to set hint bits */
 	SHB_ENABLED,
 } SetHintBitsState;
+
+typedef enum HeapTupleCSNXidVisibility
+{
+	HEAPTUPLE_CSN_XID_FALLBACK,
+	HEAPTUPLE_CSN_XID_ABORTED,
+	HEAPTUPLE_CSN_XID_IN_PROGRESS,
+	HEAPTUPLE_CSN_XID_COMMITTING,
+	HEAPTUPLE_CSN_XID_VISIBLE,
+	HEAPTUPLE_CSN_XID_IN_FUTURE
+} HeapTupleCSNXidVisibility;
 
 /*
  * SetHintBitsExt()
@@ -200,6 +213,54 @@ SetHintBits(HeapTupleHeader tuple, Buffer buffer,
 			uint16 infomask, TransactionId xid)
 {
 	SetHintBitsExt(tuple, buffer, infomask, xid, NULL);
+}
+
+static inline bool
+HeapTupleCSNCommittedVisible(CommitSeqNo xidcsn, Snapshot snapshot)
+{
+	Assert(SnapshotUsesCSN(snapshot));
+	Assert(CommitSeqNoIsCommitted(xidcsn));
+
+	if (CommitSeqNoIsFrozen(xidcsn))
+		return true;
+
+	return CommitSeqNoPrecedes(xidcsn, snapshot->snapshot_csn);
+}
+
+static inline HeapTupleCSNXidVisibility
+HeapTupleCSNGetXidVisibility(TransactionId xid, Snapshot snapshot)
+{
+	CommitSeqNo xidcsn = InvalidCommitSeqNo;
+	TransactionCSNStatus xidstatus;
+
+	Assert(SnapshotUsesCSN(snapshot));
+
+	xidstatus = TransactionIdGetCSNStatus(xid, &xidcsn);
+
+	switch (xidstatus)
+	{
+		case TRANSACTION_CSN_STATUS_INVALID:
+
+			/*
+			 * Stage 1 cannot safely invent a committed/aborted answer when
+			 * transam reports that no general CSN status is available for
+			 * this xid. Fall back to the legacy tuple-visibility path for the
+			 * whole tuple instead of making a mixed-model guess here.
+			 */
+			return HEAPTUPLE_CSN_XID_FALLBACK;
+		case TRANSACTION_CSN_STATUS_IN_PROGRESS:
+			return HEAPTUPLE_CSN_XID_IN_PROGRESS;
+		case TRANSACTION_CSN_STATUS_COMMITTING:
+			return HEAPTUPLE_CSN_XID_COMMITTING;
+		case TRANSACTION_CSN_STATUS_ABORTED:
+			return HEAPTUPLE_CSN_XID_ABORTED;
+		case TRANSACTION_CSN_STATUS_COMMITTED:
+			if (HeapTupleCSNCommittedVisible(xidcsn, snapshot))
+				return HEAPTUPLE_CSN_XID_VISIBLE;
+			return HEAPTUPLE_CSN_XID_IN_FUTURE;
+	}
+
+	pg_unreachable();
 }
 
 /*
@@ -936,8 +997,8 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot,
  * and more contention on ProcArrayLock.
  */
 static inline bool
-HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
-					   Buffer buffer, SetHintBitsState *state)
+HeapTupleSatisfiesMVCCLegacy(HeapTuple htup, Snapshot snapshot,
+							 Buffer buffer, SetHintBitsState *state)
 {
 	HeapTupleHeader tuple = htup->t_data;
 
@@ -1093,6 +1154,218 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 	/* xmax transaction committed */
 
 	return false;
+}
+
+static inline bool
+HeapTupleSatisfiesMVCCCSN(HeapTuple htup, Snapshot snapshot,
+						  Buffer buffer, SetHintBitsState *state)
+{
+	HeapTupleHeader tuple = htup->t_data;
+
+	Assert(SnapshotUsesCSN(snapshot));
+
+	if (!HeapTupleHeaderXminCommitted(tuple))
+	{
+		HeapTupleCSNXidVisibility xminvisible;
+
+		if (HeapTupleHeaderXminInvalid(tuple))
+			return false;
+
+		if (!HeapTupleCleanMoved(tuple, buffer))
+			return false;
+		else if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tuple)))
+		{
+			if (HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid)
+				return false;	/* inserted after scan started */
+
+			if (tuple->t_infomask & HEAP_XMAX_INVALID)	/* xid invalid */
+				return true;
+
+			if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))	/* not deleter */
+				return true;
+
+			if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
+			{
+				TransactionId xmax;
+
+				xmax = HeapTupleGetUpdateXid(tuple);
+
+				/* not LOCKED_ONLY, so it has to have an xmax */
+				Assert(TransactionIdIsValid(xmax));
+
+				/* updating subtransaction must have aborted */
+				if (!TransactionIdIsCurrentTransactionId(xmax))
+					return true;
+				else if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+					return true;	/* updated after scan started */
+				else
+					return false;	/* updated before scan started */
+			}
+
+			if (!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple)))
+			{
+				/* deleting subtransaction must have aborted */
+				SetHintBitsExt(tuple, buffer, HEAP_XMAX_INVALID,
+							   InvalidTransactionId, state);
+				return true;
+			}
+
+			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+				return true;	/* deleted after scan started */
+			else
+				return false;	/* deleted before scan started */
+		}
+
+		xminvisible = HeapTupleCSNGetXidVisibility(HeapTupleHeaderGetRawXmin(tuple),
+												   snapshot);
+		switch (xminvisible)
+		{
+			case HEAPTUPLE_CSN_XID_FALLBACK:
+				return HeapTupleSatisfiesMVCCLegacy(htup, snapshot, buffer, state);
+			case HEAPTUPLE_CSN_XID_VISIBLE:
+				SetHintBitsExt(tuple, buffer, HEAP_XMIN_COMMITTED,
+							   HeapTupleHeaderGetRawXmin(tuple), state);
+				break;
+			case HEAPTUPLE_CSN_XID_IN_PROGRESS:
+			case HEAPTUPLE_CSN_XID_COMMITTING:
+			case HEAPTUPLE_CSN_XID_IN_FUTURE:
+				return false;
+			case HEAPTUPLE_CSN_XID_ABORTED:
+				SetHintBitsExt(tuple, buffer, HEAP_XMIN_INVALID,
+							   InvalidTransactionId, state);
+				return false;
+		}
+	}
+	else if (!HeapTupleHeaderXminFrozen(tuple))
+	{
+		HeapTupleCSNXidVisibility xminvisible;
+
+		xminvisible = HeapTupleCSNGetXidVisibility(HeapTupleHeaderGetRawXmin(tuple),
+												   snapshot);
+		switch (xminvisible)
+		{
+			case HEAPTUPLE_CSN_XID_FALLBACK:
+				return HeapTupleSatisfiesMVCCLegacy(htup, snapshot, buffer, state);
+			case HEAPTUPLE_CSN_XID_VISIBLE:
+				break;
+			case HEAPTUPLE_CSN_XID_IN_PROGRESS:
+			case HEAPTUPLE_CSN_XID_COMMITTING:
+			case HEAPTUPLE_CSN_XID_IN_FUTURE:
+			case HEAPTUPLE_CSN_XID_ABORTED:
+				return false;
+		}
+	}
+
+	/*
+	 * by here, the inserting transaction has committed and is
+	 * snapshot-visible
+	 */
+
+	if (tuple->t_infomask & HEAP_XMAX_INVALID)	/* xid invalid or aborted */
+		return true;
+
+	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+		return true;
+
+	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
+	{
+		TransactionId xmax;
+
+		/* already checked above */
+		Assert(!HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask));
+
+		xmax = HeapTupleGetUpdateXid(tuple);
+
+		/* not LOCKED_ONLY, so it has to have an xmax */
+		Assert(TransactionIdIsValid(xmax));
+
+		if (TransactionIdIsCurrentTransactionId(xmax))
+		{
+			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+				return true;	/* deleted after scan started */
+			else
+				return false;	/* deleted before scan started */
+		}
+
+		switch (HeapTupleCSNGetXidVisibility(xmax, snapshot))
+		{
+			case HEAPTUPLE_CSN_XID_FALLBACK:
+				return HeapTupleSatisfiesMVCCLegacy(htup, snapshot, buffer, state);
+			case HEAPTUPLE_CSN_XID_VISIBLE:
+				return false;
+			case HEAPTUPLE_CSN_XID_IN_PROGRESS:
+			case HEAPTUPLE_CSN_XID_COMMITTING:
+			case HEAPTUPLE_CSN_XID_IN_FUTURE:
+			case HEAPTUPLE_CSN_XID_ABORTED:
+				return true;
+		}
+	}
+
+	if (!(tuple->t_infomask & HEAP_XMAX_COMMITTED))
+	{
+		HeapTupleCSNXidVisibility xmaxvisible;
+
+		if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple)))
+		{
+			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+				return true;	/* deleted after scan started */
+			else
+				return false;	/* deleted before scan started */
+		}
+
+		xmaxvisible = HeapTupleCSNGetXidVisibility(HeapTupleHeaderGetRawXmax(tuple),
+												   snapshot);
+		switch (xmaxvisible)
+		{
+			case HEAPTUPLE_CSN_XID_FALLBACK:
+				return HeapTupleSatisfiesMVCCLegacy(htup, snapshot, buffer, state);
+			case HEAPTUPLE_CSN_XID_VISIBLE:
+				SetHintBitsExt(tuple, buffer, HEAP_XMAX_COMMITTED,
+							   HeapTupleHeaderGetRawXmax(tuple), state);
+				return false;
+			case HEAPTUPLE_CSN_XID_IN_PROGRESS:
+			case HEAPTUPLE_CSN_XID_COMMITTING:
+			case HEAPTUPLE_CSN_XID_IN_FUTURE:
+				return true;
+			case HEAPTUPLE_CSN_XID_ABORTED:
+				SetHintBitsExt(tuple, buffer, HEAP_XMAX_INVALID,
+							   InvalidTransactionId, state);
+				return true;
+		}
+	}
+	else
+	{
+		switch (HeapTupleCSNGetXidVisibility(HeapTupleHeaderGetRawXmax(tuple),
+											 snapshot))
+		{
+			case HEAPTUPLE_CSN_XID_FALLBACK:
+				return HeapTupleSatisfiesMVCCLegacy(htup, snapshot, buffer, state);
+			case HEAPTUPLE_CSN_XID_VISIBLE:
+				return false;
+			case HEAPTUPLE_CSN_XID_IN_PROGRESS:
+			case HEAPTUPLE_CSN_XID_COMMITTING:
+			case HEAPTUPLE_CSN_XID_IN_FUTURE:
+			case HEAPTUPLE_CSN_XID_ABORTED:
+				return true;
+		}
+	}
+
+	pg_unreachable();
+}
+
+static inline bool
+HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
+					   Buffer buffer, SetHintBitsState *state)
+{
+	/*
+	 * Stage 1 only switches supported MVCC snapshots onto CSN semantics.
+	 * Unsupported shapes and local-buffer relations stay on the legacy
+	 * xid-array path explicitly.
+	 */
+	if (!SnapshotUsesCSN(snapshot) || BufferIsLocal(buffer))
+		return HeapTupleSatisfiesMVCCLegacy(htup, snapshot, buffer, state);
+
+	return HeapTupleSatisfiesMVCCCSN(htup, snapshot, buffer, state);
 }
 
 
