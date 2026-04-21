@@ -5,7 +5,8 @@
  *
  * This module provides a conservative, non-WAL-backed SLRU skeleton for
  * xid-to-CSN storage.  It does not claim crash-safe semantics.  Runtime
- * truncation and its retained-range bookkeeping remain deferred.
+ * truncation uses conservative runtime and legacy horizons, but durable
+ * retention reconstruction remains deferred.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -20,6 +21,7 @@
 #include "access/csn_mvcc_vars.h"
 #include "access/csnlog.h"
 #include "access/slru.h"
+#include "storage/procarray.h"
 
 /* We store one 64-bit CSN per xid. */
 #define CSNLOG_XACTS_PER_PAGE		(BLCKSZ / sizeof(CommitSeqNo))
@@ -42,6 +44,7 @@ static bool CsnlogPagePrecedes(int64 page1, int64 page2);
 static int	csnlog_errdetail_for_io_error(const void *opaque_data);
 static bool TransactionIdInCSNLogRange(TransactionId xid);
 static int	CSNLogReadPageForWrite(int64 pageno, TransactionId xid);
+static TransactionId CSNLogGetRetentionFloor(TransactionId oldestXactToKeep);
 
 static SlruDesc CsnlogSlruDesc;
 
@@ -112,6 +115,7 @@ StartupCSNLOG(TransactionId oldestActiveXID)
 	LWLockRelease(lock);
 
 	SetCSNOldestActiveXid(oldestActiveXID);
+	SetOldestCSNLogXid(oldestActiveXID);
 }
 
 /*
@@ -159,9 +163,63 @@ CheckPointCSNLOG(void)
 }
 
 /*
- * Phase B intentionally omits runtime truncation wiring.  A later phase must
- * introduce truncation together with retained-range tracking that can account
- * for explicit removal of older csnlog segments.
+ * Compute the oldest xid that we must still retain in pg_csnlog.
+ *
+ * The caller's requested floor is the baseline.  We keep that floor from
+ * moving right only when that remains conservative with respect to the
+ * runtime holders and legacy fallback horizons that still need old xid state.
+ */
+static TransactionId
+CSNLogGetRetentionFloor(TransactionId oldestXactToKeep)
+{
+	TransactionId runtimeFloor;
+	TransactionId clogFloor;
+
+	Assert(TransactionIdIsNormal(oldestXactToKeep));
+
+	runtimeFloor = GetOldestTransactionIdConsideredRunning();
+	if (TransactionIdIsValid(runtimeFloor) &&
+		TransactionIdPrecedes(runtimeFloor, oldestXactToKeep))
+		oldestXactToKeep = runtimeFloor;
+
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	clogFloor = TransamVariables->oldestClogXid;
+	LWLockRelease(XactTruncationLock);
+
+	if (TransactionIdIsValid(clogFloor) &&
+		TransactionIdPrecedes(clogFloor, oldestXactToKeep))
+		oldestXactToKeep = clogFloor;
+
+	return oldestXactToKeep;
+}
+
+/*
+ * Truncate old csnlog segments that are no longer needed by either runtime
+ * holders or legacy fallback lookups.
+ */
+void
+TruncateCSNLOG(TransactionId oldestXactToKeep)
+{
+	TransactionId retentionFloor;
+	int64		cutoffPage;
+
+	retentionFloor = CSNLogGetRetentionFloor(oldestXactToKeep);
+	cutoffPage = TransactionIdToCSNPage(retentionFloor);
+
+	if (!SlruScanDirectory(CsnlogCtl, SlruScanDirCbReportPresence, &cutoffPage))
+		return;
+
+	LWLockAcquire(XactTruncationLock, LW_EXCLUSIVE);
+	if (!TransactionIdIsValid(TransamVariables->oldestCsnlogXid) ||
+		TransactionIdPrecedes(TransamVariables->oldestCsnlogXid, retentionFloor))
+		TransamVariables->oldestCsnlogXid = retentionFloor;
+	SimpleLruTruncate(CsnlogCtl, cutoffPage);
+	LWLockRelease(XactTruncationLock);
+}
+
+/*
+ * Phase B intentionally omitted runtime truncation wiring.  Truncation is
+ * now conservative, but the durable retention contract remains prototype-only.
  */
 void
 ExtendCSNLOG(TransactionId newestXact)
@@ -251,8 +309,17 @@ TransactionIdGetCommitSeqNoIfAny(TransactionId xid, CommitSeqNo *csn)
 
 	*csn = InvalidCommitSeqNo;
 
+	/*
+	 * Keep the published CSN retention floor stable across the range check
+	 * and the subsequent SLRU read so VACUUM cannot truncate the backing
+	 * segment out from under an in-range lookup.
+	 */
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
 	if (!TransactionIdInCSNLogRange(xid))
+	{
+		LWLockRelease(XactTruncationLock);
 		return false;
+	}
 
 	pageno = TransactionIdToCSNPage(xid);
 	entryno = TransactionIdToCSNEntry(xid);
@@ -263,6 +330,7 @@ TransactionIdGetCommitSeqNoIfAny(TransactionId xid, CommitSeqNo *csn)
 	*csn = *ptr;
 
 	LWLockRelease(SimpleLruGetBankLock(CsnlogCtl, pageno));
+	LWLockRelease(XactTruncationLock);
 
 	return CommitSeqNoIsValid(*csn);
 }
@@ -319,11 +387,12 @@ TransactionIdInCSNLogRange(TransactionId xid)
 		return false;
 
 	/*
-	 * csnOldestActiveXid is only prototype-owned csnlog bookkeeping.  It is
-	 * not an authoritative replacement for procarray, GlobalVis, or
-	 * nonremovable horizon state.
+	 * oldestCsnlogXid is the monotonic retained-history floor for on-disk
+	 * csnlog segments.  It is separate from the runtime-only
+	 * csnOldestActiveXid, which can move backwards when old xmin holders
+	 * reappear.
 	 */
-	oldestActiveXid = ReadCSNOldestActiveXid();
+	oldestActiveXid = ReadOldestCSNLogXid();
 	if (!TransactionIdIsValid(oldestActiveXid))
 		return false;
 

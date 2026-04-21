@@ -32,6 +32,7 @@ CSNShmemInit(void)
 {
 	TransamVariables->nextCommitSeqNo = FirstNormalCommitSeqNo;
 	TransamVariables->csnOldestActiveXid = InvalidTransactionId;
+	TransamVariables->oldestCsnlogXid = InvalidTransactionId;
 }
 
 CommitSeqNo
@@ -142,4 +143,48 @@ AdvanceCSNOldestActiveXid(TransactionId xid)
 		TransactionIdPrecedes(TransamVariables->csnOldestActiveXid, xid))
 		TransamVariables->csnOldestActiveXid = xid;
 	LWLockRelease(ProcArrayLock);
+}
+
+TransactionId
+ReadOldestCSNLogXid(void)
+{
+	TransactionId xid;
+
+	if (LWLockHeldByMeInMode(XactTruncationLock, LW_SHARED) ||
+		LWLockHeldByMeInMode(XactTruncationLock, LW_EXCLUSIVE))
+		return TransamVariables->oldestCsnlogXid;
+
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	xid = TransamVariables->oldestCsnlogXid;
+	LWLockRelease(XactTruncationLock);
+
+	return xid;
+}
+
+void
+SetOldestCSNLogXid(TransactionId xid)
+{
+	Assert(!TransactionIdIsValid(xid) || TransactionIdIsNormal(xid));
+
+	if (LWLockHeldByMeInMode(XactTruncationLock, LW_EXCLUSIVE))
+	{
+		TransamVariables->oldestCsnlogXid = xid;
+		return;
+	}
+
+	LWLockAcquire(XactTruncationLock, LW_EXCLUSIVE);
+	TransamVariables->oldestCsnlogXid = xid;
+	LWLockRelease(XactTruncationLock);
+}
+
+void
+AdvanceOldestCSNLogXid(TransactionId xid)
+{
+	Assert(TransactionIdIsNormal(xid));
+
+	LWLockAcquire(XactTruncationLock, LW_EXCLUSIVE);
+	if (!TransactionIdIsValid(TransamVariables->oldestCsnlogXid) ||
+		TransactionIdPrecedes(TransamVariables->oldestCsnlogXid, xid))
+		TransamVariables->oldestCsnlogXid = xid;
+	LWLockRelease(XactTruncationLock);
 }

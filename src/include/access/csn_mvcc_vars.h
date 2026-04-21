@@ -23,5 +23,8 @@ extern TransactionId ReadCSNOldestActiveXid(void);
 extern void SetCSNOldestActiveXid(TransactionId xid);
 extern void SetCSNOldestActiveXidIfEarlier(TransactionId xid);
 extern void AdvanceCSNOldestActiveXid(TransactionId xid);
+extern TransactionId ReadOldestCSNLogXid(void);
+extern void SetOldestCSNLogXid(TransactionId xid);
+extern void AdvanceOldestCSNLogXid(TransactionId xid);
 
 #endif							/* CSN_MVCC_VARS_H */

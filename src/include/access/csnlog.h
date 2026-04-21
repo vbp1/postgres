@@ -25,6 +25,7 @@ extern void StartupCSNLOG(TransactionId oldestActiveXID);
 extern void TrimCSNLOG(void);
 extern void CheckPointCSNLOG(void);
 extern void ExtendCSNLOG(TransactionId newestXact);
+extern void TruncateCSNLOG(TransactionId oldestXactToKeep);
 
 extern void CSNLogSetSubTransParent(TransactionId xid, TransactionId parentXid);
 extern bool CSNLogGetSubTransParent(TransactionId xid, TransactionId *parentXid);

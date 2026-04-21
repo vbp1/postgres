@@ -327,14 +327,16 @@ typedef struct TransamVariablesData
 	uint64		xactCompletionCount;
 
 	/*
-	 * Prototype-owned CSN bookkeeping lower bound.  This does not replace
-	 * existing procarray, GlobalVis, or nonremovable horizon machinery.
+	 * Prototype-owned CSN runtime bookkeeping lower bound.  This does not
+	 * replace existing procarray, GlobalVis, or nonremovable horizon
+	 * machinery.
 	 */
 	TransactionId csnOldestActiveXid;
 
 	/*
 	 * These fields are protected by XactTruncationLock
 	 */
+	TransactionId oldestCsnlogXid;	/* oldest xid still retained in csnlog */
 	TransactionId oldestClogXid;	/* oldest it's safe to look up in clog */
 
 } TransamVariablesData;

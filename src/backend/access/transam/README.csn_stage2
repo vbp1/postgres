@@ -18,8 +18,9 @@ it is conservative by design:
 - `csnOldestActiveXid` is runtime bookkeeping, not a persisted truth across
   restart.
 - `csnlog` has storage and read/write plumbing, plus a conservative
-  end-of-recovery tail trim for the current page, but no runtime truncation or
-  crash-safe retention policy yet.
+  end-of-recovery tail trim and a runtime truncation path that stays within
+  existing runtime and fallback horizons.  It still has no crash-safe
+  retention reconstruction policy.
 
 
 Supported / Fallback / Forbidden Matrix
@@ -35,7 +36,7 @@ Supported / Fallback / Forbidden Matrix
 | `ImportSnapshot()` / `ExportSnapshot()` | Forbidden for CSN-sensitive snapshots | The wire format has no `snapshot_csn`, and import resets the field to invalid. CSN snapshots would silently downgrade today. |
 | `SerializeSnapshot()` / `RestoreSnapshot()` consumers | Forbidden for CSN-sensitive snapshots | Parallel scan handoff, file-based snapshot transport, and other consumers currently lose `snapshot_csn`. |
 | `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` | Implemented but not yet accepted for Stage 2 closure | The current tree already publishes conservative CSN state for prepared transactions, but Stage 2 still treats 2PC correctness as incomplete until retention, restart, and visibility contracts are closed. |
-| Crash / restart CSN retention | Fallback | Startup reinitializes runtime state conservatively, and end-of-recovery trims the unused tail of the current `pg_csnlog` page; there is still no durable CSN reconstruction path or runtime truncation policy. |
+| Crash / restart CSN retention | Fallback | Startup reinitializes runtime state conservatively, end-of-recovery trims the unused tail of the current `pg_csnlog` page, and VACUUM now truncates `pg_csnlog` conservatively against runtime and legacy horizons; there is still no durable CSN reconstruction path. |
 | Serializable, standby, recovery, logical decoding | Forbidden | Stage 2 does not claim CSN support for these paths. |
 
 
@@ -92,10 +93,17 @@ Horizon holders and truncation constraints
 - `csnOldestActiveXid` is only a prototype-owned lower bound. It helps
   `pg_csnlog` decide whether an xid is still in range, but it does not replace
   procarray, GlobalVis, or vacuum horizons.
-- `csnlog.c` explicitly says runtime truncation is not wired yet. That means
-  the cleanup policy still has to be defined around the full conservative
-  minimum of active xids, prepared xacts, replication slots, and any
-  `pg_xact` / `pg_subtrans` fallback constraints.
+- `oldestCsnlogXid` is a separate monotonic retained-history floor protected by
+  `XactTruncationLock`. Runtime procarray recomputation may move
+  `csnOldestActiveXid` backwards, but it must not widen the on-disk CSN range
+  after VACUUM has already truncated old segments.
+- `csnlog.c` now truncates only after folding in the runtime horizon from
+  `GetOldestTransactionIdConsideredRunning()` and the legacy fallback horizon
+  protected by `XactTruncationLock`. CSN readers also hold
+  `XactTruncationLock` shared across the range check plus SLRU read so VACUUM
+  cannot drop an in-range segment underneath an active lookup. The cutoff
+  stays conservative and primary-only instead of inventing a new visibility
+  oracle.
 - `TransactionIdGetLegacyCSNStatus()` already encodes the safe fallback rule:
   if both CSN storage and clog have forgotten an xid, the answer is
   `TRANSACTION_CSN_STATUS_INVALID`, not "committed".
@@ -113,6 +121,9 @@ Lifecycle wiring, including `varsup.c`
   lifecycle.
 - `StartupCSNLOG()` zeroes pages for the active CSN range and then publishes a
   runtime lower bound via `SetCSNOldestActiveXid()`.
+- `TruncateCSNLOG()` is now wired from `vacuum.c` and only removes segments
+  that are older than the conservative floor shared by runtime holders and
+  legacy fallback lookups.
 - The wiring is conservative, but it is not durable state reconstruction. A
   later phase still needs a restart-stable policy for the retained CSN range.
 
@@ -157,8 +168,9 @@ Open Risks
 
 - CSN snapshots still lose their boundary when exported, imported, or
   serialized through the current transport helpers.
-- `pg_csnlog` has no runtime truncation policy yet, so truncation safety must
-  still be defined and tested against every relevant horizon holder.
+- `pg_csnlog` truncation still depends on the runtime and legacy horizons
+  visible at vacuum time, so truncation safety must stay covered by tests
+  that exercise both the live horizon and restart paths.
 - Restart and prepared-transaction paths are conservative, but not yet backed
   by a restart-stable CSN retention contract.
 - Subxid overflow remains a risk until the fallback and parent-resolution

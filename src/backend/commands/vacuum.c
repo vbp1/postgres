@@ -26,6 +26,7 @@
 #include <math.h>
 
 #include "access/clog.h"
+#include "access/csnlog.h"
 #include "access/commit_ts.h"
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -1973,6 +1974,7 @@ vac_truncate_clog(TransactionId frozenXID,
 	 * Truncate CLOG, multixact and CommitTs to the oldest computed value.
 	 */
 	TruncateCLOG(frozenXID, oldestxid_datoid);
+	TruncateCSNLOG(frozenXID);
 	TruncateCommitTs(frozenXID);
 	TruncateMultiXact(minMulti, minmulti_datoid);
 
