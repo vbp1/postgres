@@ -11,20 +11,18 @@ pressure as the dominant bottleneck on commit-heavy workloads.
 Current baseline
 ----------------
 
-The current target tree still has two important dependencies on the legacy
-transaction-end path:
+The current target tree still keeps two deliberate legacy dependencies:
 
 1. `CommitTransaction()` and `AbortTransaction()` still end by calling
    `ProcArrayEndTransaction(MyProc, latestXid)`, which in turn may enter
    `ProcArrayGroupClearXid()` when `ProcArrayLock` is contended.
-2. `GetSnapshotData()` only assigns `snapshot_csn` when it does not observe a
-   backend with a visible xid already marked `DELAY_CHKPT_IN_COMMIT`.  When
-   that condition is seen, the snapshot falls back to legacy xid-array
-   semantics for safety.
+2. `GetSnapshotData()` still builds legacy xid arrays for compatibility and
+   explicit fallback, even though supported primary membership checks no
+   longer rely on those arrays semantically.
 
-This means the current CSN implementation is correct for the supported Stage 2
-surface, but ordinary primary snapshots still remain tightly coupled to the
-legacy ProcArray transaction-end timing.
+This means Stage 3 has reduced the correctness-critical dependence on the
+legacy path, but has not yet removed ProcArray from the transaction-end hot
+path itself.
 
 Stage 3 baseline guardrail
 --------------------------
@@ -41,11 +39,10 @@ The first Stage 3 deliverable is a characterization test, not a refactor:
 The point of this test is to make the current limitation explicit and
 reproducible before changing any of the commit publication or snapshot plumbing.
 
-Current C1 progress
--------------------
+Current Stage 3 state
+---------------------
 
-The current tree now has the first real Stage 3 `C1` slice on top of that
-baseline:
+The current tree now has the following landed Stage 3 slices:
 
 - `ProcArrayEndTransaction()` and `ProcArrayGroupClearXid()` no longer force a
   full `RecomputeCSNOldestActiveXid()` when the exiting backend cannot advance
@@ -57,19 +54,43 @@ baseline:
   supported primary `snapshot_csn` path, allowing concurrent snapshots to stay
   on CSN semantics during the short “published but not yet ProcArray-cleaned”
   window;
-- the new `csn_commit_published` isolation characterization fixes that
-  behavior as an explicit guardrail.
+- xid-less `xmin` holders in the supported primary snapshot lifecycle now feed
+  conservative CSN horizon bookkeeping earlier than the old full-procarray
+  recompute path;
+- the transient `csnFlags` marker is no longer cleared inside the locked
+  write-xact cleanup path, but is self-cleared immediately after
+  `ProcArrayEndTransaction()` returns;
+- `XidInMVCCSnapshot()` is now CSN-aware for snapshots that already carry a
+  valid `snapshot_csn`, so supported non-heap membership checks use
+  `TransactionIdGetCSNStatus()` plus `snapshot_csn` as their semantic source
+  of truth;
+- `TRANSACTION_CSN_STATUS_INVALID` still falls back explicitly to the legacy
+  xid-array logic, preserving the compatibility contract for unsupported or
+  unavailable answers;
+- the `csn_commit_published` isolation characterization remains the explicit
+  guardrail for the publication-before-cleanup window.
 
-This is intentionally narrow.  The legacy ProcArray slot still exists until the
-normal cleanup path runs, and unsupported snapshot shapes still use the old
-fallback behavior.  Stage 3 has not yet removed ProcArray from the transaction-
-end hot path, but it has started separating visibility-critical publication
-from that cleanup machinery.
+This is still intentionally conservative.  The legacy ProcArray slot remains
+authoritative until the normal cleanup path runs, unsupported snapshot shapes
+still stay on the legacy path, and snapshot array construction is still kept as
+compatibility state rather than being removed outright.
 
-Non-goals of this initial Stage 3 slice
----------------------------------------
+Local validation state
+----------------------
 
-- no behavioral change to production builds without injection points enabled
-- no attempt yet to change the support matrix
-- no claim yet that ProcArray pressure has been reduced
-- no change yet to standby, recovery, or logical decoding semantics
+- `src/test/modules/injection_points check` is green, including
+  `csn_commit_fallback` and `csn_commit_published`;
+- `src/test/regress check` is green;
+- `src/test/isolation check` is green.
+
+Remaining closure item
+----------------------
+
+The remaining Stage 3 acceptance blocker is no longer a local correctness gap.
+It is the external performance gate from the Stage 3 plan:
+
+- run the agreed `pgbench` compare on a dedicated external host;
+- collect the vanilla PostgreSQL baseline first;
+- rerun the same profile against this Stage 3 implementation candidate;
+- compare wait-share, median TPS, and p95 latency under the documented dual
+  acceptance gate.

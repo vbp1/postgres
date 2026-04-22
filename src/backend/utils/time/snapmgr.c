@@ -1881,34 +1881,9 @@ RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
 	SetTransactionSnapshot(snapshot, NULL, InvalidPid, source_pgproc);
 }
 
-/*
- * XidInMVCCSnapshot
- *		Is the given XID still-in-progress according to the snapshot?
- *
- * Note: GetSnapshotData never stores either top xid or subxids of our own
- * backend into a snapshot, so these xids will not be reported as "running"
- * by this function.  This is OK for current uses, because we always check
- * TransactionIdIsCurrentTransactionId first, except when it's known the
- * XID could not be ours anyway.
- */
-bool
-XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+static bool
+XidInMVCCSnapshotLegacy(TransactionId xid, Snapshot snapshot)
 {
-	/*
-	 * Make a quick range check to eliminate most XIDs without looking at the
-	 * xip arrays.  Note that this is OK even if we convert a subxact XID to
-	 * its parent below, because a subxact with XID < xmin has surely also got
-	 * a parent with XID < xmin, while one with XID >= xmax must belong to a
-	 * parent that was not yet committed at the time of this snapshot.
-	 */
-
-	/* Any xid < xmin is not in-progress */
-	if (TransactionIdPrecedes(xid, snapshot->xmin))
-		return false;
-	/* Any xid >= xmax is in-progress */
-	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
-		return true;
-
 	/*
 	 * Snapshot information is stored slightly differently in snapshots taken
 	 * during recovery.
@@ -1986,6 +1961,76 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	}
 
 	return false;
+}
+
+static bool
+XidInMVCCSnapshotCSN(TransactionId xid, Snapshot snapshot)
+{
+	CommitSeqNo xidcsn = InvalidCommitSeqNo;
+	TransactionCSNStatus xidstatus;
+
+	Assert(SnapshotUsesCSN(snapshot));
+
+	xidstatus = TransactionIdGetCSNStatus(xid, &xidcsn);
+
+	switch (xidstatus)
+	{
+		case TRANSACTION_CSN_STATUS_INVALID:
+
+			/*
+			 * The supported CSN path must not invent an answer when the status
+			 * API cannot prove one. Fall back to the existing xid-array logic
+			 * explicitly until F1 removes that compatibility dependency too.
+			 */
+			return XidInMVCCSnapshotLegacy(xid, snapshot);
+		case TRANSACTION_CSN_STATUS_IN_PROGRESS:
+		case TRANSACTION_CSN_STATUS_COMMITTING:
+			return true;
+		case TRANSACTION_CSN_STATUS_ABORTED:
+			return false;
+		case TRANSACTION_CSN_STATUS_COMMITTED:
+			if (CommitSeqNoIsFrozen(xidcsn))
+				return false;
+
+			return !CommitSeqNoPrecedes(xidcsn, snapshot->snapshot_csn);
+	}
+
+	pg_unreachable();
+}
+
+/*
+ * XidInMVCCSnapshot
+ *		Is the given XID still-in-progress according to the snapshot?
+ *
+ * Note: GetSnapshotData never stores either top xid or subxids of our own
+ * backend into a snapshot, so these xids will not be reported as "running"
+ * by this function.  This is OK for current uses, because we always check
+ * TransactionIdIsCurrentTransactionId first, except when it's known the
+ * XID could not be ours anyway.
+ */
+bool
+XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+{
+	/*
+	 * Make a quick range check to eliminate most XIDs without looking at the
+	 * snapshot payload. Note that this is OK even if a later fallback converts
+	 * a subxact XID to its parent below, because a subxact with XID < xmin has
+	 * surely also got a parent with XID < xmin, while one with XID >= xmax
+	 * must belong to a parent that was not yet committed at the time of this
+	 * snapshot.
+	 */
+
+	/* Any xid < xmin is not in-progress */
+	if (TransactionIdPrecedes(xid, snapshot->xmin))
+		return false;
+	/* Any xid >= xmax is in-progress */
+	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
+		return true;
+
+	if (SnapshotUsesCSN(snapshot))
+		return XidInMVCCSnapshotCSN(xid, snapshot);
+
+	return XidInMVCCSnapshotLegacy(xid, snapshot);
 }
 
 /* ResourceOwner callbacks */
