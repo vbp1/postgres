@@ -34,15 +34,23 @@ $node_pitr->append_conf(
 recovery_target_name = 'rp'
 recovery_target_action = 'promote'});
 
-# Workload with a prepared transaction and the target restore point.
+# Workload with prepared transactions and the target restore point.
 $node_primary->psql(
 	'postgres', qq{
-CREATE TABLE foo(i int);
+CREATE TABLE foo(tag text PRIMARY KEY);
 BEGIN;
-INSERT INTO foo VALUES(1);
-PREPARE TRANSACTION 'fooinsert';
+INSERT INTO foo VALUES('commit_top');
+SAVEPOINT s1;
+INSERT INTO foo VALUES('commit_sub');
+PREPARE TRANSACTION 'foocommit';
+BEGIN;
+INSERT INTO foo VALUES('abort_top');
+SAVEPOINT s1;
+INSERT INTO foo VALUES('abort_sub');
+PREPARE TRANSACTION 'fooabort';
 SELECT pg_create_restore_point('rp');
-INSERT INTO foo VALUES(2);
+INSERT INTO foo VALUES('after_rp');
+COMMIT;
 });
 
 # Find next WAL segment to be archived
@@ -66,20 +74,46 @@ $node_pitr->start;
 $node_pitr->poll_query_until('postgres', "SELECT pg_is_in_recovery() = 'f';")
   or die "Timed out while waiting for PITR promotion";
 
-# Commit the prepared transaction in the latest timeline and check its
-# result.  There should only be one row in the table, coming from the
-# prepared transaction.  The row from the INSERT after the restore point
-# should not show up, since our recovery target was older than the second
-# INSERT done.
-$node_pitr->psql('postgres', qq{COMMIT PREPARED 'fooinsert';});
-my $result = $node_pitr->safe_psql('postgres', "SELECT * FROM foo;");
-is($result, qq{1}, "check table contents after COMMIT PREPARED");
+# Hold a CSN snapshot on the promoted primary before finishing either prepared
+# transaction. Prepared rows stay invisible until finish-prepared publishes a
+# final outcome, and an old snapshot must keep that decision stable.
+my $snapshot_session = $node_pitr->background_psql('postgres',
+	on_error_stop => 1);
+
+my $result;
+
+$snapshot_session->query_safe("BEGIN ISOLATION LEVEL REPEATABLE READ;");
+pass('open repeatable read snapshot on promoted primary');
+
+$result = $snapshot_session->query_safe(
+	"SELECT pg_current_snapshot_uses_csn(), count(*) FROM foo;");
+is($result, 't|0',
+	'prepared rows stay invisible to a CSN snapshot before finish');
+
+$node_pitr->psql('postgres', qq{
+COMMIT PREPARED 'foocommit';
+ROLLBACK PREPARED 'fooabort';
+});
+
+$result = $snapshot_session->query_safe(
+	"SELECT pg_current_snapshot_uses_csn(), count(*) FROM foo;");
+is($result, 't|0',
+	'old CSN snapshot keeps prepared rows invisible after finish');
+
+$snapshot_session->query_safe("COMMIT;");
+
+$result = $node_pitr->safe_psql('postgres',
+	"SELECT string_agg(tag, ',' ORDER BY tag) FROM foo;");
+is($result, 'commit_sub,commit_top',
+	'new snapshot sees only committed prepared rows after PITR finish');
+
+$snapshot_session->quit;
 
 # Insert more data and do a checkpoint.  These should be generated on the
 # timeline chosen after the PITR promotion.
 $node_pitr->psql(
 	'postgres', qq{
-INSERT INTO foo VALUES(3);
+INSERT INTO foo VALUES('post_pitr');
 CHECKPOINT;
 });
 

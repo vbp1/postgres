@@ -149,6 +149,11 @@ Lifecycle wiring, including `varsup.c`
 - `FinishPreparedTransaction()` follows the safe order: publish the finish
   record, update transaction status, remove the procarray entry, and only then
   run callbacks and cleanup.
+- `src/test/recovery/t/023_pitr_prepared_xact.pl` now proves the primary-side
+  visibility contract after restart: a repeatable-read snapshot on the
+  promoted node keeps `snapshot_csn`, does not see prepared rows before
+  `COMMIT PREPARED` / `ROLLBACK PREPARED`, and still does not see them after
+  finish while a new snapshot sees only the committed prepared rows.
 - The current restart behavior is conservative, but it does not yet prove a
   restart-stable CSN story for prepared xacts. That remains a later-phase
   closure item.
