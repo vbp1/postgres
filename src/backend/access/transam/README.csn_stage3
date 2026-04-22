@@ -5,24 +5,27 @@ machinery.
 
 The production goal for Stage 3 is not “more CSN code” by itself.  The real
 goal is to preserve the existing primary-only correctness contract while
-removing `ProcArrayGroupClearXid()` and related ProcArray transaction-end
-pressure as the dominant bottleneck on commit-heavy workloads.
+removing direct ordinary transaction-end dependence on
+`ProcArrayEndTransaction()` / `ProcArrayGroupClearXid()` as the dominant
+bottleneck candidate on commit-heavy workloads.
 
 Current baseline
 ----------------
 
 The current target tree still keeps two deliberate legacy dependencies:
 
-1. `CommitTransaction()` and `AbortTransaction()` still end by calling
-   `ProcArrayEndTransaction(MyProc, latestXid)`, which in turn may enter
-   `ProcArrayGroupClearXid()` when `ProcArrayLock` is contended.
-2. `GetSnapshotData()` still builds legacy xid arrays for compatibility and
+1. `GetSnapshotData()` still builds legacy xid arrays for compatibility and
    explicit fallback, even though supported primary membership checks no
    longer rely on those arrays semantically.
+2. `2PC` and recovery still use their own ProcArray-owned exit paths
+   (`ProcArrayRemove()` and `ExpireTreeKnownAssignedTransactionIds()`), so
+   the ordinary primary path is no longer the whole Stage 3 surface.
 
-This means Stage 3 has reduced the correctness-critical dependence on the
-legacy path, but has not yet removed ProcArray from the transaction-end hot
-path itself.
+The first item above is no longer about direct ordinary commit/abort calls:
+those now end through `ProcArrayEndTransactionPrimary()`, which removes the
+ordinary backend from xid/xmin snapshot membership and advances
+`latestCompletedXid` / `xactCompletionCount` without routing ordinary commit
+through `ProcArrayEndTransaction()` or `ProcArrayGroupClearXid()`.
 
 Stage 3 baseline guardrail
 --------------------------
@@ -64,16 +67,24 @@ The current tree now has the following landed Stage 3 slices:
   valid `snapshot_csn`, so supported non-heap membership checks use
   `TransactionIdGetCSNStatus()` plus `snapshot_csn` as their semantic source
   of truth;
+- `TransactionIdIsInProgress()` is now CSN-first for the ordinary primary
+  path, while `TRANSACTION_CSN_STATUS_INVALID` and recovery still fall back
+  explicitly to the legacy procarray/subtrans algorithm;
+- ordinary top-level `COMMIT` and `ABORT` no longer call
+  `ProcArrayEndTransaction()` directly; they now use
+  `ProcArrayEndTransactionPrimary()`, which clears ordinary xid/xmin snapshot
+  membership and reuse counters under `ProcArrayLock`, while leaving unlocked
+  `vxid` / CSN-marker cleanup to the caller;
 - `TRANSACTION_CSN_STATUS_INVALID` still falls back explicitly to the legacy
   xid-array logic, preserving the compatibility contract for unsupported or
   unavailable answers;
 - the `csn_commit_published` isolation characterization remains the explicit
   guardrail for the publication-before-cleanup window.
 
-This is still intentionally conservative.  The legacy ProcArray slot remains
-authoritative until the normal cleanup path runs, unsupported snapshot shapes
-still stay on the legacy path, and snapshot array construction is still kept as
-compatibility state rather than being removed outright.
+This is still intentionally conservative. Unsupported snapshot shapes still
+stay on the legacy path, snapshot array construction is still kept as
+compatibility state rather than being removed outright, and `2PC` /
+recovery continue to use their own legacy ProcArray-owned exit paths.
 
 Local validation state
 ----------------------

@@ -749,6 +749,105 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 }
 
 /*
+ * ProcArrayEndTransactionPrimary -- end ordinary primary transaction exposure
+ *
+ * This removes the ordinary backend from xid/xmin snapshot membership and
+ * advances the reuse counters, but leaves unlocked virtual-xid and other
+ * backend-local cleanup to the caller.
+ */
+void
+ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
+{
+	if (TransactionIdIsValid(latestXid))
+	{
+		int			pgxactoff = proc->pgxactoff;
+		bool		recomputeCsnOldestActiveXid;
+
+		Assert(TransactionIdIsValid(proc->xid));
+
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+
+		recomputeCsnOldestActiveXid =
+			ProcCouldAdvanceCSNOldestActiveXid(proc);
+
+		Assert(TransactionIdIsValid(ProcGlobal->xids[pgxactoff]));
+		Assert(ProcGlobal->xids[pgxactoff] == proc->xid);
+
+		ProcGlobal->xids[pgxactoff] = InvalidTransactionId;
+		proc->xid = InvalidTransactionId;
+		proc->xmin = InvalidTransactionId;
+
+		/* must be cleared with xid/xmin: */
+		/* avoid unnecessarily dirtying shared cachelines */
+		if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
+		{
+			proc->statusFlags &= ~PROC_VACUUM_STATE_MASK;
+			ProcGlobal->statusFlags[pgxactoff] = proc->statusFlags;
+		}
+
+		/*
+		 * Clear the subtransaction-XID cache before the PGPROC slot can be
+		 * reused by the next top-level transaction in this backend.
+		 */
+		Assert(ProcGlobal->subxidStates[pgxactoff].count == proc->subxidStatus.count &&
+			   ProcGlobal->subxidStates[pgxactoff].overflowed == proc->subxidStatus.overflowed);
+		if (proc->subxidStatus.count > 0 || proc->subxidStatus.overflowed)
+		{
+			ProcGlobal->subxidStates[pgxactoff].count = 0;
+			ProcGlobal->subxidStates[pgxactoff].overflowed = false;
+			proc->subxidStatus.count = 0;
+			proc->subxidStatus.overflowed = false;
+		}
+
+		MaintainLatestCompletedXid(latestXid);
+		TransamVariables->xactCompletionCount++;
+
+		if (recomputeCsnOldestActiveXid)
+			RecomputeCSNOldestActiveXid();
+
+		LWLockRelease(ProcArrayLock);
+	}
+	else
+	{
+		bool		needProcArrayLock;
+		bool		recomputeCsnOldestActiveXid = false;
+
+		Assert(!TransactionIdIsValid(proc->xid));
+		Assert(proc->subxidStatus.count == 0);
+		Assert(!proc->subxidStatus.overflowed);
+
+		needProcArrayLock =
+			TransactionIdIsValid(proc->xmin) ||
+			(proc->statusFlags & PROC_VACUUM_STATE_MASK) != 0;
+
+		if (needProcArrayLock)
+		{
+			LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+
+			recomputeCsnOldestActiveXid =
+				ProcCouldAdvanceCSNOldestActiveXid(proc);
+			proc->xmin = InvalidTransactionId;
+
+			/* must be cleared with xid/xmin: */
+			/* avoid unnecessarily dirtying shared cachelines */
+			if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
+			{
+				Assert(proc->statusFlags == ProcGlobal->statusFlags[proc->pgxactoff]);
+				proc->statusFlags &= ~PROC_VACUUM_STATE_MASK;
+				ProcGlobal->statusFlags[proc->pgxactoff] = proc->statusFlags;
+			}
+
+			if (recomputeCsnOldestActiveXid)
+				RecomputeCSNOldestActiveXid();
+
+			LWLockRelease(ProcArrayLock);
+		}
+		else
+			proc->xmin = InvalidTransactionId;
+	}
+}
+
+/*
  * Mark a write transaction as no longer running.
  *
  * We don't do any locking here; caller must handle that.
@@ -1594,8 +1693,8 @@ ProcArrayApplyXidAssignment(TransactionId topxid,
  * This buys back some concurrency (and we can't retrieve the main Xids from
  * ProcGlobal->xids[] again anyway; see GetNewTransactionId).
  */
-bool
-TransactionIdIsInProgress(TransactionId xid)
+static bool
+TransactionIdIsInProgressLegacy(TransactionId xid)
 {
 	static TransactionId *xids = NULL;
 	static TransactionId *other_xids;
@@ -1816,6 +1915,82 @@ TransactionIdIsInProgress(TransactionId xid)
 
 	cachedXidIsNotInProgress = xid;
 	return false;
+}
+
+static bool
+TransactionIdIsInProgressCSN(TransactionId xid)
+{
+	TransactionCSNStatus xidstatus;
+
+	if (RecoveryInProgress())
+		return TransactionIdIsInProgressLegacy(xid);
+
+	xidstatus = TransactionIdGetCSNStatus(xid, NULL);
+
+	switch (xidstatus)
+	{
+		case TRANSACTION_CSN_STATUS_INVALID:
+
+			/*
+			 * Ordinary primary callers can ask the CSN status API first, but
+			 * unsupported or no-longer-provable cases must still use the
+			 * legacy procarray/subtrans answer path explicitly.
+			 */
+			return TransactionIdIsInProgressLegacy(xid);
+		case TRANSACTION_CSN_STATUS_IN_PROGRESS:
+		case TRANSACTION_CSN_STATUS_COMMITTING:
+			return true;
+		case TRANSACTION_CSN_STATUS_ABORTED:
+		case TRANSACTION_CSN_STATUS_COMMITTED:
+			cachedXidIsNotInProgress = xid;
+			return false;
+	}
+
+	pg_unreachable();
+}
+
+bool
+TransactionIdIsInProgress(TransactionId xid)
+{
+	/*
+	 * Keep the cheapest local fast paths ahead of both the CSN-aware answer
+	 * and the legacy procarray fallback.
+	 */
+
+	/*
+	 * Don't bother checking a transaction older than RecentXmin; it could not
+	 * possibly still be running.  (Note: in particular, this guarantees that
+	 * we reject InvalidTransactionId, FrozenTransactionId, etc as not
+	 * running.)
+	 */
+	if (TransactionIdPrecedes(xid, RecentXmin))
+	{
+		xc_by_recent_xmin_inc();
+		return false;
+	}
+
+	/*
+	 * We may have just checked the status of this transaction, so if it is
+	 * already known to be completed, we can fall out without any access to
+	 * shared memory.
+	 */
+	if (TransactionIdEquals(cachedXidIsNotInProgress, xid))
+	{
+		xc_by_known_xact_inc();
+		return false;
+	}
+
+	/*
+	 * Also, we can handle our own transaction (and subtransactions) without
+	 * any access to shared memory.
+	 */
+	if (TransactionIdIsCurrentTransactionId(xid))
+	{
+		xc_by_my_xact_inc();
+		return true;
+	}
+
+	return TransactionIdIsInProgressCSN(xid);
 }
 
 

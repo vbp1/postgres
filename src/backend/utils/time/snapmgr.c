@@ -1102,9 +1102,9 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 	FirstSnapshotSet = false;
 
 	/*
-	 * During normal commit processing, we call ProcArrayEndTransaction() to
-	 * reset the MyProc->xmin. That call happens prior to the call to
-	 * AtEOXact_Snapshot(), so we need not touch xmin here at all.
+	 * During normal commit processing, the ordinary primary path clears
+	 * MyProc->xmin before AtEOXact_Snapshot() runs, so we need not touch xmin
+	 * here at all.
 	 */
 	if (resetXmin)
 		SnapshotResetXmin();

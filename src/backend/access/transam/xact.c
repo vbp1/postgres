@@ -2463,7 +2463,8 @@ CommitTransaction(void)
 	 * must be done _before_ releasing locks we hold and _after_
 	 * RecordTransactionCommit.
 	 */
-	ProcArrayEndTransaction(MyProc, latestXid);
+	ProcArrayEndTransactionPrimary(MyProc, latestXid);
+	MyProc->vxid.lxid = InvalidLocalTransactionId;
 	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
 
 	/*
@@ -3035,7 +3036,8 @@ AbortTransaction(void)
 	 * must be done _before_ releasing locks we hold and _after_
 	 * RecordTransactionAbort.
 	 */
-	ProcArrayEndTransaction(MyProc, latestXid);
+	ProcArrayEndTransactionPrimary(MyProc, latestXid);
+	MyProc->vxid.lxid = InvalidLocalTransactionId;
 	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
 
 	/*
