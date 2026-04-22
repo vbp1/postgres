@@ -634,6 +634,12 @@ BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 SET TRANSACTION SNAPSHOT 'FFF-FFF-F';
 ROLLBACK;
 
+-- CSN-sensitive snapshots must not be exported through the SQL text format.
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT pg_current_snapshot_uses_csn() AS uses_csn;
+SELECT pg_export_snapshot();
+ROLLBACK;
+
 -- Test for successful cleanup of an aborted transaction at session exit.
 -- THIS MUST BE THE LAST TEST IN THIS FILE.
 

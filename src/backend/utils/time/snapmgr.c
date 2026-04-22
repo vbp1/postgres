@@ -247,6 +247,8 @@ ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snap)
  *
  * Only these fields need to be sent to the cooperating backend; the
  * remaining ones can (and must) be set by the receiver upon restore.
+ * snapshot_csn is included so internal binary transport preserves CSN-aware
+ * MVCC snapshots.
  */
 typedef struct SerializedSnapshotData
 {
@@ -257,6 +259,7 @@ typedef struct SerializedSnapshotData
 	bool		suboverflowed;
 	bool		takenDuringRecovery;
 	CommandId	curcid;
+	CommitSeqNo snapshot_csn;
 } SerializedSnapshotData;
 
 /*
@@ -1161,6 +1164,11 @@ ExportSnapshot(Snapshot snapshot)
 	 * Importers of the snapshot must see them as still running, so get their
 	 * XIDs to add them to the snapshot.
 	 */
+	if (SnapshotUsesCSN(snapshot))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot export a CSN-sensitive snapshot")));
+
 	nchildren = xactGetCommittedChildren(&children);
 
 	/*
@@ -1520,6 +1528,16 @@ ImportSnapshot(const char *idstr)
 	snapshot.snapshot_csn = InvalidCommitSeqNo;
 
 	/*
+	 * SQL-level snapshot import/export remains text-only and does not support
+	 * CSN-sensitive snapshots.  If a CSN marker is present in the file, reject
+	 * the import explicitly rather than silently downgrading it.
+	 */
+	if (strncmp(filebuf, "csn:", 4) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot import a CSN-sensitive snapshot")));
+
+	/*
 	 * Do some additional sanity checking, just to protect ourselves.  We
 	 * don't trouble to check the array elements, just the most critical
 	 * fields.
@@ -1749,6 +1767,7 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 	serialized_snapshot.suboverflowed = snapshot->suboverflowed;
 	serialized_snapshot.takenDuringRecovery = snapshot->takenDuringRecovery;
 	serialized_snapshot.curcid = snapshot->curcid;
+	serialized_snapshot.snapshot_csn = snapshot->snapshot_csn;
 
 	/*
 	 * Ignore the SubXID array if it has overflowed, unless the snapshot was
@@ -1822,7 +1841,7 @@ RestoreSnapshot(char *start_address)
 	snapshot->takenDuringRecovery = serialized_snapshot.takenDuringRecovery;
 	snapshot->curcid = serialized_snapshot.curcid;
 	snapshot->snapXactCompletionCount = 0;
-	snapshot->snapshot_csn = InvalidCommitSeqNo;
+	snapshot->snapshot_csn = serialized_snapshot.snapshot_csn;
 
 	/* Copy XIDs, if present. */
 	if (serialized_snapshot.xcnt > 0)

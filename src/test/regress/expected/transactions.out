@@ -1199,6 +1199,17 @@ BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 SET TRANSACTION SNAPSHOT 'FFF-FFF-F';
 ERROR:  snapshot "FFF-FFF-F" does not exist
 ROLLBACK;
+-- CSN-sensitive snapshots must not be exported through the SQL text format.
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT pg_current_snapshot_uses_csn() AS uses_csn;
+ uses_csn 
+----------
+ t
+(1 row)
+
+SELECT pg_export_snapshot();
+ERROR:  cannot export a CSN-sensitive snapshot
+ROLLBACK;
 -- Test for successful cleanup of an aborted transaction at session exit.
 -- THIS MUST BE THE LAST TEST IN THIS FILE.
 begin;

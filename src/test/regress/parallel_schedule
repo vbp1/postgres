@@ -88,6 +88,7 @@ test: rules psql psql_crosstab psql_pipeline amutils stats_ext collate.linux.utf
 # select_parallel depends on create_misc
 # ----------
 test: select_parallel
+test: csn_snapshot_transport
 test: write_parallel
 test: vacuum_parallel
 
