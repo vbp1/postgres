@@ -698,8 +698,12 @@ AssignTransactionId(TransactionState s)
 		log_unknown_top = true;
 
 	/*
-	 * Generate a new FullTransactionId and record its xid in PGPROC and
-	 * pg_subtrans.
+	 * Generate a new FullTransactionId and record its xid in PGPROC.
+	 *
+	 * Subtransactions also mirror the immediate parent link into pg_subtrans
+	 * and the CSN parent map so supported primary MVCC snapshots can resolve
+	 * non-overflowed subxids through pg_csnlog while the snapshot remains
+	 * eligible for snapshot_csn.
 	 *
 	 * NB: we must make the subtrans entry BEFORE the Xid appears anywhere in
 	 * shared storage other than PGPROC; because if there's no room for it in

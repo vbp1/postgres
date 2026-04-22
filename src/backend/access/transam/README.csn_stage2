@@ -29,6 +29,7 @@ Supported / Fallback / Forbidden Matrix
 | Path | Status | Current baseline |
 | --- | --- | --- |
 | `GetSnapshotData()` for primary MVCC `READ COMMITTED` / `REPEATABLE READ` | Supported | Builds `snapshot_csn` only for primary, non-overflowed, non-serializable MVCC snapshots that do not observe a backend in the commit critical section. |
+| `SubTransactionIdSetCSNParent()` / `SubTransSetParent()` | Supported for non-overflowed subxids | Records the immediate parent link in `pg_csnlog` alongside `pg_subtrans` bookkeeping. Overflowed snapshots do not get a valid `snapshot_csn` and stay on the legacy xid-array path. |
 | `HeapTupleSatisfiesMVCCCSN()` | Supported | Uses `TransactionIdGetCSNStatus()` and `snapshot_csn`; local-buffer relations still fall back to the legacy path. |
 | `TransactionIdGetCSNStatus()` | Supported chokepoint | Central status API for CSN-aware callers; returns `INVALID` instead of inventing a committed answer when the CSN story is not safe. |
 | `GetSnapshotDataReuse()` | Fallback | Reuse is disabled for CSN snapshots, so the snapshot is rebuilt instead of assuming a stable CSN boundary. |
@@ -60,6 +61,18 @@ Snapshot install, reuse, import, and export
 
 - `GetSnapshotData()` in `procarray.c` only assigns `snapshot_csn` when the
   snapshot is primary-side, non-overflowed, and not serializable.
+- Subtransaction parent links are recorded in both `pg_subtrans` and
+  `pg_csnlog` when a subxid is assigned. That lets supported primary MVCC
+  snapshots resolve non-overflowed subxids through the CSN path while the
+  snapshot remains eligible for `snapshot_csn`.
+- Phase D coverage directly proves the snapshot-side contract here: eligible
+  non-overflowed MVCC snapshots keep `snapshot_csn`, and overflowed snapshots
+  clear it before visibility checks begin. Direct runtime proof that every
+  subxid reader stays on the intended CSN parent-resolution path remains a
+  narrower follow-up item.
+- Once `suboverflowed` is true, `GetSnapshotData()` deliberately clears the
+  CSN boundary and the reader stays on the legacy xid-array plus
+  `pg_subtrans` path.
 - `GetSnapshotDataReuse()` deliberately returns false for CSN snapshots, so
   the code rebuilds them instead of relying on reuse after any transaction
   completion.

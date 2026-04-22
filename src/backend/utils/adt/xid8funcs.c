@@ -413,6 +413,23 @@ pg_current_snapshot(PG_FUNCTION_ARGS)
 }
 
 /*
+ * pg_current_snapshot_uses_csn() returns bool
+ *
+ *		Return true if the active MVCC snapshot carries a valid CSN boundary.
+ */
+Datum
+pg_current_snapshot_uses_csn(PG_FUNCTION_ARGS)
+{
+	Snapshot	cur;
+
+	cur = GetActiveSnapshot();
+	if (cur == NULL)
+		elog(ERROR, "no active snapshot set");
+
+	PG_RETURN_BOOL(SnapshotUsesCSN(cur));
+}
+
+/*
  * pg_snapshot_in(cstring) returns pg_snapshot
  *
  *		input function for type pg_snapshot

@@ -2361,6 +2361,14 @@ GetSnapshotData(Snapshot snapshot)
 			Assert(TransactionIdIsNormal(xid));
 
 			/*
+			 * Overflowed backend-local subxid caches remain a CSN hazard for
+			 * this procarray view even when the backend's top xid is >= xmax
+			 * and therefore doesn't need an explicit xip entry.
+			 */
+			if (subxidStates[pgxactoff].overflowed)
+				suboverflowed = true;
+
+			/*
 			 * If the XID is >= xmax, we can skip it; such transactions will
 			 * be treated as running anyway (and any sub-XIDs will also be >=
 			 * xmax).
@@ -2399,25 +2407,19 @@ GetSnapshotData(Snapshot snapshot)
 			 */
 			if (!suboverflowed)
 			{
+				int			nsubxids = subxidStates[pgxactoff].count;
 
-				if (subxidStates[pgxactoff].overflowed)
-					suboverflowed = true;
-				else
+				if (nsubxids > 0)
 				{
-					int			nsubxids = subxidStates[pgxactoff].count;
+					int			subpgprocno = pgprocnos[pgxactoff];
+					PGPROC	   *subproc = &allProcs[subpgprocno];
 
-					if (nsubxids > 0)
-					{
-						int			subpgprocno = pgprocnos[pgxactoff];
-						PGPROC	   *subproc = &allProcs[subpgprocno];
+					pg_read_barrier();	/* pairs with GetNewTransactionId */
 
-						pg_read_barrier();	/* pairs with GetNewTransactionId */
-
-						memcpy(snapshot->subxip + subcount,
-							   subproc->subxids.xids,
-							   nsubxids * sizeof(TransactionId));
-						subcount += nsubxids;
-					}
+					memcpy(snapshot->subxip + subcount,
+						   subproc->subxids.xids,
+						   nsubxids * sizeof(TransactionId));
+					subcount += nsubxids;
 				}
 			}
 		}
