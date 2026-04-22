@@ -25,6 +25,7 @@ extern void ProcArrayRemove(PGPROC *proc, TransactionId latestXid);
 extern void ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid);
 extern void ProcArrayClearTransaction(PGPROC *proc);
 extern void ProcArrayMarkCSNSnapshotSafeToIgnore(PGPROC *proc);
+extern void ProcArrayUpdateXmin(PGPROC *proc, TransactionId xmin);
 
 extern void ProcArrayInitRecovery(TransactionId initializedUptoXID);
 extern void ProcArrayApplyRecoveryInfo(RunningTransactions running);

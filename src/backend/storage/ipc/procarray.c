@@ -1154,6 +1154,53 @@ ProcArrayMarkCSNSnapshotSafeToIgnore(PGPROC *proc)
 	proc->csnFlags |= PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE;
 }
 
+void
+ProcArrayUpdateXmin(PGPROC *proc, TransactionId xmin)
+{
+	TransactionId oldXmin;
+
+	Assert(proc == MyProc);
+	Assert(!TransactionIdIsValid(xmin) || TransactionIdIsNormal(xmin));
+
+	oldXmin = proc->xmin;
+	if (oldXmin == xmin)
+		return;
+
+	/*
+	 * Lowering xmin or installing it for the first time can only move the
+	 * conservative CSN floor backwards, so the existing "if earlier" helper
+	 * is sufficient.
+	 */
+	if (!TransactionIdIsValid(oldXmin) ||
+		(TransactionIdIsValid(xmin) &&
+		 !TransactionIdPrecedes(oldXmin, xmin)))
+	{
+		proc->xmin = xmin;
+		if (TransactionIdIsNormal(xmin))
+			SetCSNOldestActiveXidIfEarlier(xmin);
+		return;
+	}
+
+	/*
+	 * Advancing or clearing xmin can only make the floor newer, so we need a
+	 * conditional full recompute if this backend could be holding it.
+	 */
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	if (proc->xmin == oldXmin)
+	{
+		bool		recomputeCsnOldestActiveXid;
+
+		recomputeCsnOldestActiveXid =
+			ProcCouldAdvanceCSNOldestActiveXid(proc);
+		proc->xmin = xmin;
+		if (recomputeCsnOldestActiveXid)
+			RecomputeCSNOldestActiveXid();
+	}
+	else if (TransactionIdIsNormal(proc->xmin))
+		SetCSNOldestActiveXidIfEarlier(proc->xmin);
+	LWLockRelease(ProcArrayLock);
+}
+
 /*
  * ProcArrayInitRecovery -- initialize recovery xid mgmt environment
  *
