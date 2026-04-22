@@ -151,8 +151,8 @@ extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
  *
  * PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE marks a backend whose commit outcome is
  * already published strongly enough for supported CSN snapshots to ignore the
- * backend's legacy ProcArray xid/xmin membership until the normal cleanup path
- * clears the slot.
+ * backend's legacy ProcArray xid/xmin membership until the backend clears the
+ * marker after it has left authoritative ProcArray membership.
  */
 #define PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE	0x01
 

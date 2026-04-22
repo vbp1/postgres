@@ -770,7 +770,6 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 	proc->xid = InvalidTransactionId;
 	proc->vxid.lxid = InvalidLocalTransactionId;
 	proc->xmin = InvalidTransactionId;
-	proc->csnFlags = 0;
 
 	/* be sure this is cleared in abort */
 	proc->delayChkptFlags = 0;
@@ -1152,6 +1151,14 @@ ProcArrayMarkCSNSnapshotSafeToIgnore(PGPROC *proc)
 	 */
 	pg_write_barrier();
 	proc->csnFlags |= PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE;
+}
+
+void
+ProcArrayClearCSNSnapshotSafeToIgnore(PGPROC *proc)
+{
+	Assert(proc == MyProc);
+
+	proc->csnFlags = 0;
 }
 
 void

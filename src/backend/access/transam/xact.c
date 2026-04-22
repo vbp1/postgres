@@ -2464,6 +2464,7 @@ CommitTransaction(void)
 	 * RecordTransactionCommit.
 	 */
 	ProcArrayEndTransaction(MyProc, latestXid);
+	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
 
 	/*
 	 * This is all post-commit cleanup.  Note that if an error is raised here,
@@ -3035,6 +3036,7 @@ AbortTransaction(void)
 	 * RecordTransactionAbort.
 	 */
 	ProcArrayEndTransaction(MyProc, latestXid);
+	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
 
 	/*
 	 * Post-abort cleanup.  See notes in CommitTransaction() concerning
