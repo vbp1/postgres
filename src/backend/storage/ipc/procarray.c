@@ -383,6 +383,8 @@ static void ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid);
 static void MaintainLatestCompletedXid(TransactionId latestXid);
 static void MaintainLatestCompletedXidRecovery(TransactionId latestXid);
 static void RecomputeCSNOldestActiveXid(void);
+static inline bool ProcIsCSNSnapshotSafeToIgnore(PGPROC *proc);
+static bool ProcCouldAdvanceCSNOldestActiveXid(PGPROC *proc);
 
 static inline FullTransactionId FullXidRelativeTo(FullTransactionId rel,
 												  TransactionId xid);
@@ -605,6 +607,7 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 	Assert(ProcGlobal->subxidStates[myoff].count == 0);
 	Assert(ProcGlobal->subxidStates[myoff].overflowed == false);
 
+	proc->csnFlags = 0;
 	ProcGlobal->statusFlags[myoff] = 0;
 
 	/* Keep the PGPROC array sorted. See notes above */
@@ -668,6 +671,8 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 {
 	if (TransactionIdIsValid(latestXid))
 	{
+		bool		recomputeCsnOldestActiveXid;
+
 		/*
 		 * We must lock ProcArrayLock while clearing our advertised XID, so
 		 * that we do not exit the set of "running" transactions while someone
@@ -683,8 +688,11 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		 */
 		if (LWLockConditionalAcquire(ProcArrayLock, LW_EXCLUSIVE))
 		{
+			recomputeCsnOldestActiveXid =
+				ProcCouldAdvanceCSNOldestActiveXid(proc);
 			ProcArrayEndTransactionInternal(proc, latestXid);
-			RecomputeCSNOldestActiveXid();
+			if (recomputeCsnOldestActiveXid)
+				RecomputeCSNOldestActiveXid();
 			LWLockRelease(ProcArrayLock);
 		}
 		else
@@ -743,6 +751,7 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 	proc->xid = InvalidTransactionId;
 	proc->vxid.lxid = InvalidLocalTransactionId;
 	proc->xmin = InvalidTransactionId;
+	proc->csnFlags = 0;
 
 	/* be sure this is cleared in abort */
 	proc->delayChkptFlags = 0;
@@ -792,6 +801,7 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 	PROC_HDR   *procglobal = ProcGlobal;
 	uint32		nextidx;
 	uint32		wakeidx;
+	bool		recomputeCsnOldestActiveXid = false;
 
 	/* We should definitely have an XID to clear. */
 	Assert(TransactionIdIsValid(proc->xid));
@@ -859,13 +869,18 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 	{
 		PGPROC	   *nextproc = &allProcs[nextidx];
 
+		if (!recomputeCsnOldestActiveXid &&
+			ProcCouldAdvanceCSNOldestActiveXid(nextproc))
+			recomputeCsnOldestActiveXid = true;
+
 		ProcArrayEndTransactionInternal(nextproc, nextproc->procArrayGroupMemberXid);
 
 		/* Move to next proc in list. */
 		nextidx = pg_atomic_read_u32(&nextproc->procArrayGroupNext);
 	}
 
-	RecomputeCSNOldestActiveXid();
+	if (recomputeCsnOldestActiveXid)
+		RecomputeCSNOldestActiveXid();
 
 	/* We're done with the lock now. */
 	LWLockRelease(ProcArrayLock);
@@ -930,6 +945,7 @@ ProcArrayClearTransaction(PGPROC *proc)
 
 	proc->vxid.lxid = InvalidLocalTransactionId;
 	proc->xmin = InvalidTransactionId;
+	proc->csnFlags = 0;
 
 	Assert(!(proc->statusFlags & PROC_VACUUM_STATE_MASK));
 	Assert(!proc->delayChkptFlags);
@@ -1037,6 +1053,9 @@ RecomputeCSNOldestActiveXid(void)
 		TransactionId xid = UINT32_ACCESS_ONCE(ProcGlobal->xids[index]);
 		TransactionId xmin = UINT32_ACCESS_ONCE(proc->xmin);
 
+		if (ProcIsCSNSnapshotSafeToIgnore(proc))
+			continue;
+
 		if (!TransactionIdIsValid(xid))
 		{
 			/*
@@ -1057,6 +1076,59 @@ RecomputeCSNOldestActiveXid(void)
 	}
 
 	SetCSNOldestActiveXid(oldestActiveXid);
+}
+
+static inline bool
+ProcIsCSNSnapshotSafeToIgnore(PGPROC *proc)
+{
+	return (proc->csnFlags & PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE) != 0;
+}
+
+/*
+ * Check whether clearing this backend from the running set could advance the
+ * cached CSN lower bound.
+ *
+ * This is deliberately conservative.  If the backend could be contributing the
+ * current floor through either xid or xmin, callers must perform the full
+ * procarray recomputation.  Otherwise it is safe to leave the cached floor
+ * older than necessary and skip the scan.
+ */
+static bool
+ProcCouldAdvanceCSNOldestActiveXid(PGPROC *proc)
+{
+	TransactionId currentOldestActiveXid;
+	TransactionId procOldestXid;
+
+	Assert(LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE));
+	Assert(TransactionIdIsValid(proc->xid));
+
+	if (ProcIsCSNSnapshotSafeToIgnore(proc))
+		return false;
+
+	currentOldestActiveXid = TransamVariables->csnOldestActiveXid;
+	if (!TransactionIdIsValid(currentOldestActiveXid))
+		return true;
+
+	procOldestXid = proc->xid;
+	if (TransactionIdIsValid(proc->xmin) &&
+		TransactionIdPrecedes(proc->xmin, procOldestXid))
+		procOldestXid = proc->xmin;
+
+	return !TransactionIdPrecedes(currentOldestActiveXid, procOldestXid);
+}
+
+void
+ProcArrayMarkCSNSnapshotSafeToIgnore(PGPROC *proc)
+{
+	Assert(proc == MyProc);
+	Assert(TransactionIdIsValid(proc->xid));
+
+	/*
+	 * Publish prior commit-status writes before making this backend ignorable
+	 * to supported CSN snapshots.
+	 */
+	pg_write_barrier();
+	proc->csnFlags |= PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE;
 }
 
 /*
@@ -2327,6 +2399,9 @@ GetSnapshotData(Snapshot snapshot)
 			uint8		statusFlags;
 
 			Assert(proc->pgxactoff == pgxactoff);
+
+			if (snapshotCsnLocked && ProcIsCSNSnapshotSafeToIgnore(proc))
+				continue;
 
 			/*
 			 * If the transaction has no XID assigned, we can skip it; it

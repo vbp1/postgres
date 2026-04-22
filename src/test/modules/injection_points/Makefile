@@ -14,6 +14,7 @@ REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress
 
 ISOLATION = basic \
 	    csn_commit_fallback \
+	    csn_commit_published \
 	    inplace \
 	    repack \
 	    repack_toast \

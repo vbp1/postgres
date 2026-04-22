@@ -2375,8 +2375,9 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	replorigin = (replorigin_xact_state.origin != InvalidReplOriginId &&
 				  replorigin_xact_state.origin != DoNotReplicateId);
 
-	/* Load the injection point before entering the critical section */
+	/* Load the injection points before entering the critical section */
 	INJECTION_POINT_LOAD("commit-after-delay-checkpoint");
+	INJECTION_POINT_LOAD("commit-after-csn-publication");
 
 	START_CRIT_SECTION();
 
@@ -2451,6 +2452,13 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	/* Mark the transaction committed in pg_xact */
 	TransactionIdSetCSNCommittedTree(xid, nchildren, children, commitSeqNo);
 	TransactionIdCommitTree(xid, nchildren, children);
+
+	/*
+	 * As in the plain commit path, supported CSN snapshots can now ignore
+	 * our legacy ProcArray slot while twophase cleanup finishes.
+	 */
+	ProcArrayMarkCSNSnapshotSafeToIgnore(MyProc);
+	INJECTION_POINT_CACHED("commit-after-csn-publication", NULL);
 
 	/* Checkpoint can proceed now */
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_IN_COMMIT;

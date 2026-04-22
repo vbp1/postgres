@@ -146,6 +146,16 @@ extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
 #define DELAY_CHKPT_COMPLETE	(1<<1)
 #define DELAY_CHKPT_IN_COMMIT	(DELAY_CHKPT_START | 1<<2)
 
+/*
+ * Flags for PGPROC.csnFlags.
+ *
+ * PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE marks a backend whose commit outcome is
+ * already published strongly enough for supported CSN snapshots to ignore the
+ * backend's legacy ProcArray xid/xmin membership until the normal cleanup path
+ * clears the slot.
+ */
+#define PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE	0x01
+
 typedef enum
 {
 	PROC_WAIT_STATUS_OK,
@@ -264,6 +274,7 @@ typedef struct PGPROC
 	PGSemaphore sem;			/* ONE semaphore to sleep on */
 
 	int			delayChkptFlags;	/* for DELAY_CHKPT_* flags */
+	uint8		csnFlags;		/* for PROC_CSN_* flags */
 
 	/*
 	 * While in hot standby mode, shows that a conflict signal has been sent

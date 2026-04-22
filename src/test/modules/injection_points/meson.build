@@ -45,6 +45,7 @@ tests += {
     'specs': [
       'basic',
       'csn_commit_fallback',
+      'csn_commit_published',
       'inplace',
       'repack',
       'repack_toast',

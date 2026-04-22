@@ -41,6 +41,31 @@ The first Stage 3 deliverable is a characterization test, not a refactor:
 The point of this test is to make the current limitation explicit and
 reproducible before changing any of the commit publication or snapshot plumbing.
 
+Current C1 progress
+-------------------
+
+The current tree now has the first real Stage 3 `C1` slice on top of that
+baseline:
+
+- `ProcArrayEndTransaction()` and `ProcArrayGroupClearXid()` no longer force a
+  full `RecomputeCSNOldestActiveXid()` when the exiting backend cannot advance
+  the cached CSN floor;
+- plain commit and 2PC commit publish a transient per-backend CSN marker after
+  commit state is published to `pg_csnlog` / `pg_xact`, but before legacy
+  ProcArray cleanup removes the xid;
+- `GetSnapshotData()` now treats that marker as authoritative only for the
+  supported primary `snapshot_csn` path, allowing concurrent snapshots to stay
+  on CSN semantics during the short “published but not yet ProcArray-cleaned”
+  window;
+- the new `csn_commit_published` isolation characterization fixes that
+  behavior as an explicit guardrail.
+
+This is intentionally narrow.  The legacy ProcArray slot still exists until the
+normal cleanup path runs, and unsupported snapshot shapes still use the old
+fallback behavior.  Stage 3 has not yet removed ProcArray from the transaction-
+end hot path, but it has started separating visibility-critical publication
+from that cleanup machinery.
+
 Non-goals of this initial Stage 3 slice
 ---------------------------------------
 

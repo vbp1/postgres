@@ -1480,8 +1480,9 @@ RecordTransactionCommit(void)
 		 * RecordTransactionCommitPrepared.
 		 */
 		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0);
-		/* Test-only hook for Stage 3 commit-critical-section characterization. */
+		/* Test-only hooks for Stage 3 commit publication characterization. */
 		INJECTION_POINT_LOAD("commit-after-delay-checkpoint");
+		INJECTION_POINT_LOAD("commit-after-csn-publication");
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_IN_COMMIT;
 		INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
@@ -1604,6 +1605,13 @@ RecordTransactionCommit(void)
 	 */
 	if (markXidCommitted)
 	{
+		/*
+		 * The commit outcome is now published strongly enough for supported
+		 * CSN snapshots to ignore our legacy ProcArray slot until the normal
+		 * end-transaction cleanup catches up.
+		 */
+		ProcArrayMarkCSNSnapshotSafeToIgnore(MyProc);
+		INJECTION_POINT_CACHED("commit-after-csn-publication", NULL);
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_IN_COMMIT;
 		END_CRIT_SECTION();
 	}
