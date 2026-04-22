@@ -1,0 +1,50 @@
+CSN Stage 3 starts from a Stage 2 primary-only implementation that already has
+`pg_csnlog`, `snapshot_csn`, CSN-aware visibility, and explicit unsupported
+paths, but still routes transaction end through the legacy ProcArray cleanup
+machinery.
+
+The production goal for Stage 3 is not “more CSN code” by itself.  The real
+goal is to preserve the existing primary-only correctness contract while
+removing `ProcArrayGroupClearXid()` and related ProcArray transaction-end
+pressure as the dominant bottleneck on commit-heavy workloads.
+
+Current baseline
+----------------
+
+The current target tree still has two important dependencies on the legacy
+transaction-end path:
+
+1. `CommitTransaction()` and `AbortTransaction()` still end by calling
+   `ProcArrayEndTransaction(MyProc, latestXid)`, which in turn may enter
+   `ProcArrayGroupClearXid()` when `ProcArrayLock` is contended.
+2. `GetSnapshotData()` only assigns `snapshot_csn` when it does not observe a
+   backend with a visible xid already marked `DELAY_CHKPT_IN_COMMIT`.  When
+   that condition is seen, the snapshot falls back to legacy xid-array
+   semantics for safety.
+
+This means the current CSN implementation is correct for the supported Stage 2
+surface, but ordinary primary snapshots still remain tightly coupled to the
+legacy ProcArray transaction-end timing.
+
+Stage 3 baseline guardrail
+--------------------------
+
+The first Stage 3 deliverable is a characterization test, not a refactor:
+
+- add a test-only injection point to the plain commit path after
+  `DELAY_CHKPT_IN_COMMIT` is published;
+- suspend a normal commit in that critical section;
+- prove that a concurrent snapshot loses `snapshot_csn` while the suspended
+  commit is still present in ProcArray;
+- keep that test as the “before” guardrail for later refactors.
+
+The point of this test is to make the current limitation explicit and
+reproducible before changing any of the commit publication or snapshot plumbing.
+
+Non-goals of this initial Stage 3 slice
+---------------------------------------
+
+- no behavioral change to production builds without injection points enabled
+- no attempt yet to change the support matrix
+- no claim yet that ProcArray pressure has been reduced
+- no change yet to standby, recovery, or logical decoding semantics

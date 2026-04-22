@@ -66,6 +66,7 @@
 #include "utils/builtins.h"
 #include "utils/combocid.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/relmapper.h"
@@ -1479,8 +1480,11 @@ RecordTransactionCommit(void)
 		 * RecordTransactionCommitPrepared.
 		 */
 		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0);
+		/* Test-only hook for Stage 3 commit-critical-section characterization. */
+		INJECTION_POINT_LOAD("commit-after-delay-checkpoint");
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_IN_COMMIT;
+		INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
 
 		Assert(xactStopTimestamp == 0);
 

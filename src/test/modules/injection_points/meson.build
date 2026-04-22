@@ -44,6 +44,7 @@ tests += {
   'isolation': {
     'specs': [
       'basic',
+      'csn_commit_fallback',
       'inplace',
       'repack',
       'repack_toast',
