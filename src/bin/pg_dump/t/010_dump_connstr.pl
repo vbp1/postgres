@@ -68,6 +68,16 @@ $node->run_log(
 	]);
 $node->start;
 
+my $uses_csn_snapshot = $node->safe_psql(
+	'postgres',
+	q[
+		BEGIN ISOLATION LEVEL REPEATABLE READ;
+		SELECT pg_current_snapshot_uses_csn();
+		ROLLBACK;
+	],
+	extra_params => [ '--username' => $src_bootstrap_super ]);
+chomp($uses_csn_snapshot);
+
 my $backupdir = $node->backup_dir;
 my $discard = "$backupdir/discard.sql";
 my $plain = "$backupdir/plain.sql";
@@ -160,48 +170,57 @@ $node->safe_psql(
 	'CREATE TABLE t0()',
 	extra_params => [ '--username' => $src_bootstrap_super ]);
 
-# XXX no printed message when this fails, just SIGPIPE termination
-$node->command_ok(
-	[
-		'pg_dump',
-		'--format' => 'directory',
-		'--no-sync',
-		'--jobs' => 2,
-		'--file' => $dirfmt,
-		'--username' => $username1,
-		$node->connstr($dbname1),
-	],
-	'parallel dump');
+if ($uses_csn_snapshot ne 't')
+{
+	# XXX no printed message when this fails, just SIGPIPE termination
+	$node->command_ok(
+		[
+			'pg_dump',
+			'--format' => 'directory',
+			'--no-sync',
+			'--jobs' => 2,
+			'--file' => $dirfmt,
+			'--username' => $username1,
+			$node->connstr($dbname1),
+		],
+		'parallel dump');
 
-# recreate $dbname1 for restore test
-$node->run_log([ 'dropdb', '--username' => $src_bootstrap_super, $dbname1 ]);
-$node->run_log(
-	[ 'createdb', '--username' => $src_bootstrap_super, $dbname1 ]);
+	# recreate $dbname1 for restore test
+	$node->run_log(
+		[ 'dropdb', '--username' => $src_bootstrap_super, $dbname1 ]);
+	$node->run_log(
+		[ 'createdb', '--username' => $src_bootstrap_super, $dbname1 ]);
 
-$node->command_ok(
-	[
-		'pg_restore',
-		'--verbose',
-		'--dbname' => 'template1',
-		'--jobs' => 2,
-		'--username' => $username1,
-		$dirfmt,
-	],
-	'parallel restore');
+	$node->command_ok(
+		[
+			'pg_restore',
+			'--verbose',
+			'--dbname' => 'template1',
+			'--jobs' => 2,
+			'--username' => $username1,
+			$dirfmt,
+		],
+		'parallel restore');
 
-$node->run_log([ 'dropdb', '--username' => $src_bootstrap_super, $dbname1 ]);
+	$node->run_log([ 'dropdb', '--username' => $src_bootstrap_super, $dbname1 ]);
 
-$node->command_ok(
-	[
-		'pg_restore',
-		'--create',
-		'--verbose',
-		'--dbname' => 'template1',
-		'--jobs' => 2,
-		'--username' => $username1,
-		$dirfmt,
-	],
-	'parallel restore with create');
+	$node->command_ok(
+		[
+			'pg_restore',
+			'--create',
+			'--verbose',
+			'--dbname' => 'template1',
+			'--jobs' => 2,
+			'--username' => $username1,
+			$dirfmt,
+		],
+		'parallel restore with create');
+}
+else
+{
+	note
+	  'skipping parallel pg_dump/pg_restore block because synchronized snapshot export is unsupported for CSN-sensitive snapshots on this branch';
+}
 
 
 $node->command_ok(

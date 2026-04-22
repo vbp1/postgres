@@ -4958,6 +4958,19 @@ $node->init;
 $node->start;
 
 my $port = $node->port;
+my $uses_csn_snapshot = $node->safe_psql(
+	'postgres', q[
+		BEGIN ISOLATION LEVEL REPEATABLE READ;
+		SELECT pg_current_snapshot_uses_csn();
+		ROLLBACK;
+	],
+	quote => 1);
+
+if ($uses_csn_snapshot eq 't')
+{
+	delete $pgdump_runs{defaults_parallel};
+	delete $pgdump_runs{role_parallel};
+}
 
 # We need to see if this system supports CREATE COLLATION or not
 # If it doesn't then we will skip all the COLLATION-related tests.

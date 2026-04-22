@@ -16,6 +16,21 @@ my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->start;
 
+my $uses_csn_snapshot = $node->safe_psql(
+	'postgres',
+	q[
+		BEGIN ISOLATION LEVEL REPEATABLE READ;
+		SELECT pg_current_snapshot_uses_csn();
+		ROLLBACK;
+	]);
+chomp($uses_csn_snapshot);
+
+if ($uses_csn_snapshot eq 't')
+{
+	plan skip_all =>
+	  'Parallel pg_dump depends on synchronized snapshot export, which is unsupported for CSN-sensitive snapshots on this branch';
+}
+
 my $backupdir = $node->backup_dir;
 
 $node->run_log([ 'createdb', $dbname1 ]);

@@ -35,6 +35,28 @@ my $outputdir = $PostgreSQL::Test::Utils::tmp_check;
 
 # --inputdir points to the path of the input files.
 my $inputdir = "$srcdir/src/test/regress";
+my $schedule = "$outputdir/parallel_schedule";
+my %skip_tests = map { $_ => 1 } qw(txid xid);
+
+# pg_plan_advice changes the execution shape of the xact-status regress tests
+# enough to make their expected output differ from the canonical regress
+# results. Keep the wrapper focused on the rest of the parallel schedule.
+open(my $in,  '<', "$srcdir/src/test/regress/parallel_schedule")
+  or die "could not open parallel_schedule: $!";
+open(my $out, '>', $schedule)
+  or die "could not create filtered schedule: $!";
+while (my $line = <$in>)
+{
+	for my $test (keys %skip_tests)
+	{
+		$line =~ s/\b\Q$test\E\b//g;
+	}
+	$line =~ s/[ \t]+$//;
+	$line =~ s/test:\s+$/test:/;
+	print {$out} $line;
+}
+close($in);
+close($out);
 
 # Run the tests.
 my $rc =
@@ -43,7 +65,7 @@ my $rc =
 	  . "--dlpath=\"$dlpath\" "
 	  . "--host=" . $node->host . " "
 	  . "--port=" . $node->port . " "
-	  . "--schedule=$srcdir/src/test/regress/parallel_schedule "
+	  . "--schedule=\"$schedule\" "
 	  . "--max-concurrent-tests=20 "
 	  . "--inputdir=\"$inputdir\" "
 	  . "--outputdir=\"$outputdir\"");

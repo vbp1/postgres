@@ -149,7 +149,7 @@ SELECT pg_xact_status(:rolledback::text::xid8) AS rolledback;
 SELECT pg_xact_status(:inprogress::text::xid8) AS inprogress;
 SELECT pg_xact_status('1'::xid8); -- BootstrapTransactionId is always committed
 SELECT pg_xact_status('2'::xid8); -- FrozenTransactionId is always committed
-SELECT pg_xact_status('3'::xid8); -- in regress testing FirstNormalTransactionId will always be behind oldestXmin
+SELECT pg_xact_status('3'::xid8); -- FirstNormalTransactionId is too old to classify here
 
 COMMIT;
 

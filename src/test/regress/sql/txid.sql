@@ -80,7 +80,7 @@ SELECT txid_status(:rolledback) AS rolledback;
 SELECT txid_status(:inprogress) AS inprogress;
 SELECT txid_status(1); -- BootstrapTransactionId is always committed
 SELECT txid_status(2); -- FrozenTransactionId is always committed
-SELECT txid_status(3); -- in regress testing FirstNormalTransactionId will always be behind oldestXmin
+SELECT txid_status(3); -- FirstNormalTransactionId is too old to classify here
 
 COMMIT;
 

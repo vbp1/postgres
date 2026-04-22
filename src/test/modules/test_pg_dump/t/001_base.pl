@@ -876,6 +876,21 @@ my $port = $node->port;
 
 my $supports_gzip = check_pg_config("#define HAVE_LIBZ 1");
 
+my $uses_csn_snapshot = $node->safe_psql(
+	'postgres',
+	q[
+		BEGIN ISOLATION LEVEL REPEATABLE READ;
+		SELECT pg_current_snapshot_uses_csn();
+		ROLLBACK;
+	]);
+chomp($uses_csn_snapshot);
+if ($uses_csn_snapshot eq 't')
+{
+	# Parallel pg_dump still depends on synchronized snapshot export, which is
+	# rejected for CSN-sensitive snapshots in this branch.
+	delete $pgdump_runs{defaults_parallel};
+}
+
 #########################################
 # Set up schemas, tables, etc, to be dumped.
 

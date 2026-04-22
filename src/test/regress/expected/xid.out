@@ -503,7 +503,7 @@ SELECT pg_xact_status('2'::xid8); -- FrozenTransactionId is always committed
  committed
 (1 row)
 
-SELECT pg_xact_status('3'::xid8); -- in regress testing FirstNormalTransactionId will always be behind oldestXmin
+SELECT pg_xact_status('3'::xid8); -- FirstNormalTransactionId is too old to classify here
  pg_xact_status 
 ----------------
  
