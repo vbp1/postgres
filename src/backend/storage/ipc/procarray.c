@@ -2363,6 +2363,10 @@ GetSnapshotData(Snapshot snapshot)
 	if (GetSnapshotDataReuse(snapshot))
 	{
 		LWLockRelease(ProcArrayLock);
+
+		if (TransactionIdIsNormal(TransactionXmin))
+			SetCSNOldestActiveXidIfEarlier(TransactionXmin);
+
 		return snapshot;
 	}
 
