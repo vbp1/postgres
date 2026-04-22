@@ -700,6 +700,9 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 	}
 	else
 	{
+		bool		needProcArrayLock;
+		bool		recomputeCsnOldestActiveXid = false;
+
 		/*
 		 * If we have no XID, we don't need to lock, since we won't affect
 		 * anyone else's calculation of a snapshot.  We might change their
@@ -709,23 +712,39 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		Assert(proc->subxidStatus.count == 0);
 		Assert(!proc->subxidStatus.overflowed);
 
+		needProcArrayLock =
+			TransactionIdIsValid(proc->xmin) ||
+			(proc->statusFlags & PROC_VACUUM_STATE_MASK) != 0;
+
 		proc->vxid.lxid = InvalidLocalTransactionId;
-		proc->xmin = InvalidTransactionId;
 
 		/* be sure this is cleared in abort */
 		proc->delayChkptFlags = 0;
+		proc->csnFlags = 0;
 
-		/* must be cleared with xid/xmin: */
-		/* avoid unnecessarily dirtying shared cachelines */
-		if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
+		if (needProcArrayLock)
 		{
-			Assert(!LWLockHeldByMe(ProcArrayLock));
 			LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-			Assert(proc->statusFlags == ProcGlobal->statusFlags[proc->pgxactoff]);
-			proc->statusFlags &= ~PROC_VACUUM_STATE_MASK;
-			ProcGlobal->statusFlags[proc->pgxactoff] = proc->statusFlags;
+
+			recomputeCsnOldestActiveXid =
+				ProcCouldAdvanceCSNOldestActiveXid(proc);
+			proc->xmin = InvalidTransactionId;
+
+			/* must be cleared with xid/xmin: */
+			/* avoid unnecessarily dirtying shared cachelines */
+			if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
+			{
+				Assert(proc->statusFlags == ProcGlobal->statusFlags[proc->pgxactoff]);
+				proc->statusFlags &= ~PROC_VACUUM_STATE_MASK;
+				ProcGlobal->statusFlags[proc->pgxactoff] = proc->statusFlags;
+			}
+
+			if (recomputeCsnOldestActiveXid)
+				RecomputeCSNOldestActiveXid();
 			LWLockRelease(ProcArrayLock);
 		}
+		else
+			proc->xmin = InvalidTransactionId;
 	}
 }
 
@@ -1100,19 +1119,23 @@ ProcCouldAdvanceCSNOldestActiveXid(PGPROC *proc)
 	TransactionId procOldestXid;
 
 	Assert(LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE));
-	Assert(TransactionIdIsValid(proc->xid));
 
 	if (ProcIsCSNSnapshotSafeToIgnore(proc))
+		return false;
+
+	procOldestXid = proc->xid;
+	if (!TransactionIdIsValid(procOldestXid))
+		procOldestXid = proc->xmin;
+	else if (TransactionIdIsValid(proc->xmin) &&
+			 TransactionIdPrecedes(proc->xmin, procOldestXid))
+		procOldestXid = proc->xmin;
+
+	if (!TransactionIdIsValid(procOldestXid))
 		return false;
 
 	currentOldestActiveXid = TransamVariables->csnOldestActiveXid;
 	if (!TransactionIdIsValid(currentOldestActiveXid))
 		return true;
-
-	procOldestXid = proc->xid;
-	if (TransactionIdIsValid(proc->xmin) &&
-		TransactionIdPrecedes(proc->xmin, procOldestXid))
-		procOldestXid = proc->xmin;
 
 	return !TransactionIdPrecedes(currentOldestActiveXid, procOldestXid);
 }
@@ -2565,6 +2588,9 @@ GetSnapshotData(Snapshot snapshot)
 
 	LWLockRelease(ProcArrayLock);
 
+	if (TransactionIdIsNormal(TransactionXmin))
+		SetCSNOldestActiveXidIfEarlier(TransactionXmin);
+
 	/* maintain state for GlobalVis* */
 	{
 		TransactionId def_vis_xid;
@@ -2746,6 +2772,9 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
 
 	LWLockRelease(ProcArrayLock);
 
+	if (result)
+		SetCSNOldestActiveXidIfEarlier(xmin);
+
 	return result;
 }
 
@@ -2800,6 +2829,9 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
 	}
 
 	LWLockRelease(ProcArrayLock);
+
+	if (result)
+		SetCSNOldestActiveXidIfEarlier(xmin);
 
 	return result;
 }
