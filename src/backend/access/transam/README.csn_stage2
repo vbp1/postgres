@@ -36,7 +36,7 @@ Supported / Fallback / Forbidden Matrix
 | `TransactionIdGetLegacyCSNStatus()` | Fallback | Used when `pg_csnlog` has no safe answer and the caller must consult legacy status sources. |
 | `ImportSnapshot()` / `ExportSnapshot()` | Forbidden for CSN-sensitive snapshots | SQL export now rejects CSN-sensitive snapshots explicitly, and the text format still carries no `snapshot_csn` for import. |
 | `SerializeSnapshot()` / `RestoreSnapshot()` consumers | Supported for CSN-sensitive snapshots | Parallel scan handoff, file-based snapshot transport, and other internal consumers now preserve `snapshot_csn`. |
-| `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` | Implemented but not yet accepted for Stage 2 closure | The current tree already publishes conservative CSN state for prepared transactions, but Stage 2 still treats 2PC correctness as incomplete until retention, restart, and visibility contracts are closed. |
+| `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` | Supported for the conservative primary-only Stage 2 contract | The current tree publishes conservative CSN state for prepared transactions, keeps them as retention-relevant holders before finish, and now has targeted proof for the primary-only visibility and finishability contract. This does not claim durable restart-stable committed-CSN reconstruction for already-finished prepared xids. |
 | Crash / restart CSN retention | Fallback | Startup reinitializes runtime state conservatively, end-of-recovery trims the unused tail of the current `pg_csnlog` page, and VACUUM now truncates `pg_csnlog` conservatively against runtime and legacy horizons; there is still no durable CSN reconstruction path. |
 | Serializable, standby, recovery, logical decoding | Forbidden | Stage 2 does not claim CSN support for these paths. |
 
@@ -152,9 +152,10 @@ Lifecycle wiring, including `varsup.c`
   promoted node keeps `snapshot_csn`, does not see prepared rows before
   `COMMIT PREPARED` / `ROLLBACK PREPARED`, and still does not see them after
   finish while a new snapshot sees only the committed prepared rows.
-- The current restart behavior is conservative, but it does not yet prove a
-  restart-stable CSN story for prepared xacts. That remains a later-phase
-  closure item.
+- The current restart behavior is conservative and now sufficient for the
+  primary-only Stage 2 prepared-xact contract. Durable restart-stable
+  committed-CSN reconstruction for already-finished prepared xids remains
+  later-phase work, not a Stage 2 closure requirement.
 
 
 Concrete Touchpoints for Next Phases
@@ -187,8 +188,9 @@ Open Risks
 - `pg_csnlog` truncation still depends on the runtime and legacy horizons
   visible at vacuum time, so truncation safety must stay covered by tests
   that exercise both the live horizon and restart paths.
-- Restart and prepared-transaction paths are conservative, but not yet backed
-  by a restart-stable CSN retention contract.
+- Restart and prepared-transaction paths are closed only for the conservative
+  primary-only Stage 2 contract; durable restart-stable CSN reconstruction for
+  already-finished prepared xids remains later-phase work.
 - Subxid overflow remains a risk until the fallback and parent-resolution
   behavior is closed out under explicit tests.
 - Any future Stage 2 work must keep the current "no silent downgrade" rule:
