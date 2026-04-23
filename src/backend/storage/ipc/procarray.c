@@ -425,11 +425,13 @@ static void KnownAssignedXidsDisplay(int trace_level);
 static void KnownAssignedXidsReset(void);
 static inline void ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid);
 static void ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid);
+static void MaintainLatestCompletedXidShadowAtomic(TransactionId latestXid);
 static void MaintainLatestCompletedXid(TransactionId latestXid);
 static void MaintainLatestCompletedXidRecovery(TransactionId latestXid);
 static void RecomputeCSNOldestActiveXid(void);
 static inline bool ProcIsCSNSnapshotSafeToIgnore(PGPROC *proc);
 static inline bool ProcIsOrdinaryPrimaryMirrorFinished(PGPROC *proc);
+static inline bool ProcIsOrdinaryPrimaryMirrorCompletionVisible(PGPROC *proc);
 static bool ProcCouldAdvanceCSNOldestActiveXid(PGPROC *proc);
 
 static inline FullTransactionId FullXidRelativeTo(FullTransactionId rel,
@@ -847,21 +849,22 @@ ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
 	if (TransactionIdIsValid(latestXid))
 	{
 		int			pgxactoff = proc->pgxactoff;
-		bool		recomputeCsnOldestActiveXid;
 
 		Assert(TransactionIdIsValid(proc->xid));
 
-		/* Test-only hook for the H1-B ordinary ProcArrayLock witness. */
-		INJECTION_POINT("ordinary-before-procarray-lock", NULL);
-		/* Test-only hook for the H1-B lock-contention baseline. */
-		INJECTION_POINT("ordinary-before-procarray-lock-wait", NULL);
-		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-
-		recomputeCsnOldestActiveXid =
-			ProcCouldAdvanceCSNOldestActiveXid(proc);
-
 		Assert(TransactionIdIsValid(ProcGlobal->xids[pgxactoff]));
 		Assert(ProcGlobal->xids[pgxactoff] == proc->xid);
+
+		/*
+		 * H1-E switch: supported ordinary readers now key off completion
+		 * publication rather than the lock-owned xid/xmin cleanup point.
+		 * Publish completion metadata first, then mark the ordinary mirror
+		 * finished, and only then clear the compatibility fields.
+		 */
+		MaintainLatestCompletedXidShadowAtomic(latestXid);
+		INJECTION_POINT("xact-completion-advance-ordinary-primary", NULL);
+		pg_atomic_add_fetch_u64(&TransamVariables->xactCompletionCountShadow, 1);
+		ProcArrayMarkOrdinaryMirrorFinished(proc);
 
 		ProcGlobal->xids[pgxactoff] = InvalidTransactionId;
 		proc->xid = InvalidTransactionId;
@@ -888,20 +891,10 @@ ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
 			proc->subxidStatus.count = 0;
 			proc->subxidStatus.overflowed = false;
 		}
-
-		MaintainLatestCompletedXid(latestXid);
-		INJECTION_POINT("xact-completion-advance-ordinary-primary", NULL);
-		TransamAdvanceXactCompletionCount();
-
-		if (recomputeCsnOldestActiveXid)
-			RecomputeCSNOldestActiveXid();
-
-		LWLockRelease(ProcArrayLock);
 	}
 	else
 	{
 		bool		needProcArrayLock;
-		bool		recomputeCsnOldestActiveXid = false;
 
 		Assert(!TransactionIdIsValid(proc->xid));
 		Assert(proc->subxidStatus.count == 0);
@@ -913,29 +906,16 @@ ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
 
 		if (needProcArrayLock)
 		{
-			/* Test-only hook for the H1-B ordinary ProcArrayLock witness. */
-			INJECTION_POINT("ordinary-before-procarray-lock", NULL);
-			/* Test-only hook for the H1-B lock-contention baseline. */
-			INJECTION_POINT("ordinary-before-procarray-lock-wait", NULL);
-			LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-
-			recomputeCsnOldestActiveXid =
-				ProcCouldAdvanceCSNOldestActiveXid(proc);
+			ProcArrayMarkOrdinaryMirrorFinished(proc);
 			proc->xmin = InvalidTransactionId;
 
 			/* must be cleared with xid/xmin: */
 			/* avoid unnecessarily dirtying shared cachelines */
 			if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
 			{
-				Assert(proc->statusFlags == ProcGlobal->statusFlags[proc->pgxactoff]);
 				proc->statusFlags &= ~PROC_VACUUM_STATE_MASK;
 				ProcGlobal->statusFlags[proc->pgxactoff] = proc->statusFlags;
 			}
-
-			if (recomputeCsnOldestActiveXid)
-				RecomputeCSNOldestActiveXid();
-
-			LWLockRelease(ProcArrayLock);
 		}
 		else
 			proc->xmin = InvalidTransactionId;
@@ -1215,6 +1195,27 @@ MaintainLatestCompletedXid(TransactionId latestXid)
 		   FullTransactionIdIsNormal(TransamVariables->latestCompletedXid));
 }
 
+static void
+MaintainLatestCompletedXidShadowAtomic(TransactionId latestXid)
+{
+	FullTransactionId cur_latest;
+	FullTransactionId candidate;
+
+	Assert(TransactionIdIsValid(latestXid));
+	Assert(!RecoveryInProgress());
+	Assert(procArrayLatestCompletedShadow != NULL);
+
+	cur_latest = ProcArrayReadLatestCompletedXidShadow();
+	Assert(FullTransactionIdIsValid(cur_latest));
+
+	if (!TransactionIdPrecedes(XidFromFullTransactionId(cur_latest), latestXid))
+		return;
+
+	candidate = FullXidRelativeTo(cur_latest, latestXid);
+	pg_atomic_monotonic_advance_u64(&procArrayLatestCompletedShadow->latestCompletedXid,
+									U64FromFullTransactionId(candidate));
+}
+
 /*
  * Same as MaintainLatestCompletedXid, except for use during WAL replay.
  */
@@ -1328,6 +1329,8 @@ RecomputeCSNOldestActiveXid(void)
 
 		if (ProcIsCSNSnapshotSafeToIgnore(proc))
 			continue;
+		if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
+			continue;
 
 		if (!TransactionIdIsValid(xid))
 		{
@@ -1371,6 +1374,38 @@ ProcIsOrdinaryPrimaryMirrorFinished(PGPROC *proc)
 		&procArrayOrdinaryMirrorFinishedState->flags[procNumber]) != 0;
 }
 
+static inline bool
+ProcIsOrdinaryPrimaryMirrorCompletionVisible(PGPROC *proc)
+{
+	uint64		slotEpoch;
+	uint64		publishedEpoch;
+
+	if (!ProcIsOrdinaryPrimaryMirrorFinished(proc))
+		return false;
+
+	/*
+	 * xid-less ordinary generations can still advertise xmin- or
+	 * vacuum-related state. Once such a generation is marked finished, that
+	 * state is already non-authoritative for supported ordinary readers even
+	 * though there is no published xid mirror epoch.
+	 */
+	if (!TransactionIdIsValid(proc->xid))
+	{
+		return TransactionIdIsValid(proc->xmin) ||
+			(proc->statusFlags & PROC_VACUUM_STATE_MASK) != 0;
+	}
+
+	publishedEpoch = ProcArrayReadPublishedOrdinaryMirrorEpoch(proc);
+	if (publishedEpoch == 0)
+		return false;
+
+	slotEpoch = ProcArrayReadSlotEpoch(GetNumberFromPGProc(proc));
+	if (slotEpoch == 0)
+		return false;
+
+	return publishedEpoch == slotEpoch;
+}
+
 bool
 ProcArrayReadOrdinaryMirrorFinished(PGPROC *proc)
 {
@@ -1383,9 +1418,8 @@ ProcArrayMarkOrdinaryMirrorFinished(PGPROC *proc)
 	Assert(proc == MyProc);
 
 	/*
-	 * Publish the now-finished ordinary generation after the legacy helper
-	 * has completed its xid/xmin cleanup and immediately before any reader
-	 * freeze point that wants to observe the post-helper state.
+	 * Publish completion metadata and any prior mirror writes before readers
+	 * are allowed to treat this ordinary generation as finished.
 	 */
 	pg_write_barrier();
 	pg_atomic_write_u32(
@@ -1411,6 +1445,8 @@ ProcCouldAdvanceCSNOldestActiveXid(PGPROC *proc)
 	Assert(LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE));
 
 	if (ProcIsCSNSnapshotSafeToIgnore(proc))
+		return false;
+	if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
 		return false;
 
 	procOldestXid = proc->xid;
@@ -2024,6 +2060,17 @@ TransactionIdIsInProgressLegacy(TransactionId xid)
 		if (pgxactoff == mypgxactoff)
 			continue;
 
+		pgprocno = arrayP->pgprocnos[pgxactoff];
+		proc = &allProcs[pgprocno];
+
+		/*
+		 * H1-E reader-side support: a completion-visible ordinary mirror is
+		 * already non-authoritative for supported primary semantics, even if
+		 * its xid/subxid arrays have not yet been compatibility-cleaned.
+		 */
+		if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
+			continue;
+
 		/* Fetch xid just once - see GetNewTransactionId */
 		pxid = UINT32_ACCESS_ONCE(other_xids[pgxactoff]);
 
@@ -2052,8 +2099,7 @@ TransactionIdIsInProgressLegacy(TransactionId xid)
 		 */
 		pxids = other_subxidstates[pgxactoff].count;
 		pg_read_barrier();		/* pairs with barrier in GetNewTransactionId() */
-		pgprocno = arrayP->pgprocnos[pgxactoff];
-		proc = &allProcs[pgprocno];
+
 		for (j = pxids - 1; j >= 0; j--)
 		{
 			/* Fetch xid just once - see GetNewTransactionId */
@@ -2349,6 +2395,9 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 		TransactionId xmin;
 
 		/* Fetch xid just once - see GetNewTransactionId */
+		if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
+			continue;
+
 		xid = UINT32_ACCESS_ONCE(other_xids[index]);
 		xmin = UINT32_ACCESS_ONCE(proc->xmin);
 
@@ -2888,10 +2937,9 @@ GetSnapshotData(Snapshot snapshot)
 		 */
 		for (int pgxactoff = 0; pgxactoff < numProcs; pgxactoff++)
 		{
-			/* Fetch xid just once - see GetNewTransactionId */
-			TransactionId xid = UINT32_ACCESS_ONCE(other_xids[pgxactoff]);
 			int			pgprocno = arrayP->pgprocnos[pgxactoff];
 			PGPROC	   *proc = &allProcs[pgprocno];
+			TransactionId xid;
 			uint8		delayChkptFlags;
 			uint8		statusFlags;
 
@@ -2902,6 +2950,12 @@ GetSnapshotData(Snapshot snapshot)
 				INJECTION_POINT("snapshot-before-skip-safe-to-ignore", NULL);
 				continue;
 			}
+
+			if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
+				continue;
+
+			/* Fetch xid just once - see GetNewTransactionId */
+			xid = UINT32_ACCESS_ONCE(other_xids[pgxactoff]);
 
 			/*
 			 * If the transaction has no XID assigned, we can skip it; it
@@ -3414,7 +3468,12 @@ GetRunningTransactionData(Oid dbid)
 	 */
 	for (index = 0; index < arrayP->numProcs; index++)
 	{
+		int			pgprocno = arrayP->pgprocnos[index];
+		PGPROC	   *proc = &allProcs[pgprocno];
 		TransactionId xid;
+
+		if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
+			continue;
 
 		/* Fetch xid just once - see GetNewTransactionId */
 		xid = UINT32_ACCESS_ONCE(other_xids[index]);
@@ -3431,9 +3490,6 @@ GetRunningTransactionData(Oid dbid)
 		 */
 		if (OidIsValid(dbid))
 		{
-			int			pgprocno = arrayP->pgprocnos[index];
-			PGPROC	   *proc = &allProcs[pgprocno];
-
 			if (proc->databaseId != dbid)
 				continue;
 		}
@@ -3487,6 +3543,9 @@ GetRunningTransactionData(Oid dbid)
 			int			pgprocno = arrayP->pgprocnos[index];
 			PGPROC	   *proc = &allProcs[pgprocno];
 			int			nsubxids;
+
+			if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
+				continue;
 
 			/*
 			 * Filter by database OID if requested.
@@ -3595,6 +3654,9 @@ GetOldestActiveTransactionId(bool inCommitOnly, bool allDbs)
 		TransactionId xid;
 		int			pgprocno = arrayP->pgprocnos[index];
 		PGPROC	   *proc = &allProcs[pgprocno];
+
+		if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
+			continue;
 
 		/* Fetch xid just once - see GetNewTransactionId */
 		xid = UINT32_ACCESS_ONCE(other_xids[index]);
@@ -4039,6 +4101,9 @@ GetCurrentVirtualXIDs(TransactionId limitXmin, bool excludeXmin0,
 		uint8		statusFlags = ProcGlobal->statusFlags[index];
 
 		if (proc == MyProc)
+			continue;
+
+		if (ProcIsOrdinaryPrimaryMirrorCompletionVisible(proc))
 			continue;
 
 		if (excludeVacuum & statusFlags)

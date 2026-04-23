@@ -1,13 +1,11 @@
 CREATE EXTENSION injection_points;
-SELECT injection_points_latest_completed_xid_shadow() =
-       injection_points_latest_completed_xid();
+SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL;
  ?column? 
 ----------
  t
 (1 row)
 
-SELECT injection_points_xact_completion_count_shadow() =
-       injection_points_xact_completion_count();
+SELECT injection_points_xact_completion_count_shadow() > 0;
  ?column? 
 ----------
  t
@@ -324,8 +322,7 @@ SELECT injection_points_latest_completed_xid() IS NOT NULL;
  t
 (1 row)
 
-SELECT injection_points_latest_completed_xid_shadow() =
-       injection_points_latest_completed_xid();
+SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL;
  ?column? 
 ----------
  t
@@ -349,7 +346,7 @@ SELECT injection_points_transaction_snapshot_xact_completion_count() > 0;
  t
 (1 row)
 
-SELECT injection_points_save_int8(injection_points_xact_completion_count());
+SELECT injection_points_save_int8(injection_points_xact_completion_count_shadow());
  injection_points_save_int8 
 ----------------------------
  
@@ -361,7 +358,7 @@ SELECT injection_points_get_saved_int8() > 0;
  t
 (1 row)
 
-SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+SELECT injection_points_save_xid8(injection_points_latest_completed_xid_shadow());
  injection_points_save_xid8 
 ----------------------------
  

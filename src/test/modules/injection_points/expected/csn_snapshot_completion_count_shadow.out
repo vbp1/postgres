@@ -36,7 +36,7 @@ step r_before:
 
 uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
 --------+--------------------------+----------------------------+----------------------------+----------------------------
-t       |                         0|                          20|                          20|                          20
+t       |                         0|                          20|                          20|                           1
 (1 row)
 
 step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
@@ -90,7 +90,7 @@ step r_after:
 
 uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
 --------+--------------------------+----------------------------+----------------------------+----------------------------
-t       |                         0|                          25|                          25|                          25
+t       |                         0|                          25|                          25|                           1
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
@@ -144,7 +144,7 @@ step r_before:
 
 uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
 --------+--------------------------+----------------------------+----------------------------+----------------------------
-t       |                         0|                          28|                          28|                          28
+t       |                         0|                          28|                          28|                           1
 (1 row)
 
 step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
@@ -198,7 +198,7 @@ step r_after:
 
 uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
 --------+--------------------------+----------------------------+----------------------------+----------------------------
-t       |                         0|                          33|                          33|                          33
+t       |                         0|                          33|                          33|                           1
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>

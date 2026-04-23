@@ -2467,7 +2467,6 @@ CommitTransaction(void)
 	 * RecordTransactionCommit.
 	 */
 	ProcArrayEndTransactionPrimary(MyProc, latestXid);
-	ProcArrayMarkOrdinaryMirrorFinished(MyProc);
 	/* Test-only hook for the H1-B completion-visible but not reusable window. */
 	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
 	MyProc->vxid.lxid = InvalidLocalTransactionId;
@@ -3045,7 +3044,6 @@ AbortTransaction(void)
 	 * RecordTransactionAbort.
 	 */
 	ProcArrayEndTransactionPrimary(MyProc, latestXid);
-	ProcArrayMarkOrdinaryMirrorFinished(MyProc);
 	/* Test-only hook for the H1-B completion-visible but not reusable window. */
 	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
 	MyProc->vxid.lxid = InvalidLocalTransactionId;

@@ -29,6 +29,7 @@ ISOLATION = basic \
 	    csn_ordinary_in_commit_oldest_xid \
 	    csn_ordinary_legacy_exit \
 	    csn_ordinary_lock_count \
+	    csn_ordinary_lock_count_readonly \
 	    csn_ordinary_oldest_active_xid \
 	    csn_ordinary_horizons \
 	    csn_ordinary_mirror_epoch \

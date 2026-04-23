@@ -1,5 +1,5 @@
-# Stage 3 H1-D baseline: ordinary completion metadata is still updated inside
-# the legacy ordinary ProcArray helper, not before it.
+# Stage 3 H1-E characterization: ordinary completion metadata is published
+# through the shadow-backed contract at ordinary finish publication.
 
 setup
 {
@@ -168,15 +168,10 @@ step o_capture_commit_before
 }
 step o_commit_before_state
 {
-	SELECT injection_points_latest_completed_xid() =
-		injection_points_get_saved_xid8() AS commit_before_latest_stable,
-		injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS commit_before_latest_shadow_matches_legacy,
-		injection_points_xact_completion_count() =
-		injection_points_get_saved_int8() AS commit_before_count_unchanged,
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_get_saved_xid8() AS commit_before_shadow_latest_stable,
 		injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS commit_before_shadow_matches_legacy;
+		injection_points_get_saved_int8() AS commit_before_shadow_count_unchanged;
 }
 step o_capture_commit_after
 {
@@ -199,15 +194,10 @@ step o_capture_commit_after
 }
 step o_commit_after_state
 {
-	SELECT injection_points_latest_completed_xid() =
-		injection_points_get_saved_xid8() AS commit_after_latest_stable,
-		injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS commit_after_latest_shadow_matches_legacy,
-		injection_points_xact_completion_count() =
-		injection_points_get_saved_int8() + 1 AS commit_after_count_advanced,
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_get_saved_xid8() AS commit_after_shadow_latest_stable,
 		injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS commit_after_shadow_matches_legacy;
+		injection_points_get_saved_int8() + 1 AS commit_after_shadow_count_advanced;
 }
 step o_capture_abort_before
 {
@@ -230,15 +220,10 @@ step o_capture_abort_before
 }
 step o_abort_before_state
 {
-	SELECT injection_points_latest_completed_xid() =
-		injection_points_get_saved_xid8() AS abort_before_latest_stable,
-		injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS abort_before_latest_shadow_matches_legacy,
-		injection_points_xact_completion_count() =
-		injection_points_get_saved_int8() AS abort_before_count_unchanged,
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_get_saved_xid8() AS abort_before_shadow_latest_stable,
 		injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS abort_before_shadow_matches_legacy;
+		injection_points_get_saved_int8() AS abort_before_shadow_count_unchanged;
 }
 step o_capture_abort_after
 {
@@ -261,26 +246,20 @@ step o_capture_abort_after
 }
 step o_abort_after_state
 {
-	SELECT injection_points_latest_completed_xid() =
-		injection_points_get_saved_xid8() AS abort_after_latest_stable,
-		injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS abort_after_latest_shadow_matches_legacy,
-		injection_points_xact_completion_count() =
-		injection_points_get_saved_int8() + 1 AS abort_after_count_advanced,
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_get_saved_xid8() AS abort_after_shadow_latest_stable,
 		injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS abort_after_shadow_matches_legacy;
+		injection_points_get_saved_int8() + 1 AS abort_after_shadow_count_advanced;
 }
 
 step o_save_count
 {
-	SELECT injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS saved_latest_shadow_matches_legacy;
-	SELECT injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
-	SELECT injection_points_save_int8(injection_points_xact_completion_count());
-	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+	SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL
+		AS saved_shadow_latest_present;
+	SELECT injection_points_xact_completion_count_shadow() > 0
+		AS saved_shadow_count_present;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count_shadow());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid_shadow());
 }
 
 session ctl

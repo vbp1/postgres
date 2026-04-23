@@ -1,9 +1,7 @@
 CREATE EXTENSION injection_points;
 
-SELECT injection_points_latest_completed_xid_shadow() =
-       injection_points_latest_completed_xid();
-SELECT injection_points_xact_completion_count_shadow() =
-       injection_points_xact_completion_count();
+SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL;
+SELECT injection_points_xact_completion_count_shadow() > 0;
 
 \getenv libdir PG_LIBDIR
 \getenv dlsuffix PG_DLSUFFIX
@@ -86,14 +84,13 @@ SELECT injection_points_csn_oldest_active_xid() IS NOT NULL;
 SELECT injection_points_oldest_considered_running_xid() IS NOT NULL;
 SELECT injection_points_oldest_nonremovable_xid() IS NOT NULL;
 SELECT injection_points_latest_completed_xid() IS NOT NULL;
-SELECT injection_points_latest_completed_xid_shadow() =
-       injection_points_latest_completed_xid();
+SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL;
 SELECT injection_points_xact_completion_count() > 0;
 SELECT injection_points_xact_completion_count_shadow() > 0;
 SELECT injection_points_transaction_snapshot_xact_completion_count() > 0;
-SELECT injection_points_save_int8(injection_points_xact_completion_count());
+SELECT injection_points_save_int8(injection_points_xact_completion_count_shadow());
 SELECT injection_points_get_saved_int8() > 0;
-SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+SELECT injection_points_save_xid8(injection_points_latest_completed_xid_shadow());
 SELECT injection_points_get_saved_xid8() IS NOT NULL;
 SELECT injection_points_running_xacts_include_backend(pg_backend_pid(), true);
 SELECT injection_points_running_xacts_latest_completed_xid(true) =

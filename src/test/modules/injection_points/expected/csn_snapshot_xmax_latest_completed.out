@@ -27,16 +27,13 @@ step r_before:
 	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
 		pg_snapshot_xmax(snap)::text::int8 =
-			injection_points_latest_completed_xid()::text::int8 + 1
-			AS xmax_matches_latest,
-		pg_snapshot_xmax(snap)::text::int8 =
 			injection_points_latest_completed_xid_shadow()::text::int8 + 1
 			AS xmax_matches_shadow
 	FROM snap;
 
-uses_csn|xmax_matches_latest|xmax_matches_shadow
---------+-------------------+-------------------
-t       |t                  |t                  
+uses_csn|xmax_matches_shadow
+--------+-------------------
+t       |t                  
 (1 row)
 
 step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
@@ -81,16 +78,13 @@ step r_after:
 	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
 		pg_snapshot_xmax(snap)::text::int8 =
-			injection_points_latest_completed_xid()::text::int8 + 1
-			AS xmax_matches_latest,
-		pg_snapshot_xmax(snap)::text::int8 =
 			injection_points_latest_completed_xid_shadow()::text::int8 + 1
 			AS xmax_matches_shadow
 	FROM snap;
 
-uses_csn|xmax_matches_latest|xmax_matches_shadow
---------+-------------------+-------------------
-t       |t                  |t                  
+uses_csn|xmax_matches_shadow
+--------+-------------------
+t       |t                  
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>

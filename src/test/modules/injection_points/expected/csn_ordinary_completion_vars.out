@@ -65,22 +65,21 @@ t
 (1 row)
 
 step o_save_count: 
-	SELECT injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS saved_latest_shadow_matches_legacy;
-	SELECT injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
-	SELECT injection_points_save_int8(injection_points_xact_completion_count());
-	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+	SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL
+		AS saved_shadow_latest_present;
+	SELECT injection_points_xact_completion_count_shadow() > 0
+		AS saved_shadow_count_present;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count_shadow());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid_shadow());
 
-saved_latest_shadow_matches_legacy
-----------------------------------
-t                                 
-(1 row)
-
-saved_shadow_matches_legacy
+saved_shadow_latest_present
 ---------------------------
 t                          
+(1 row)
+
+saved_shadow_count_present
+--------------------------
+t                         
 (1 row)
 
 injection_points_save_int8
@@ -95,19 +94,14 @@ injection_points_save_xid8
 
 step wcb_commit: COMMIT; <waiting ...>
 step o_commit_before_state: 
-	SELECT injection_points_latest_completed_xid() =
-		injection_points_get_saved_xid8() AS commit_before_latest_stable,
-		injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS commit_before_latest_shadow_matches_legacy,
-		injection_points_xact_completion_count() =
-		injection_points_get_saved_int8() AS commit_before_count_unchanged,
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_get_saved_xid8() AS commit_before_shadow_latest_stable,
 		injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS commit_before_shadow_matches_legacy;
+		injection_points_get_saved_int8() AS commit_before_shadow_count_unchanged;
 
-commit_before_latest_stable|commit_before_latest_shadow_matches_legacy|commit_before_count_unchanged|commit_before_shadow_matches_legacy
----------------------------+------------------------------------------+-----------------------------+-----------------------------------
-t                          |t                                         |t                            |t                                  
+commit_before_shadow_latest_stable|commit_before_shadow_count_unchanged
+----------------------------------+------------------------------------
+t                                 |t                                   
 (1 row)
 
 step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
@@ -203,22 +197,21 @@ t
 (1 row)
 
 step o_save_count: 
-	SELECT injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS saved_latest_shadow_matches_legacy;
-	SELECT injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
-	SELECT injection_points_save_int8(injection_points_xact_completion_count());
-	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+	SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL
+		AS saved_shadow_latest_present;
+	SELECT injection_points_xact_completion_count_shadow() > 0
+		AS saved_shadow_count_present;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count_shadow());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid_shadow());
 
-saved_latest_shadow_matches_legacy
-----------------------------------
-t                                 
-(1 row)
-
-saved_shadow_matches_legacy
+saved_shadow_latest_present
 ---------------------------
 t                          
+(1 row)
+
+saved_shadow_count_present
+--------------------------
+t                         
 (1 row)
 
 injection_points_save_int8
@@ -233,19 +226,14 @@ injection_points_save_xid8
 
 step wca_commit: COMMIT; <waiting ...>
 step o_commit_after_state: 
-	SELECT injection_points_latest_completed_xid() =
-		injection_points_get_saved_xid8() AS commit_after_latest_stable,
-		injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS commit_after_latest_shadow_matches_legacy,
-		injection_points_xact_completion_count() =
-		injection_points_get_saved_int8() + 1 AS commit_after_count_advanced,
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_get_saved_xid8() AS commit_after_shadow_latest_stable,
 		injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS commit_after_shadow_matches_legacy;
+		injection_points_get_saved_int8() + 1 AS commit_after_shadow_count_advanced;
 
-commit_after_latest_stable|commit_after_latest_shadow_matches_legacy|commit_after_count_advanced|commit_after_shadow_matches_legacy
---------------------------+-----------------------------------------+---------------------------+----------------------------------
-t                         |t                                        |t                          |t                                 
+commit_after_shadow_latest_stable|commit_after_shadow_count_advanced
+---------------------------------+----------------------------------
+t                                |t                                 
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
@@ -341,22 +329,21 @@ t
 (1 row)
 
 step o_save_count: 
-	SELECT injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS saved_latest_shadow_matches_legacy;
-	SELECT injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
-	SELECT injection_points_save_int8(injection_points_xact_completion_count());
-	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+	SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL
+		AS saved_shadow_latest_present;
+	SELECT injection_points_xact_completion_count_shadow() > 0
+		AS saved_shadow_count_present;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count_shadow());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid_shadow());
 
-saved_latest_shadow_matches_legacy
-----------------------------------
-t                                 
-(1 row)
-
-saved_shadow_matches_legacy
+saved_shadow_latest_present
 ---------------------------
 t                          
+(1 row)
+
+saved_shadow_count_present
+--------------------------
+t                         
 (1 row)
 
 injection_points_save_int8
@@ -371,19 +358,14 @@ injection_points_save_xid8
 
 step wab_abort: ABORT; <waiting ...>
 step o_abort_before_state: 
-	SELECT injection_points_latest_completed_xid() =
-		injection_points_get_saved_xid8() AS abort_before_latest_stable,
-		injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS abort_before_latest_shadow_matches_legacy,
-		injection_points_xact_completion_count() =
-		injection_points_get_saved_int8() AS abort_before_count_unchanged,
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_get_saved_xid8() AS abort_before_shadow_latest_stable,
 		injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS abort_before_shadow_matches_legacy;
+		injection_points_get_saved_int8() AS abort_before_shadow_count_unchanged;
 
-abort_before_latest_stable|abort_before_latest_shadow_matches_legacy|abort_before_count_unchanged|abort_before_shadow_matches_legacy
---------------------------+-----------------------------------------+----------------------------+----------------------------------
-t                         |t                                        |t                           |t                                 
+abort_before_shadow_latest_stable|abort_before_shadow_count_unchanged
+---------------------------------+-----------------------------------
+t                                |t                                  
 (1 row)
 
 step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
@@ -479,22 +461,21 @@ t
 (1 row)
 
 step o_save_count: 
-	SELECT injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS saved_latest_shadow_matches_legacy;
-	SELECT injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
-	SELECT injection_points_save_int8(injection_points_xact_completion_count());
-	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+	SELECT injection_points_latest_completed_xid_shadow() IS NOT NULL
+		AS saved_shadow_latest_present;
+	SELECT injection_points_xact_completion_count_shadow() > 0
+		AS saved_shadow_count_present;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count_shadow());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid_shadow());
 
-saved_latest_shadow_matches_legacy
-----------------------------------
-t                                 
-(1 row)
-
-saved_shadow_matches_legacy
+saved_shadow_latest_present
 ---------------------------
 t                          
+(1 row)
+
+saved_shadow_count_present
+--------------------------
+t                         
 (1 row)
 
 injection_points_save_int8
@@ -509,19 +490,14 @@ injection_points_save_xid8
 
 step waa_abort: ABORT; <waiting ...>
 step o_abort_after_state: 
-	SELECT injection_points_latest_completed_xid() =
-		injection_points_get_saved_xid8() AS abort_after_latest_stable,
-		injection_points_latest_completed_xid_shadow() =
-		injection_points_latest_completed_xid()
-			AS abort_after_latest_shadow_matches_legacy,
-		injection_points_xact_completion_count() =
-		injection_points_get_saved_int8() + 1 AS abort_after_count_advanced,
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_get_saved_xid8() AS abort_after_shadow_latest_stable,
 		injection_points_xact_completion_count_shadow() =
-		injection_points_xact_completion_count() AS abort_after_shadow_matches_legacy;
+		injection_points_get_saved_int8() + 1 AS abort_after_shadow_count_advanced;
 
-abort_after_latest_stable|abort_after_latest_shadow_matches_legacy|abort_after_count_advanced|abort_after_shadow_matches_legacy
--------------------------+----------------------------------------+--------------------------+---------------------------------
-t                        |t                                       |t                         |t                                
+abort_after_shadow_latest_stable|abort_after_shadow_count_advanced
+--------------------------------+---------------------------------
+t                               |t                                
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>

@@ -1,6 +1,6 @@
-# Stage 3 H1-D characterization: snapshot xmax remains tied to
-# latestCompletedXid + 1 across the ordinary pre-helper and post-helper
-# freeze-points.
+# Stage 3 H1-E characterization: snapshot xmax remains tied to the
+# shadow-backed latestCompletedXid + 1 across the ordinary pre-helper and
+# post-helper freeze-points.
 
 setup
 {
@@ -44,9 +44,6 @@ step r_before
 	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
 		pg_snapshot_xmax(snap)::text::int8 =
-			injection_points_latest_completed_xid()::text::int8 + 1
-			AS xmax_matches_latest,
-		pg_snapshot_xmax(snap)::text::int8 =
 			injection_points_latest_completed_xid_shadow()::text::int8 + 1
 			AS xmax_matches_shadow
 	FROM snap;
@@ -57,9 +54,6 @@ step r_after
 		SELECT pg_current_snapshot() AS snap
 	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
-		pg_snapshot_xmax(snap)::text::int8 =
-			injection_points_latest_completed_xid()::text::int8 + 1
-			AS xmax_matches_latest,
 		pg_snapshot_xmax(snap)::text::int8 =
 			injection_points_latest_completed_xid_shadow()::text::int8 + 1
 			AS xmax_matches_shadow
