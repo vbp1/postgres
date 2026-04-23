@@ -139,6 +139,39 @@ AS 'MODULE_PATHNAME', 'injection_points_backend_slot_epoch'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
 --
+-- injection_points_backend_published_mirror_epoch()
+--
+-- Reads the published ordinary mirror epoch of the backend with the given
+-- PID.
+--
+CREATE FUNCTION injection_points_backend_published_mirror_epoch(IN backend_pid int4)
+RETURNS int8
+AS 'MODULE_PATHNAME', 'injection_points_backend_published_mirror_epoch'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+--
+-- injection_points_backend_snapshot_safe_to_ignore()
+--
+-- Returns whether the backend is currently marked snapshot-safe-to-ignore
+-- for CSN snapshots.
+--
+CREATE FUNCTION injection_points_backend_snapshot_safe_to_ignore(IN backend_pid int4)
+RETURNS bool
+AS 'MODULE_PATHNAME', 'injection_points_backend_snapshot_safe_to_ignore'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+--
+-- injection_points_backend_ordinary_finished()
+--
+-- Returns whether the passive ordinary-finished flag is set for the backend
+-- with the given PID.
+--
+CREATE FUNCTION injection_points_backend_ordinary_finished(IN backend_pid int4)
+RETURNS bool
+AS 'MODULE_PATHNAME', 'injection_points_backend_ordinary_finished'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+--
 -- injection_points_oldest_active_xid()
 --
 -- Exposes GetOldestActiveTransactionId() to SQL tests.

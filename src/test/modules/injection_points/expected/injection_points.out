@@ -275,6 +275,19 @@ SELECT injection_points_backend_slot_epoch(pg_backend_pid()) > 0;
  t
 (1 row)
 
+SELECT injection_points_backend_published_mirror_epoch(pg_backend_pid()) =
+       injection_points_backend_slot_epoch(pg_backend_pid());
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT injection_points_backend_ordinary_finished(pg_backend_pid()) = false;
+ ?column? 
+----------
+ t
+(1 row)
+
 SELECT injection_points_xid_in_progress(pg_current_xact_id());
  injection_points_xid_in_progress 
 ----------------------------------

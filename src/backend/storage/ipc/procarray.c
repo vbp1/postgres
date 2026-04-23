@@ -137,6 +137,22 @@ typedef struct ProcArraySlotEpochState
 
 static ProcArraySlotEpochState *procArraySlotEpochState;
 
+typedef struct ProcArrayOrdinaryMirrorEpochState
+{
+	int			nslots;
+	pg_atomic_uint64 epochs[FLEXIBLE_ARRAY_MEMBER];
+} ProcArrayOrdinaryMirrorEpochState;
+
+static ProcArrayOrdinaryMirrorEpochState *procArrayOrdinaryMirrorEpochState;
+
+typedef struct ProcArrayOrdinaryMirrorFinishedState
+{
+	int			nslots;
+	pg_atomic_uint32 flags[FLEXIBLE_ARRAY_MEMBER];
+} ProcArrayOrdinaryMirrorFinishedState;
+
+static ProcArrayOrdinaryMirrorFinishedState *procArrayOrdinaryMirrorFinishedState;
+
 #define PROCARRAY_MAXPROCS	(MaxBackends + max_prepared_xacts)
 #define PROCARRAY_ALLPROCS	(PROCARRAY_MAXPROCS + NUM_AUXILIARY_PROCS)
 
@@ -413,6 +429,7 @@ static void MaintainLatestCompletedXid(TransactionId latestXid);
 static void MaintainLatestCompletedXidRecovery(TransactionId latestXid);
 static void RecomputeCSNOldestActiveXid(void);
 static inline bool ProcIsCSNSnapshotSafeToIgnore(PGPROC *proc);
+static inline bool ProcIsOrdinaryPrimaryMirrorFinished(PGPROC *proc);
 static bool ProcCouldAdvanceCSNOldestActiveXid(PGPROC *proc);
 
 static inline FullTransactionId FullXidRelativeTo(FullTransactionId rel,
@@ -469,6 +486,16 @@ ProcArrayShmemRequest(void *arg)
 										mul_size(sizeof(pg_atomic_uint64), PROCARRAY_ALLPROCS)),
 					   .ptr = (void **) &procArraySlotEpochState,
 		);
+	ShmemRequestStruct(.name = "ProcArray Ordinary Mirror Epoch State",
+					   .size = add_size(offsetof(ProcArrayOrdinaryMirrorEpochState, epochs),
+										mul_size(sizeof(pg_atomic_uint64), PROCARRAY_ALLPROCS)),
+					   .ptr = (void **) &procArrayOrdinaryMirrorEpochState,
+		);
+	ShmemRequestStruct(.name = "ProcArray Ordinary Mirror Finished State",
+					   .size = add_size(offsetof(ProcArrayOrdinaryMirrorFinishedState, flags),
+										mul_size(sizeof(pg_atomic_uint32), PROCARRAY_ALLPROCS)),
+					   .ptr = (void **) &procArrayOrdinaryMirrorFinishedState,
+		);
 }
 
 /*
@@ -491,6 +518,12 @@ ProcArrayShmemInit(void *arg)
 	procArraySlotEpochState->nslots = PROCARRAY_ALLPROCS;
 	for (int procno = 0; procno < PROCARRAY_ALLPROCS; procno++)
 		pg_atomic_init_u64(&procArraySlotEpochState->epochs[procno], 0);
+	procArrayOrdinaryMirrorEpochState->nslots = PROCARRAY_ALLPROCS;
+	for (int procno = 0; procno < PROCARRAY_ALLPROCS; procno++)
+		pg_atomic_init_u64(&procArrayOrdinaryMirrorEpochState->epochs[procno], 0);
+	procArrayOrdinaryMirrorFinishedState->nslots = PROCARRAY_ALLPROCS;
+	for (int procno = 0; procno < PROCARRAY_ALLPROCS; procno++)
+		pg_atomic_init_u32(&procArrayOrdinaryMirrorFinishedState->flags[procno], 0);
 	TransamVariables->xactCompletionCount = 1;
 	TransamInitXactCompletionCountShadow(1);
 
@@ -650,6 +683,9 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 	Assert(ProcGlobal->subxidStates[myoff].count == 0);
 	Assert(ProcGlobal->subxidStates[myoff].overflowed == false);
 
+	pg_atomic_write_u32(
+		&procArrayOrdinaryMirrorFinishedState->flags[GetNumberFromPGProc(proc)],
+		0);
 	proc->csnFlags = 0;
 	ProcGlobal->statusFlags[myoff] = 0;
 
@@ -763,6 +799,9 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 
 		/* be sure this is cleared in abort */
 		proc->delayChkptFlags = 0;
+		pg_atomic_write_u32(
+			&procArrayOrdinaryMirrorFinishedState->flags[GetNumberFromPGProc(proc)],
+			0);
 		proc->csnFlags = 0;
 
 		if (needProcArrayLock)
@@ -786,9 +825,10 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 				RecomputeCSNOldestActiveXid();
 			LWLockRelease(ProcArrayLock);
 		}
-		else
+	else
 			proc->xmin = InvalidTransactionId;
 	}
+
 }
 
 /*
@@ -1118,6 +1158,9 @@ ProcArrayClearTransaction(PGPROC *proc)
 
 	proc->vxid.lxid = InvalidLocalTransactionId;
 	proc->xmin = InvalidTransactionId;
+	pg_atomic_write_u32(
+		&procArrayOrdinaryMirrorFinishedState->flags[GetNumberFromPGProc(proc)],
+		0);
 	proc->csnFlags = 0;
 
 	Assert(!(proc->statusFlags & PROC_VACUUM_STATE_MASK));
@@ -1242,6 +1285,20 @@ ProcArrayAdvanceSlotEpoch(ProcNumber procNumber)
 	return pg_atomic_add_fetch_u64(&procArraySlotEpochState->epochs[procNumber], 1);
 }
 
+uint64
+ProcArrayReadPublishedOrdinaryMirrorEpoch(PGPROC *proc)
+{
+	int			procNumber;
+
+	Assert(proc != NULL);
+	procNumber = GetNumberFromPGProc(proc);
+	if (procNumber < 0 || procNumber >= PROCARRAY_ALLPROCS)
+		return 0;
+	Assert(procArrayOrdinaryMirrorEpochState != NULL);
+
+	return pg_atomic_read_u64(&procArrayOrdinaryMirrorEpochState->epochs[procNumber]);
+}
+
 /*
  * Recompute the prototype-owned CSN lower bound from the current ProcArray.
  *
@@ -1300,6 +1357,42 @@ ProcIsCSNSnapshotSafeToIgnore(PGPROC *proc)
 	return (proc->csnFlags & PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE) != 0;
 }
 
+static inline bool
+ProcIsOrdinaryPrimaryMirrorFinished(PGPROC *proc)
+{
+	int			procNumber;
+
+	Assert(proc != NULL);
+	procNumber = GetNumberFromPGProc(proc);
+	if (procNumber < 0 || procNumber >= PROCARRAY_ALLPROCS)
+		return false;
+
+	return pg_atomic_read_u32(
+		&procArrayOrdinaryMirrorFinishedState->flags[procNumber]) != 0;
+}
+
+bool
+ProcArrayReadOrdinaryMirrorFinished(PGPROC *proc)
+{
+	return ProcIsOrdinaryPrimaryMirrorFinished(proc);
+}
+
+void
+ProcArrayMarkOrdinaryMirrorFinished(PGPROC *proc)
+{
+	Assert(proc == MyProc);
+
+	/*
+	 * Publish the now-finished ordinary generation after the legacy helper
+	 * has completed its xid/xmin cleanup and immediately before any reader
+	 * freeze point that wants to observe the post-helper state.
+	 */
+	pg_write_barrier();
+	pg_atomic_write_u32(
+		&procArrayOrdinaryMirrorFinishedState->flags[GetNumberFromPGProc(proc)],
+		1);
+}
+
 /*
  * Check whether clearing this backend from the running set could advance the
  * cached CSN lower bound.
@@ -1356,7 +1449,47 @@ ProcArrayClearCSNSnapshotSafeToIgnore(PGPROC *proc)
 {
 	Assert(proc == MyProc);
 
-	proc->csnFlags = 0;
+	proc->csnFlags &= ~PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE;
+}
+
+void
+ProcArrayBeginOrdinaryPrimaryEpoch(PGPROC *proc)
+{
+	Assert(proc == MyProc);
+	Assert(proc->vxid.procNumber == MyProcNumber);
+
+	ProcArrayAdvanceSlotEpoch(proc->vxid.procNumber);
+
+	/*
+	 * Readers must see the new slot epoch before the previous finished
+	 * mirror generation can become eligible for reuse.
+	 */
+	pg_write_barrier();
+	pg_atomic_write_u32(
+		&procArrayOrdinaryMirrorFinishedState->flags[proc->vxid.procNumber],
+		0);
+	pg_write_barrier();
+}
+
+void
+ProcArrayPublishOrdinaryMirrorEpoch(PGPROC *proc)
+{
+	uint64		slotEpoch;
+
+	Assert(proc == MyProc);
+	Assert(proc->vxid.procNumber == MyProcNumber);
+
+	slotEpoch = ProcArrayReadSlotEpoch(proc->vxid.procNumber);
+	Assert(slotEpoch > 0);
+
+	/*
+	 * Publish xid/subxid mirror writes before readers are allowed to match
+	 * them with the current slot epoch.
+	 */
+	pg_write_barrier();
+	pg_atomic_write_u64(
+		&procArrayOrdinaryMirrorEpochState->epochs[proc->vxid.procNumber],
+		slotEpoch);
 }
 
 void
@@ -2765,7 +2898,10 @@ GetSnapshotData(Snapshot snapshot)
 			Assert(proc->pgxactoff == pgxactoff);
 
 			if (snapshotCsnLocked && ProcIsCSNSnapshotSafeToIgnore(proc))
+			{
+				INJECTION_POINT("snapshot-before-skip-safe-to-ignore", NULL);
 				continue;
+			}
 
 			/*
 			 * If the transaction has no XID assigned, we can skip it; it
@@ -2781,7 +2917,10 @@ GetSnapshotData(Snapshot snapshot)
 			 */
 			delayChkptFlags = proc->delayChkptFlags;
 			if (delayChkptFlags & DELAY_CHKPT_IN_COMMIT)
+			{
 				commitCriticalSectionSeen = true;
+				INJECTION_POINT("snapshot-saw-delay-chkpt-in-commit", NULL);
+			}
 
 			/*
 			 * We don't include our own XIDs (if any) in the snapshot. It
@@ -4645,10 +4784,10 @@ XidCacheRemoveRunningXids(TransactionId xid,
 		 * overflowed. However it's also possible for this routine to be
 		 * invoked multiple times for the same subtransaction, in case of an
 		 * error during AbortSubTransaction.  So instead of Assert, emit a
-		 * debug warning.
+		 * debug-level message.
 		 */
 		if (j < 0 && !MyProc->subxidStatus.overflowed)
-			elog(WARNING, "did not find subXID %u in MyProc", anxid);
+			elog(DEBUG1, "did not find subXID %u in MyProc", anxid);
 	}
 
 	for (j = MyProc->subxidStatus.count - 1; j >= 0; j--)
@@ -4664,7 +4803,7 @@ XidCacheRemoveRunningXids(TransactionId xid,
 	}
 	/* Ordinarily we should have found it, unless the cache has overflowed */
 	if (j < 0 && !MyProc->subxidStatus.overflowed)
-		elog(WARNING, "did not find subXID %u in MyProc", xid);
+		elog(DEBUG1, "did not find subXID %u in MyProc", xid);
 
 	/* Also advance global latestCompletedXid while holding the lock */
 	MaintainLatestCompletedXid(latestXid);

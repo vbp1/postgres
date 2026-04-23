@@ -31,6 +31,7 @@ ISOLATION = basic \
 	    csn_ordinary_lock_count \
 	    csn_ordinary_oldest_active_xid \
 	    csn_ordinary_horizons \
+	    csn_ordinary_mirror_epoch \
 	    csn_ordinary_reuse_begin \
 	    csn_ordinary_reuse_slot_epoch \
 	    csn_ordinary_reuse_completion_count \
@@ -43,6 +44,7 @@ ISOLATION = basic \
 	    repack \
 	    repack_toast \
 	    syscache-update-pruned \
+	    csn_commit_snapshot_decision \
 	    heap_lock_update
 
 # some isolation tests require wal_level=replica

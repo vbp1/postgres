@@ -27,6 +27,9 @@ extern void ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid
 extern void ProcArrayClearTransaction(PGPROC *proc);
 extern void ProcArrayMarkCSNSnapshotSafeToIgnore(PGPROC *proc);
 extern void ProcArrayClearCSNSnapshotSafeToIgnore(PGPROC *proc);
+extern void ProcArrayBeginOrdinaryPrimaryEpoch(PGPROC *proc);
+extern void ProcArrayPublishOrdinaryMirrorEpoch(PGPROC *proc);
+extern void ProcArrayMarkOrdinaryMirrorFinished(PGPROC *proc);
 extern void ProcArrayUpdateXmin(PGPROC *proc, TransactionId xmin);
 
 extern void ProcArrayInitRecovery(TransactionId initializedUptoXID);
@@ -105,5 +108,7 @@ extern FullTransactionId ProcArrayReadLatestCompletedXidShadow(void);
 extern void ProcArrayWriteLatestCompletedXidShadow(FullTransactionId latestCompletedXid);
 extern uint64 ProcArrayReadSlotEpoch(ProcNumber procNumber);
 extern uint64 ProcArrayAdvanceSlotEpoch(ProcNumber procNumber);
+extern uint64 ProcArrayReadPublishedOrdinaryMirrorEpoch(PGPROC *proc);
+extern bool ProcArrayReadOrdinaryMirrorFinished(PGPROC *proc);
 
 #endif							/* PROCARRAY_H */

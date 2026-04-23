@@ -825,6 +825,72 @@ injection_points_backend_slot_epoch(PG_FUNCTION_ARGS)
 }
 
 /*
+ * SQL function for reading the published ordinary mirror epoch of the backend
+ * with the given PID.
+ */
+PG_FUNCTION_INFO_V1(injection_points_backend_published_mirror_epoch);
+Datum
+injection_points_backend_published_mirror_epoch(PG_FUNCTION_ARGS)
+{
+	int			pid = PG_GETARG_INT32(0);
+	PGPROC	   *proc;
+	uint64		epoch = 0;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	proc = BackendPidGetProcWithLock(pid);
+	if (proc != NULL)
+		epoch = ProcArrayReadPublishedOrdinaryMirrorEpoch(proc);
+	LWLockRelease(ProcArrayLock);
+
+	if (epoch == 0)
+		PG_RETURN_NULL();
+
+	PG_RETURN_INT64((int64) epoch);
+}
+
+/*
+ * SQL function for checking whether the backend with the given PID is marked
+ * snapshot-safe-to-ignore for CSN snapshots.
+ */
+PG_FUNCTION_INFO_V1(injection_points_backend_snapshot_safe_to_ignore);
+Datum
+injection_points_backend_snapshot_safe_to_ignore(PG_FUNCTION_ARGS)
+{
+	int			pid = PG_GETARG_INT32(0);
+	PGPROC	   *proc;
+	bool		safe = false;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	proc = BackendPidGetProcWithLock(pid);
+	if (proc != NULL)
+		safe = (proc->csnFlags & PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE) != 0;
+	LWLockRelease(ProcArrayLock);
+
+	PG_RETURN_BOOL(safe);
+}
+
+/*
+ * SQL function for checking whether the backend with the given PID has the
+ * passive ordinary-finished flag set.
+ */
+PG_FUNCTION_INFO_V1(injection_points_backend_ordinary_finished);
+Datum
+injection_points_backend_ordinary_finished(PG_FUNCTION_ARGS)
+{
+	int			pid = PG_GETARG_INT32(0);
+	PGPROC	   *proc;
+	bool		finished = false;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	proc = BackendPidGetProcWithLock(pid);
+	if (proc != NULL)
+		finished = ProcArrayReadOrdinaryMirrorFinished(proc);
+	LWLockRelease(ProcArrayLock);
+
+	PG_RETURN_BOOL(finished);
+}
+
+/*
  * SQL function for exposing GetOldestActiveTransactionId() to SQL tests.
  */
 PG_FUNCTION_INFO_V1(injection_points_oldest_active_xid);

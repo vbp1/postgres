@@ -2385,13 +2385,12 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_IN_COMMIT;
 
-	INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
-
 	/*
 	 * Ensures the DELAY_CHKPT_IN_COMMIT flag write is globally visible before
 	 * commit time is written.
 	 */
 	pg_write_barrier();
+	INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
 
 	TransactionIdSetCSNCommitting(xid);
 	commitSeqNo = GetNewCommitSeqNo();

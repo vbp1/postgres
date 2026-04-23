@@ -1485,7 +1485,6 @@ RecordTransactionCommit(void)
 		INJECTION_POINT_LOAD("commit-after-csn-publication");
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_IN_COMMIT;
-		INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
 
 		Assert(xactStopTimestamp == 0);
 
@@ -1494,6 +1493,7 @@ RecordTransactionCommit(void)
 		 * before commit time is written.
 		 */
 		pg_write_barrier();
+		INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
 
 		TransactionIdSetCSNCommitting(xid);
 		commitSeqNo = GetNewCommitSeqNo();
@@ -2249,7 +2249,7 @@ StartTransaction(void)
 	 * already.
 	 */
 	Assert(MyProc->vxid.procNumber == vxid.procNumber);
-	ProcArrayAdvanceSlotEpoch(vxid.procNumber);
+	ProcArrayBeginOrdinaryPrimaryEpoch(MyProc);
 	MyProc->vxid.lxid = vxid.localTransactionId;
 	/* Test-only hook for H1-B new-transaction vxid publication baseline. */
 	INJECTION_POINT("start-after-vxid-publication", NULL);
@@ -2467,6 +2467,7 @@ CommitTransaction(void)
 	 * RecordTransactionCommit.
 	 */
 	ProcArrayEndTransactionPrimary(MyProc, latestXid);
+	ProcArrayMarkOrdinaryMirrorFinished(MyProc);
 	/* Test-only hook for the H1-B completion-visible but not reusable window. */
 	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
 	MyProc->vxid.lxid = InvalidLocalTransactionId;
@@ -3044,6 +3045,7 @@ AbortTransaction(void)
 	 * RecordTransactionAbort.
 	 */
 	ProcArrayEndTransactionPrimary(MyProc, latestXid);
+	ProcArrayMarkOrdinaryMirrorFinished(MyProc);
 	/* Test-only hook for the H1-B completion-visible but not reusable window. */
 	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
 	MyProc->vxid.lxid = InvalidLocalTransactionId;

@@ -77,6 +77,9 @@ BEGIN;
 SELECT pg_current_xact_id();
 SELECT injection_points_backend_xid(pg_backend_pid()) IS NOT NULL;
 SELECT injection_points_backend_slot_epoch(pg_backend_pid()) > 0;
+SELECT injection_points_backend_published_mirror_epoch(pg_backend_pid()) =
+       injection_points_backend_slot_epoch(pg_backend_pid());
+SELECT injection_points_backend_ordinary_finished(pg_backend_pid()) = false;
 SELECT injection_points_xid_in_progress(pg_current_xact_id());
 SELECT injection_points_oldest_active_xid(false, false) IS NOT NULL;
 SELECT injection_points_csn_oldest_active_xid() IS NOT NULL;

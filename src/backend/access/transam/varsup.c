@@ -25,6 +25,7 @@
 #include "postmaster/autovacuum.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/subsystems.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -269,6 +270,7 @@ GetNewTransactionId(bool isSubXact)
 		/* LWLockRelease acts as barrier */
 		MyProc->xid = xid;
 		ProcGlobal->xids[MyProc->pgxactoff] = xid;
+		ProcArrayPublishOrdinaryMirrorEpoch(MyProc);
 	}
 	else
 	{

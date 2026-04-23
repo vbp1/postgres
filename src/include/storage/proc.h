@@ -17,6 +17,7 @@
 #include "access/xlogdefs.h"
 #include "lib/ilist.h"
 #include "miscadmin.h"
+#include "port/atomics.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
