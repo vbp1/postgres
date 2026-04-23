@@ -1,0 +1,289 @@
+Parsed test spec with 4 sessions
+
+starting permutation: reset wc_prepare wc_finish wake_after detach_after w_begin_new o_reuse_epoch wake_start detach_start w_rollback
+step reset: 
+	UPDATE csn_ordinary_reuse_slot_epoch_data SET val = 0 WHERE id = 1;
+	SELECT injection_points_set_global_int8('slot-epoch-old-pid', 0);
+	SELECT injection_points_set_global_int8('slot-epoch-old-fxid', 0);
+	SELECT injection_points_set_global_int8('slot-epoch-old-proc', 0);
+	SELECT injection_points_set_global_int8('slot-epoch-old-epoch', 0);
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step wc_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT injection_points_attach('start-after-vxid-publication', 'wait');
+	SELECT injection_points_set_global_int8('slot-epoch-old-pid', pg_backend_pid());
+	SELECT injection_points_set_global_int8(
+		'slot-epoch-old-fxid',
+		pg_current_xact_id()::text::int8
+	);
+	SELECT injection_points_set_global_int8(
+		'slot-epoch-old-proc',
+		(
+			SELECT split_part(virtualtransaction, '/', 1)::int8
+			FROM pg_locks
+			WHERE pid = pg_backend_pid()
+			  AND locktype = 'virtualxid'
+		)
+	);
+	SELECT injection_points_set_global_int8(
+		'slot-epoch-old-epoch',
+		injection_points_backend_slot_epoch(pg_backend_pid())
+	);
+	UPDATE csn_ordinary_reuse_slot_epoch_data SET val = 1 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step wc_finish: COMMIT; <waiting ...>
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step wc_finish: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_begin_new: BEGIN; <waiting ...>
+step o_reuse_epoch: 
+	SELECT injection_points_xid_in_progress(
+		injection_points_get_global_int8('slot-epoch-old-fxid')::text::xid8
+	) = false AS old_xid_retired,
+		injection_points_backend_xid(
+			injection_points_get_global_int8('slot-epoch-old-pid')::int4
+		) IS NULL AS new_xid_not_assigned,
+		(
+			SELECT split_part(virtualtransaction, '/', 1)::int8
+			FROM pg_locks
+			WHERE locktype = 'virtualxid'
+			  AND pid = injection_points_get_global_int8('slot-epoch-old-pid')::int4
+		) =
+		injection_points_get_global_int8('slot-epoch-old-proc') AS same_proc_slot,
+		injection_points_backend_slot_epoch(
+			injection_points_get_global_int8('slot-epoch-old-pid')::int4
+		) >
+		injection_points_get_global_int8('slot-epoch-old-epoch') AS slot_epoch_advanced;
+
+old_xid_retired|new_xid_not_assigned|same_proc_slot|slot_epoch_advanced
+---------------+--------------------+--------------+-------------------
+t              |t                   |t             |t                  
+(1 row)
+
+step wake_start: SELECT injection_points_wakeup('start-after-vxid-publication'); <waiting ...>
+step w_begin_new: <... completed>
+step wake_start: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_start: SELECT injection_points_detach('start-after-vxid-publication');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_rollback: ROLLBACK;
+
+starting permutation: reset wa_prepare wa_finish wake_after detach_after w_begin_new o_reuse_epoch wake_start detach_start w_rollback
+step reset: 
+	UPDATE csn_ordinary_reuse_slot_epoch_data SET val = 0 WHERE id = 1;
+	SELECT injection_points_set_global_int8('slot-epoch-old-pid', 0);
+	SELECT injection_points_set_global_int8('slot-epoch-old-fxid', 0);
+	SELECT injection_points_set_global_int8('slot-epoch-old-proc', 0);
+	SELECT injection_points_set_global_int8('slot-epoch-old-epoch', 0);
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step wa_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT injection_points_attach('start-after-vxid-publication', 'wait');
+	SELECT injection_points_set_global_int8('slot-epoch-old-pid', pg_backend_pid());
+	SELECT injection_points_set_global_int8(
+		'slot-epoch-old-fxid',
+		pg_current_xact_id()::text::int8
+	);
+	SELECT injection_points_set_global_int8(
+		'slot-epoch-old-proc',
+		(
+			SELECT split_part(virtualtransaction, '/', 1)::int8
+			FROM pg_locks
+			WHERE pid = pg_backend_pid()
+			  AND locktype = 'virtualxid'
+		)
+	);
+	SELECT injection_points_set_global_int8(
+		'slot-epoch-old-epoch',
+		injection_points_backend_slot_epoch(pg_backend_pid())
+	);
+	UPDATE csn_ordinary_reuse_slot_epoch_data SET val = 2 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step wa_finish: ABORT; <waiting ...>
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step wa_finish: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_begin_new: BEGIN; <waiting ...>
+step o_reuse_epoch: 
+	SELECT injection_points_xid_in_progress(
+		injection_points_get_global_int8('slot-epoch-old-fxid')::text::xid8
+	) = false AS old_xid_retired,
+		injection_points_backend_xid(
+			injection_points_get_global_int8('slot-epoch-old-pid')::int4
+		) IS NULL AS new_xid_not_assigned,
+		(
+			SELECT split_part(virtualtransaction, '/', 1)::int8
+			FROM pg_locks
+			WHERE locktype = 'virtualxid'
+			  AND pid = injection_points_get_global_int8('slot-epoch-old-pid')::int4
+		) =
+		injection_points_get_global_int8('slot-epoch-old-proc') AS same_proc_slot,
+		injection_points_backend_slot_epoch(
+			injection_points_get_global_int8('slot-epoch-old-pid')::int4
+		) >
+		injection_points_get_global_int8('slot-epoch-old-epoch') AS slot_epoch_advanced;
+
+old_xid_retired|new_xid_not_assigned|same_proc_slot|slot_epoch_advanced
+---------------+--------------------+--------------+-------------------
+t              |t                   |t             |t                  
+(1 row)
+
+step wake_start: SELECT injection_points_wakeup('start-after-vxid-publication'); <waiting ...>
+step w_begin_new: <... completed>
+step wake_start: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_start: SELECT injection_points_detach('start-after-vxid-publication');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_rollback: ROLLBACK;

@@ -101,5 +101,9 @@ extern void ProcArraySetReplicationSlotXmin(TransactionId xmin,
 
 extern void ProcArrayGetReplicationSlotXmin(TransactionId *xmin,
 											TransactionId *catalog_xmin);
+extern FullTransactionId ProcArrayReadLatestCompletedXidShadow(void);
+extern void ProcArrayWriteLatestCompletedXidShadow(FullTransactionId latestCompletedXid);
+extern uint64 ProcArrayReadSlotEpoch(ProcNumber procNumber);
+extern uint64 ProcArrayAdvanceSlotEpoch(ProcNumber procNumber);
 
 #endif							/* PROCARRAY_H */

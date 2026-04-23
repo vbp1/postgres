@@ -6532,6 +6532,7 @@ StartupXLOG(void)
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	TransamVariables->latestCompletedXid = TransamVariables->nextXid;
 	FullTransactionIdRetreat(&TransamVariables->latestCompletedXid);
+	ProcArrayWriteLatestCompletedXidShadow(TransamVariables->latestCompletedXid);
 	LWLockRelease(ProcArrayLock);
 
 	/*

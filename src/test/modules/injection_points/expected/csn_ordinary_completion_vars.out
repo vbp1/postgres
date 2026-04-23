@@ -1,0 +1,553 @@
+Parsed test spec with 7 sessions
+
+starting permutation: reset wcb_seed wcb_prepare o_capture_commit_before o_save_count wcb_commit o_commit_before_state wake_before detach_before wcb_unlock
+step reset: 
+	TRUNCATE csn_ordinary_completion_vars_state;
+	UPDATE csn_ordinary_completion_vars_data SET val = 0 WHERE id = 1;
+
+step wcb_seed: 
+	INSERT INTO csn_ordinary_completion_vars_state(label, pid, fxid)
+	VALUES (
+		'commit_before',
+		pg_backend_pid(),
+		NULL
+	);
+
+step wcb_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-primary', 'wait');
+	SELECT pg_current_xact_id() IS NOT NULL AS writer_fxid_assigned;
+	SELECT pg_advisory_lock_shared(1, pg_current_xact_id()::text::int4);
+	UPDATE csn_ordinary_completion_vars_data SET val = 1 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+writer_fxid_assigned
+--------------------
+t                   
+(1 row)
+
+pg_advisory_lock_shared
+-----------------------
+                       
+(1 row)
+
+step o_capture_commit_before: 
+	UPDATE csn_ordinary_completion_vars_state
+	SET fxid = (
+		SELECT objid::text::xid8
+		FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = 1
+		  AND pid = (
+			SELECT pid
+			FROM csn_ordinary_completion_vars_state
+			WHERE label = 'commit_before'
+		  )
+	)
+	WHERE label = 'commit_before';
+	SELECT fxid IS NOT NULL AS commit_before_fxid_captured
+	FROM csn_ordinary_completion_vars_state
+	WHERE label = 'commit_before';
+
+commit_before_fxid_captured
+---------------------------
+t                          
+(1 row)
+
+step o_save_count: 
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_latest_completed_xid()
+			AS saved_latest_shadow_matches_legacy;
+	SELECT injection_points_xact_completion_count_shadow() =
+		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+
+saved_latest_shadow_matches_legacy
+----------------------------------
+t                                 
+(1 row)
+
+saved_shadow_matches_legacy
+---------------------------
+t                          
+(1 row)
+
+injection_points_save_int8
+--------------------------
+                          
+(1 row)
+
+injection_points_save_xid8
+--------------------------
+                          
+(1 row)
+
+step wcb_commit: COMMIT; <waiting ...>
+step o_commit_before_state: 
+	SELECT injection_points_latest_completed_xid() =
+		injection_points_get_saved_xid8() AS commit_before_latest_stable,
+		injection_points_latest_completed_xid_shadow() =
+		injection_points_latest_completed_xid()
+			AS commit_before_latest_shadow_matches_legacy,
+		injection_points_xact_completion_count() =
+		injection_points_get_saved_int8() AS commit_before_count_unchanged,
+		injection_points_xact_completion_count_shadow() =
+		injection_points_xact_completion_count() AS commit_before_shadow_matches_legacy;
+
+commit_before_latest_stable|commit_before_latest_shadow_matches_legacy|commit_before_count_unchanged|commit_before_shadow_matches_legacy
+---------------------------+------------------------------------------+-----------------------------+-----------------------------------
+t                          |t                                         |t                            |t                                  
+(1 row)
+
+step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
+step wcb_commit: <... completed>
+step wake_before: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_before: SELECT injection_points_detach('ordinary-before-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step wcb_unlock: 
+	SELECT pg_advisory_unlock_shared(
+		1,
+		(SELECT fxid::text::int4
+		 FROM csn_ordinary_completion_vars_state
+		 WHERE label = 'commit_before')
+	);
+
+pg_advisory_unlock_shared
+-------------------------
+t                        
+(1 row)
+
+
+starting permutation: reset wca_seed wca_prepare o_capture_commit_after o_save_count wca_commit o_commit_after_state wake_after detach_after wca_unlock
+step reset: 
+	TRUNCATE csn_ordinary_completion_vars_state;
+	UPDATE csn_ordinary_completion_vars_data SET val = 0 WHERE id = 1;
+
+step wca_seed: 
+	INSERT INTO csn_ordinary_completion_vars_state(label, pid, fxid)
+	VALUES (
+		'commit_after',
+		pg_backend_pid(),
+		NULL
+	);
+
+step wca_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT pg_current_xact_id() IS NOT NULL AS writer_fxid_assigned;
+	SELECT pg_advisory_lock_shared(1, pg_current_xact_id()::text::int4);
+	UPDATE csn_ordinary_completion_vars_data SET val = 2 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+writer_fxid_assigned
+--------------------
+t                   
+(1 row)
+
+pg_advisory_lock_shared
+-----------------------
+                       
+(1 row)
+
+step o_capture_commit_after: 
+	UPDATE csn_ordinary_completion_vars_state
+	SET fxid = (
+		SELECT objid::text::xid8
+		FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = 1
+		  AND pid = (
+			SELECT pid
+			FROM csn_ordinary_completion_vars_state
+			WHERE label = 'commit_after'
+		  )
+	)
+	WHERE label = 'commit_after';
+	SELECT fxid IS NOT NULL AS commit_after_fxid_captured
+	FROM csn_ordinary_completion_vars_state
+	WHERE label = 'commit_after';
+
+commit_after_fxid_captured
+--------------------------
+t                         
+(1 row)
+
+step o_save_count: 
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_latest_completed_xid()
+			AS saved_latest_shadow_matches_legacy;
+	SELECT injection_points_xact_completion_count_shadow() =
+		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+
+saved_latest_shadow_matches_legacy
+----------------------------------
+t                                 
+(1 row)
+
+saved_shadow_matches_legacy
+---------------------------
+t                          
+(1 row)
+
+injection_points_save_int8
+--------------------------
+                          
+(1 row)
+
+injection_points_save_xid8
+--------------------------
+                          
+(1 row)
+
+step wca_commit: COMMIT; <waiting ...>
+step o_commit_after_state: 
+	SELECT injection_points_latest_completed_xid() =
+		injection_points_get_saved_xid8() AS commit_after_latest_stable,
+		injection_points_latest_completed_xid_shadow() =
+		injection_points_latest_completed_xid()
+			AS commit_after_latest_shadow_matches_legacy,
+		injection_points_xact_completion_count() =
+		injection_points_get_saved_int8() + 1 AS commit_after_count_advanced,
+		injection_points_xact_completion_count_shadow() =
+		injection_points_xact_completion_count() AS commit_after_shadow_matches_legacy;
+
+commit_after_latest_stable|commit_after_latest_shadow_matches_legacy|commit_after_count_advanced|commit_after_shadow_matches_legacy
+--------------------------+-----------------------------------------+---------------------------+----------------------------------
+t                         |t                                        |t                          |t                                 
+(1 row)
+
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step wca_commit: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step wca_unlock: 
+	SELECT pg_advisory_unlock_shared(
+		1,
+		(SELECT fxid::text::int4
+		 FROM csn_ordinary_completion_vars_state
+		 WHERE label = 'commit_after')
+	);
+
+pg_advisory_unlock_shared
+-------------------------
+t                        
+(1 row)
+
+
+starting permutation: reset wab_seed wab_prepare o_capture_abort_before o_save_count wab_abort o_abort_before_state wake_before detach_before wab_unlock
+step reset: 
+	TRUNCATE csn_ordinary_completion_vars_state;
+	UPDATE csn_ordinary_completion_vars_data SET val = 0 WHERE id = 1;
+
+step wab_seed: 
+	INSERT INTO csn_ordinary_completion_vars_state(label, pid, fxid)
+	VALUES (
+		'abort_before',
+		pg_backend_pid(),
+		NULL
+	);
+
+step wab_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-primary', 'wait');
+	SELECT pg_current_xact_id() IS NOT NULL AS writer_fxid_assigned;
+	SELECT pg_advisory_lock_shared(1, pg_current_xact_id()::text::int4);
+	UPDATE csn_ordinary_completion_vars_data SET val = 3 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+writer_fxid_assigned
+--------------------
+t                   
+(1 row)
+
+pg_advisory_lock_shared
+-----------------------
+                       
+(1 row)
+
+step o_capture_abort_before: 
+	UPDATE csn_ordinary_completion_vars_state
+	SET fxid = (
+		SELECT objid::text::xid8
+		FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = 1
+		  AND pid = (
+			SELECT pid
+			FROM csn_ordinary_completion_vars_state
+			WHERE label = 'abort_before'
+		  )
+	)
+	WHERE label = 'abort_before';
+	SELECT fxid IS NOT NULL AS abort_before_fxid_captured
+	FROM csn_ordinary_completion_vars_state
+	WHERE label = 'abort_before';
+
+abort_before_fxid_captured
+--------------------------
+t                         
+(1 row)
+
+step o_save_count: 
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_latest_completed_xid()
+			AS saved_latest_shadow_matches_legacy;
+	SELECT injection_points_xact_completion_count_shadow() =
+		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+
+saved_latest_shadow_matches_legacy
+----------------------------------
+t                                 
+(1 row)
+
+saved_shadow_matches_legacy
+---------------------------
+t                          
+(1 row)
+
+injection_points_save_int8
+--------------------------
+                          
+(1 row)
+
+injection_points_save_xid8
+--------------------------
+                          
+(1 row)
+
+step wab_abort: ABORT; <waiting ...>
+step o_abort_before_state: 
+	SELECT injection_points_latest_completed_xid() =
+		injection_points_get_saved_xid8() AS abort_before_latest_stable,
+		injection_points_latest_completed_xid_shadow() =
+		injection_points_latest_completed_xid()
+			AS abort_before_latest_shadow_matches_legacy,
+		injection_points_xact_completion_count() =
+		injection_points_get_saved_int8() AS abort_before_count_unchanged,
+		injection_points_xact_completion_count_shadow() =
+		injection_points_xact_completion_count() AS abort_before_shadow_matches_legacy;
+
+abort_before_latest_stable|abort_before_latest_shadow_matches_legacy|abort_before_count_unchanged|abort_before_shadow_matches_legacy
+--------------------------+-----------------------------------------+----------------------------+----------------------------------
+t                         |t                                        |t                           |t                                 
+(1 row)
+
+step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
+step wab_abort: <... completed>
+step wake_before: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_before: SELECT injection_points_detach('ordinary-before-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step wab_unlock: 
+	SELECT pg_advisory_unlock_shared(
+		1,
+		(SELECT fxid::text::int4
+		 FROM csn_ordinary_completion_vars_state
+		 WHERE label = 'abort_before')
+	);
+
+pg_advisory_unlock_shared
+-------------------------
+t                        
+(1 row)
+
+
+starting permutation: reset waa_seed waa_prepare o_capture_abort_after o_save_count waa_abort o_abort_after_state wake_after detach_after waa_unlock
+step reset: 
+	TRUNCATE csn_ordinary_completion_vars_state;
+	UPDATE csn_ordinary_completion_vars_data SET val = 0 WHERE id = 1;
+
+step waa_seed: 
+	INSERT INTO csn_ordinary_completion_vars_state(label, pid, fxid)
+	VALUES (
+		'abort_after',
+		pg_backend_pid(),
+		NULL
+	);
+
+step waa_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT pg_current_xact_id() IS NOT NULL AS writer_fxid_assigned;
+	SELECT pg_advisory_lock_shared(1, pg_current_xact_id()::text::int4);
+	UPDATE csn_ordinary_completion_vars_data SET val = 4 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+writer_fxid_assigned
+--------------------
+t                   
+(1 row)
+
+pg_advisory_lock_shared
+-----------------------
+                       
+(1 row)
+
+step o_capture_abort_after: 
+	UPDATE csn_ordinary_completion_vars_state
+	SET fxid = (
+		SELECT objid::text::xid8
+		FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = 1
+		  AND pid = (
+			SELECT pid
+			FROM csn_ordinary_completion_vars_state
+			WHERE label = 'abort_after'
+		  )
+	)
+	WHERE label = 'abort_after';
+	SELECT fxid IS NOT NULL AS abort_after_fxid_captured
+	FROM csn_ordinary_completion_vars_state
+	WHERE label = 'abort_after';
+
+abort_after_fxid_captured
+-------------------------
+t                        
+(1 row)
+
+step o_save_count: 
+	SELECT injection_points_latest_completed_xid_shadow() =
+		injection_points_latest_completed_xid()
+			AS saved_latest_shadow_matches_legacy;
+	SELECT injection_points_xact_completion_count_shadow() =
+		injection_points_xact_completion_count() AS saved_shadow_matches_legacy;
+	SELECT injection_points_save_int8(injection_points_xact_completion_count());
+	SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+
+saved_latest_shadow_matches_legacy
+----------------------------------
+t                                 
+(1 row)
+
+saved_shadow_matches_legacy
+---------------------------
+t                          
+(1 row)
+
+injection_points_save_int8
+--------------------------
+                          
+(1 row)
+
+injection_points_save_xid8
+--------------------------
+                          
+(1 row)
+
+step waa_abort: ABORT; <waiting ...>
+step o_abort_after_state: 
+	SELECT injection_points_latest_completed_xid() =
+		injection_points_get_saved_xid8() AS abort_after_latest_stable,
+		injection_points_latest_completed_xid_shadow() =
+		injection_points_latest_completed_xid()
+			AS abort_after_latest_shadow_matches_legacy,
+		injection_points_xact_completion_count() =
+		injection_points_get_saved_int8() + 1 AS abort_after_count_advanced,
+		injection_points_xact_completion_count_shadow() =
+		injection_points_xact_completion_count() AS abort_after_shadow_matches_legacy;
+
+abort_after_latest_stable|abort_after_latest_shadow_matches_legacy|abort_after_count_advanced|abort_after_shadow_matches_legacy
+-------------------------+----------------------------------------+--------------------------+---------------------------------
+t                        |t                                       |t                         |t                                
+(1 row)
+
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step waa_abort: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step waa_unlock: 
+	SELECT pg_advisory_unlock_shared(
+		1,
+		(SELECT fxid::text::int4
+		 FROM csn_ordinary_completion_vars_state
+		 WHERE label = 'abort_after')
+	);
+
+pg_advisory_unlock_shared
+-------------------------
+t                        
+(1 row)
+

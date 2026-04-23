@@ -1,5 +1,10 @@
 CREATE EXTENSION injection_points;
 
+SELECT injection_points_latest_completed_xid_shadow() =
+       injection_points_latest_completed_xid();
+SELECT injection_points_xact_completion_count_shadow() =
+       injection_points_xact_completion_count();
+
 \getenv libdir PG_LIBDIR
 \getenv dlsuffix PG_DLSUFFIX
 \set regresslib :libdir '/regress' :dlsuffix
@@ -51,6 +56,46 @@ SELECT injection_points_detach('TestInjectionLog'); -- fails
 
 SELECT injection_points_run('TestInjectionLog2'); -- notice
 SELECT injection_points_detach('TestInjectionLog2');
+
+-- Count action
+SELECT injection_points_attach('TestInjectionCount', 'count');
+SELECT injection_points_get_count('TestInjectionCount');
+SELECT injection_points_run('TestInjectionCount');
+SELECT injection_points_get_count('TestInjectionCount');
+SELECT injection_points_run('TestInjectionCount', 'ignored');
+SELECT injection_points_get_count('TestInjectionCount');
+SELECT injection_points_reset_count('TestInjectionCount');
+SELECT injection_points_get_count('TestInjectionCount');
+SELECT injection_points_detach('TestInjectionCount');
+
+-- Shared int8 coordination
+SELECT injection_points_get_global_int8('TestGlobalInt8') IS NULL;
+SELECT injection_points_set_global_int8('TestGlobalInt8', 42);
+SELECT injection_points_get_global_int8('TestGlobalInt8');
+
+BEGIN;
+SELECT pg_current_xact_id();
+SELECT injection_points_backend_xid(pg_backend_pid()) IS NOT NULL;
+SELECT injection_points_backend_slot_epoch(pg_backend_pid()) > 0;
+SELECT injection_points_xid_in_progress(pg_current_xact_id());
+SELECT injection_points_oldest_active_xid(false, false) IS NOT NULL;
+SELECT injection_points_csn_oldest_active_xid() IS NOT NULL;
+SELECT injection_points_oldest_considered_running_xid() IS NOT NULL;
+SELECT injection_points_oldest_nonremovable_xid() IS NOT NULL;
+SELECT injection_points_latest_completed_xid() IS NOT NULL;
+SELECT injection_points_latest_completed_xid_shadow() =
+       injection_points_latest_completed_xid();
+SELECT injection_points_xact_completion_count() > 0;
+SELECT injection_points_xact_completion_count_shadow() > 0;
+SELECT injection_points_transaction_snapshot_xact_completion_count() > 0;
+SELECT injection_points_save_int8(injection_points_xact_completion_count());
+SELECT injection_points_get_saved_int8() > 0;
+SELECT injection_points_save_xid8(injection_points_latest_completed_xid());
+SELECT injection_points_get_saved_xid8() IS NOT NULL;
+SELECT injection_points_running_xacts_include_backend(pg_backend_pid(), true);
+SELECT injection_points_running_xacts_latest_completed_xid(true) =
+       injection_points_latest_completed_xid_shadow();
+ROLLBACK;
 
 -- Loading
 SELECT injection_points_cached('TestInjectionLogLoad'); -- nothing in cache

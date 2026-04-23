@@ -1,0 +1,217 @@
+Parsed test spec with 4 sessions
+
+starting permutation: reset wb_begin w_update w_commit r_before wake_before detach_before
+step reset: 
+	UPDATE csn_snapshot_completion_count_shadow SET val = 0 WHERE id = 1;
+
+step wb_begin: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-primary', 'wait');
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step w_update: UPDATE csn_snapshot_completion_count_shadow SET val = val + 1 WHERE id = 1;
+step w_commit: COMMIT; <waiting ...>
+step r_before: 
+	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
+		injection_points_active_snapshot_xact_completion_count()
+			AS snap_xact_completion_count,
+		injection_points_transaction_snapshot_xact_completion_count()
+			AS txsnap_xact_completion_count,
+		injection_points_xact_completion_count_shadow()
+			AS shadow_xact_completion_count,
+		injection_points_xact_completion_count()
+			AS legacy_xact_completion_count
+	FROM csn_snapshot_completion_count_shadow
+	WHERE id = 1;
+
+uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
+--------+--------------------------+----------------------------+----------------------------+----------------------------
+t       |                         0|                          20|                          20|                          20
+(1 row)
+
+step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
+step w_commit: <... completed>
+step wake_before: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_before: SELECT injection_points_detach('ordinary-before-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: reset wa_begin w_update w_commit r_after wake_after detach_after
+step reset: 
+	UPDATE csn_snapshot_completion_count_shadow SET val = 0 WHERE id = 1;
+
+step wa_begin: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step w_update: UPDATE csn_snapshot_completion_count_shadow SET val = val + 1 WHERE id = 1;
+step w_commit: COMMIT; <waiting ...>
+step r_after: 
+	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
+		injection_points_active_snapshot_xact_completion_count()
+			AS snap_xact_completion_count,
+		injection_points_transaction_snapshot_xact_completion_count()
+			AS txsnap_xact_completion_count,
+		injection_points_xact_completion_count_shadow()
+			AS shadow_xact_completion_count,
+		injection_points_xact_completion_count()
+			AS legacy_xact_completion_count
+	FROM csn_snapshot_completion_count_shadow
+	WHERE id = 1;
+
+uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
+--------+--------------------------+----------------------------+----------------------------+----------------------------
+t       |                         0|                          25|                          25|                          25
+(1 row)
+
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step w_commit: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: reset wb_begin w_update_abort w_abort r_before wake_before detach_before
+step reset: 
+	UPDATE csn_snapshot_completion_count_shadow SET val = 0 WHERE id = 1;
+
+step wb_begin: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-primary', 'wait');
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step w_update_abort: UPDATE csn_snapshot_completion_count_shadow SET val = val + 2 WHERE id = 1;
+step w_abort: ABORT; <waiting ...>
+step r_before: 
+	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
+		injection_points_active_snapshot_xact_completion_count()
+			AS snap_xact_completion_count,
+		injection_points_transaction_snapshot_xact_completion_count()
+			AS txsnap_xact_completion_count,
+		injection_points_xact_completion_count_shadow()
+			AS shadow_xact_completion_count,
+		injection_points_xact_completion_count()
+			AS legacy_xact_completion_count
+	FROM csn_snapshot_completion_count_shadow
+	WHERE id = 1;
+
+uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
+--------+--------------------------+----------------------------+----------------------------+----------------------------
+t       |                         0|                          28|                          28|                          28
+(1 row)
+
+step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
+step w_abort: <... completed>
+step wake_before: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_before: SELECT injection_points_detach('ordinary-before-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: reset wa_begin w_update_abort w_abort r_after wake_after detach_after
+step reset: 
+	UPDATE csn_snapshot_completion_count_shadow SET val = 0 WHERE id = 1;
+
+step wa_begin: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step w_update_abort: UPDATE csn_snapshot_completion_count_shadow SET val = val + 2 WHERE id = 1;
+step w_abort: ABORT; <waiting ...>
+step r_after: 
+	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
+		injection_points_active_snapshot_xact_completion_count()
+			AS snap_xact_completion_count,
+		injection_points_transaction_snapshot_xact_completion_count()
+			AS txsnap_xact_completion_count,
+		injection_points_xact_completion_count_shadow()
+			AS shadow_xact_completion_count,
+		injection_points_xact_completion_count()
+			AS legacy_xact_completion_count
+	FROM csn_snapshot_completion_count_shadow
+	WHERE id = 1;
+
+uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
+--------+--------------------------+----------------------------+----------------------------+----------------------------
+t       |                         0|                          33|                          33|                          33
+(1 row)
+
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step w_abort: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

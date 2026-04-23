@@ -111,6 +111,35 @@ static void ProcArrayShmemAttach(void *arg);
 
 static ProcArrayStruct *procArray;
 
+/*
+ * Separate passive shadow for latestCompletedXid.  H1-D keeps the legacy field
+ * authoritative and uses this state only for bounded proof slices until a
+ * reader handoff is proven safe.
+ */
+typedef struct ProcArrayLatestCompletedShadowState
+{
+	pg_atomic_uint64 latestCompletedXid;
+} ProcArrayLatestCompletedShadowState;
+
+static ProcArrayLatestCompletedShadowState *procArrayLatestCompletedShadow;
+
+/*
+ * Passive per-slot epoch scaffold for H1-E. The live tree still uses the
+ * legacy writer path, but every new ordinary top-level transaction already
+ * advances a slot-scoped monotonically increasing epoch that can later be
+ * paired with authoritative lock-free observations.
+ */
+typedef struct ProcArraySlotEpochState
+{
+	int			nslots;
+	pg_atomic_uint64 epochs[FLEXIBLE_ARRAY_MEMBER];
+} ProcArraySlotEpochState;
+
+static ProcArraySlotEpochState *procArraySlotEpochState;
+
+#define PROCARRAY_MAXPROCS	(MaxBackends + max_prepared_xacts)
+#define PROCARRAY_ALLPROCS	(PROCARRAY_MAXPROCS + NUM_AUXILIARY_PROCS)
+
 const struct ShmemCallbacks ProcArrayShmemCallbacks = {
 	.request_fn = ProcArrayShmemRequest,
 	.init_fn = ProcArrayShmemInit,
@@ -396,8 +425,6 @@ static void GlobalVisUpdateApply(ComputeXidHorizonsResult *horizons);
 static void
 ProcArrayShmemRequest(void *arg)
 {
-#define PROCARRAY_MAXPROCS	(MaxBackends + max_prepared_xacts)
-
 	/*
 	 * During Hot Standby processing we have a data structure called
 	 * KnownAssignedXids, created in shared memory. Local data structures are
@@ -433,6 +460,15 @@ ProcArrayShmemRequest(void *arg)
 										mul_size(sizeof(int), PROCARRAY_MAXPROCS)),
 					   .ptr = (void **) &procArray,
 		);
+	ShmemRequestStruct(.name = "ProcArray LatestCompletedXid Shadow",
+					   .size = sizeof(ProcArrayLatestCompletedShadowState),
+					   .ptr = (void **) &procArrayLatestCompletedShadow,
+		);
+	ShmemRequestStruct(.name = "ProcArray Slot Epoch State",
+					   .size = add_size(offsetof(ProcArraySlotEpochState, epochs),
+										mul_size(sizeof(pg_atomic_uint64), PROCARRAY_ALLPROCS)),
+					   .ptr = (void **) &procArraySlotEpochState,
+		);
 }
 
 /*
@@ -450,7 +486,13 @@ ProcArrayShmemInit(void *arg)
 	procArray->lastOverflowedXid = InvalidTransactionId;
 	procArray->replication_slot_xmin = InvalidTransactionId;
 	procArray->replication_slot_catalog_xmin = InvalidTransactionId;
+	pg_atomic_init_u64(&procArrayLatestCompletedShadow->latestCompletedXid,
+					   U64FromFullTransactionId(InvalidFullTransactionId));
+	procArraySlotEpochState->nslots = PROCARRAY_ALLPROCS;
+	for (int procno = 0; procno < PROCARRAY_ALLPROCS; procno++)
+		pg_atomic_init_u64(&procArraySlotEpochState->epochs[procno], 0);
 	TransamVariables->xactCompletionCount = 1;
+	TransamInitXactCompletionCountShadow(1);
 
 	allProcs = ProcGlobal->allProcs;
 }
@@ -591,7 +633,8 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 		MaintainLatestCompletedXid(latestXid);
 
 		/* Same with xactCompletionCount  */
-		TransamVariables->xactCompletionCount++;
+		INJECTION_POINT("xact-completion-advance-procarray-remove", NULL);
+		TransamAdvanceXactCompletionCount();
 
 		ProcGlobal->xids[myoff] = InvalidTransactionId;
 		ProcGlobal->subxidStates[myoff].overflowed = false;
@@ -758,6 +801,9 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 void
 ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
 {
+	/* Test-only hook for the H1-B ordinary legacy exit witness. */
+	INJECTION_POINT("ordinary-before-procarray-primary", NULL);
+
 	if (TransactionIdIsValid(latestXid))
 	{
 		int			pgxactoff = proc->pgxactoff;
@@ -765,6 +811,10 @@ ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
 
 		Assert(TransactionIdIsValid(proc->xid));
 
+		/* Test-only hook for the H1-B ordinary ProcArrayLock witness. */
+		INJECTION_POINT("ordinary-before-procarray-lock", NULL);
+		/* Test-only hook for the H1-B lock-contention baseline. */
+		INJECTION_POINT("ordinary-before-procarray-lock-wait", NULL);
 		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
 		recomputeCsnOldestActiveXid =
@@ -800,7 +850,8 @@ ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
 		}
 
 		MaintainLatestCompletedXid(latestXid);
-		TransamVariables->xactCompletionCount++;
+		INJECTION_POINT("xact-completion-advance-ordinary-primary", NULL);
+		TransamAdvanceXactCompletionCount();
 
 		if (recomputeCsnOldestActiveXid)
 			RecomputeCSNOldestActiveXid();
@@ -822,6 +873,10 @@ ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
 
 		if (needProcArrayLock)
 		{
+			/* Test-only hook for the H1-B ordinary ProcArrayLock witness. */
+			INJECTION_POINT("ordinary-before-procarray-lock", NULL);
+			/* Test-only hook for the H1-B lock-contention baseline. */
+			INJECTION_POINT("ordinary-before-procarray-lock-wait", NULL);
 			LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
 			recomputeCsnOldestActiveXid =
@@ -896,7 +951,8 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 	MaintainLatestCompletedXid(latestXid);
 
 	/* Same with xactCompletionCount  */
-	TransamVariables->xactCompletionCount++;
+	INJECTION_POINT("xact-completion-advance-internal", NULL);
+	TransamAdvanceXactCompletionCount();
 }
 
 /*
@@ -1074,7 +1130,8 @@ ProcArrayClearTransaction(PGPROC *proc)
 	 * otherwise could end up reusing the snapshot later. Which would be bad,
 	 * because it might not count the prepared transaction as running.
 	 */
-	TransamVariables->xactCompletionCount++;
+	INJECTION_POINT("xact-completion-advance-clear-transaction", NULL);
+	TransamAdvanceXactCompletionCount();
 	RecomputeCSNOldestActiveXid();
 
 	/* Clear the subtransaction-XID cache too */
@@ -1109,6 +1166,7 @@ MaintainLatestCompletedXid(TransactionId latestXid)
 		TransamVariables->latestCompletedXid =
 			FullXidRelativeTo(cur_latest, latestXid);
 	}
+	ProcArrayWriteLatestCompletedXidShadow(TransamVariables->latestCompletedXid);
 
 	Assert(IsBootstrapProcessingMode() ||
 		   FullTransactionIdIsNormal(TransamVariables->latestCompletedXid));
@@ -1140,8 +1198,48 @@ MaintainLatestCompletedXidRecovery(TransactionId latestXid)
 		TransamVariables->latestCompletedXid =
 			FullXidRelativeTo(rel, latestXid);
 	}
+	ProcArrayWriteLatestCompletedXidShadow(TransamVariables->latestCompletedXid);
 
 	Assert(FullTransactionIdIsNormal(TransamVariables->latestCompletedXid));
+}
+
+FullTransactionId
+ProcArrayReadLatestCompletedXidShadow(void)
+{
+	Assert(procArrayLatestCompletedShadow != NULL);
+
+	return FullTransactionIdFromU64(pg_atomic_read_u64(&procArrayLatestCompletedShadow->latestCompletedXid));
+}
+
+void
+ProcArrayWriteLatestCompletedXidShadow(FullTransactionId latestCompletedXid)
+{
+	Assert(procArrayLatestCompletedShadow != NULL);
+
+	pg_atomic_write_u64(&procArrayLatestCompletedShadow->latestCompletedXid,
+						U64FromFullTransactionId(latestCompletedXid));
+}
+
+uint64
+ProcArrayReadSlotEpoch(ProcNumber procNumber)
+{
+	if (procNumber < 0 || procNumber >= PROCARRAY_ALLPROCS)
+		return 0;
+
+	Assert(procArraySlotEpochState != NULL);
+
+	return pg_atomic_read_u64(&procArraySlotEpochState->epochs[procNumber]);
+}
+
+uint64
+ProcArrayAdvanceSlotEpoch(ProcNumber procNumber)
+{
+	if (procNumber < 0 || procNumber >= PROCARRAY_ALLPROCS)
+		return 0;
+
+	Assert(procArraySlotEpochState != NULL);
+
+	return pg_atomic_add_fetch_u64(&procArraySlotEpochState->epochs[procNumber], 1);
 }
 
 /*
@@ -1160,7 +1258,8 @@ RecomputeCSNOldestActiveXid(void)
 
 	Assert(LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE));
 
-	oldestActiveXid = XidFromFullTransactionId(TransamVariables->latestCompletedXid);
+	oldestActiveXid =
+		XidFromFullTransactionId(ProcArrayReadLatestCompletedXidShadow());
 	Assert(TransactionIdIsNormal(oldestActiveXid));
 	TransactionIdAdvance(oldestActiveXid);
 
@@ -1770,7 +1869,7 @@ TransactionIdIsInProgressLegacy(TransactionId xid)
 	 * target Xid is after that, it's surely still running.
 	 */
 	latestCompletedXid =
-		XidFromFullTransactionId(TransamVariables->latestCompletedXid);
+		XidFromFullTransactionId(ProcArrayReadLatestCompletedXidShadow());
 	if (TransactionIdPrecedes(latestCompletedXid, xid))
 	{
 		LWLockRelease(ProcArrayLock);
@@ -2063,7 +2162,7 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
-	h->latest_completed = TransamVariables->latestCompletedXid;
+	h->latest_completed = ProcArrayReadLatestCompletedXidShadow();
 
 	/*
 	 * We initialize the MIN() calculation with latestCompletedXid + 1. This
@@ -2448,8 +2547,10 @@ GetSnapshotDataReuse(Snapshot snapshot)
 
 	/*
 	 * xactCompletionCount remains part of the snapshot contract, but Phase D
-	 * intentionally rebuilds CSN snapshots until a stronger reuse contract
-	 * exists for snapshot_csn.
+	 * now reads it through the passive shadow so the reuse check does not
+	 * depend on unlocked direct loads of the lock-owned legacy field.
+	 * CSN snapshots are still rebuilt until a stronger reuse contract exists
+	 * for snapshot_csn.
 	 */
 	if (SnapshotUsesCSN(snapshot))
 		return false;
@@ -2457,7 +2558,7 @@ GetSnapshotDataReuse(Snapshot snapshot)
 	if (unlikely(snapshot->snapXactCompletionCount == 0))
 		return false;
 
-	curXactCompletionCount = TransamVariables->xactCompletionCount;
+	curXactCompletionCount = TransamReadXactCompletionCountShadow();
 	if (curXactCompletionCount != snapshot->snapXactCompletionCount)
 		return false;
 
@@ -2483,6 +2584,7 @@ GetSnapshotDataReuse(Snapshot snapshot)
 	 */
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = snapshot->xmin;
+	INJECTION_POINT("snapshot-after-install-xmin", NULL);
 
 	RecentXmin = snapshot->xmin;
 	Assert(TransactionIdPrecedesOrEquals(TransactionXmin, RecentXmin));
@@ -2491,6 +2593,7 @@ GetSnapshotDataReuse(Snapshot snapshot)
 	snapshot->active_count = 0;
 	snapshot->regd_count = 0;
 	snapshot->copied = false;
+	INJECTION_POINT("snapshot-reuse-success", NULL);
 
 	return true;
 }
@@ -2614,13 +2717,18 @@ GetSnapshotData(Snapshot snapshot)
 		snapshotCsnCandidate = TransamVariables->nextCommitSeqNo;
 	}
 
-	latest_completed = TransamVariables->latestCompletedXid;
+	/*
+	 * H1-D keeps the legacy field authoritative, but snapshot xmax now reads
+	 * the separate passive latestCompletedXid shadow so this reader no longer
+	 * depends on the embedded transam field directly.
+	 */
+	latest_completed = ProcArrayReadLatestCompletedXidShadow();
 	mypgxactoff = MyProc->pgxactoff;
 	myxid = other_xids[mypgxactoff];
 	Assert(myxid == MyProc->xid);
 
 	oldestxid = TransamVariables->oldestXid;
-	curXactCompletionCount = TransamVariables->xactCompletionCount;
+	curXactCompletionCount = TransamReadXactCompletionCountShadow();
 
 	/* xmax is always latestCompletedXid + 1 */
 	xmax = XidFromFullTransactionId(latest_completed);
@@ -2815,6 +2923,7 @@ GetSnapshotData(Snapshot snapshot)
 
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = xmin;
+	INJECTION_POINT("snapshot-after-install-xmin", NULL);
 
 	if (snapshotCsnLocked)
 		LWLockRelease(XidGenLock);
@@ -3157,7 +3266,7 @@ GetRunningTransactionData(Oid dbid)
 	LWLockAcquire(XidGenLock, LW_SHARED);
 
 	latestCompletedXid =
-		XidFromFullTransactionId(TransamVariables->latestCompletedXid);
+		XidFromFullTransactionId(ProcArrayReadLatestCompletedXidShadow());
 	oldestDatabaseRunningXid = oldestRunningXid =
 		XidFromFullTransactionId(TransamVariables->nextXid);
 
@@ -4561,7 +4670,8 @@ XidCacheRemoveRunningXids(TransactionId xid,
 	MaintainLatestCompletedXid(latestXid);
 
 	/* ... and xactCompletionCount */
-	TransamVariables->xactCompletionCount++;
+	INJECTION_POINT("xact-completion-advance-cache-remove", NULL);
+	TransamAdvanceXactCompletionCount();
 
 	LWLockRelease(ProcArrayLock);
 }
@@ -5014,7 +5124,8 @@ ExpireTreeKnownAssignedTransactionIds(TransactionId xid, int nsubxids,
 	MaintainLatestCompletedXidRecovery(max_xid);
 
 	/* ... and xactCompletionCount */
-	TransamVariables->xactCompletionCount++;
+	INJECTION_POINT("xact-completion-advance-expire-tree", NULL);
+	TransamAdvanceXactCompletionCount();
 
 	LWLockRelease(ProcArrayLock);
 }
@@ -5036,12 +5147,14 @@ ExpireAllKnownAssignedTransactionIds(void)
 	latestXid = TransamVariables->nextXid;
 	FullTransactionIdRetreat(&latestXid);
 	TransamVariables->latestCompletedXid = latestXid;
+	ProcArrayWriteLatestCompletedXidShadow(latestXid);
 
 	/*
 	 * Any transactions that were in-progress were effectively aborted, so
 	 * advance xactCompletionCount.
 	 */
-	TransamVariables->xactCompletionCount++;
+	INJECTION_POINT("xact-completion-advance-expire-all", NULL);
+	TransamAdvanceXactCompletionCount();
 
 	/*
 	 * Reset lastOverflowedXid.  Currently, lastOverflowedXid has no use after
@@ -5070,7 +5183,8 @@ ExpireOldKnownAssignedTransactionIds(TransactionId xid)
 	MaintainLatestCompletedXidRecovery(latestXid);
 
 	/* ... and xactCompletionCount */
-	TransamVariables->xactCompletionCount++;
+	INJECTION_POINT("xact-completion-advance-expire-old", NULL);
+	TransamAdvanceXactCompletionCount();
 
 	/*
 	 * Reset lastOverflowedXid if we know all transactions that have been

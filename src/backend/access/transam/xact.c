@@ -2249,7 +2249,10 @@ StartTransaction(void)
 	 * already.
 	 */
 	Assert(MyProc->vxid.procNumber == vxid.procNumber);
+	ProcArrayAdvanceSlotEpoch(vxid.procNumber);
 	MyProc->vxid.lxid = vxid.localTransactionId;
+	/* Test-only hook for H1-B new-transaction vxid publication baseline. */
+	INJECTION_POINT("start-after-vxid-publication", NULL);
 
 	TRACE_POSTGRESQL_TRANSACTION_START(vxid.localTransactionId);
 
@@ -2464,8 +2467,12 @@ CommitTransaction(void)
 	 * RecordTransactionCommit.
 	 */
 	ProcArrayEndTransactionPrimary(MyProc, latestXid);
+	/* Test-only hook for the H1-B completion-visible but not reusable window. */
+	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
 	MyProc->vxid.lxid = InvalidLocalTransactionId;
 	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
+	/* Test-only hook for the H1-B post-vxid-clear, pre-reuse window. */
+	INJECTION_POINT("ordinary-after-vxid-clear", NULL);
 
 	/*
 	 * This is all post-commit cleanup.  Note that if an error is raised here,
@@ -3037,8 +3044,12 @@ AbortTransaction(void)
 	 * RecordTransactionAbort.
 	 */
 	ProcArrayEndTransactionPrimary(MyProc, latestXid);
+	/* Test-only hook for the H1-B completion-visible but not reusable window. */
+	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
 	MyProc->vxid.lxid = InvalidLocalTransactionId;
 	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
+	/* Test-only hook for the H1-B post-vxid-clear, pre-reuse window. */
+	INJECTION_POINT("ordinary-after-vxid-clear", NULL);
 
 	/*
 	 * Post-abort cleanup.  See notes in CommitTransaction() concerning
