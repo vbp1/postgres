@@ -169,6 +169,14 @@ typedef struct PortalData
 	Snapshot	portalSnapshot; /* active snapshot, or NULL if none */
 
 	/*
+	 * Optional execution snapshot seed provided by the caller before portal
+	 * execution starts. This lets all portal strategies share the same
+	 * execution snapshot choice instead of taking separate snapshots later in
+	 * strategy-specific code paths.
+	 */
+	Snapshot	execSnapshot;	/* registered execution seed, or NULL */
+
+	/*
 	 * Where we store tuples for a held cursor or a PORTAL_ONE_RETURNING,
 	 * PORTAL_ONE_MOD_WITH, or PORTAL_UTIL_SELECT query.  (A cursor held past
 	 * the end of its transaction no longer has any active executor state.)

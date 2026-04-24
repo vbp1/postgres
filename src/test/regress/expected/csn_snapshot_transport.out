@@ -29,6 +29,16 @@ BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 SET TRANSACTION SNAPSHOT 'DEADBEEF-CAFEBABE-1';
 ERROR:  cannot import a CSN-sensitive snapshot
 ROLLBACK;
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT pg_current_snapshot_uses_csn() AS uses_csn;
+ uses_csn 
+----------
+ t
+(1 row)
+
+SELECT pg_export_snapshot();
+ERROR:  cannot export a CSN-sensitive snapshot
+ROLLBACK;
 CREATE TABLE csn_snapshot_transport AS
 SELECT i AS id
 FROM generate_series(1, 100000) AS g(i);

@@ -109,7 +109,7 @@ t
 (1 row)
 
 
-starting permutation: reset wa_seed wa_prepare o_after_capture wa_commit o_after_not_visible wake_after detach_after wa_unlock
+starting permutation: reset wa_seed wa_prepare o_after_capture wa_commit o_after_visible wake_after detach_after wa_unlock
 step reset: 
 	TRUNCATE csn_ordinary_horizons_state;
 	UPDATE csn_ordinary_horizons_data SET val = 0 WHERE id = 1;
@@ -170,24 +170,24 @@ t
 (1 row)
 
 step wa_commit: COMMIT; <waiting ...>
-step o_after_not_visible: 
-	SELECT injection_points_oldest_considered_running_xid() <>
+step o_after_visible: 
+	SELECT injection_points_oldest_considered_running_xid() =
 		(SELECT fxid
 		 FROM csn_ordinary_horizons_state
-		 WHERE label = 'after') AS after_not_seen_by_oldest_considered_running;
-	SELECT injection_points_oldest_nonremovable_xid() <>
+		 WHERE label = 'after') AS after_seen_by_oldest_considered_running;
+	SELECT injection_points_oldest_nonremovable_xid() =
 		(SELECT fxid
 		 FROM csn_ordinary_horizons_state
-		 WHERE label = 'after') AS after_not_seen_by_oldest_nonremovable;
+		 WHERE label = 'after') AS after_seen_by_oldest_nonremovable;
 
-after_not_seen_by_oldest_considered_running
--------------------------------------------
-t                                          
+after_seen_by_oldest_considered_running
+---------------------------------------
+t                                      
 (1 row)
 
-after_not_seen_by_oldest_nonremovable
--------------------------------------
-t                                    
+after_seen_by_oldest_nonremovable
+---------------------------------
+t                                
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>

@@ -22,21 +22,26 @@ injection_points_attach
 step w_update: UPDATE csn_snapshot_completion_count_shadow SET val = val + 1 WHERE id = 1;
 step w_commit: COMMIT; <waiting ...>
 step r_before: 
+	WITH counts AS (
+		SELECT injection_points_active_snapshot_xact_completion_count()
+				AS active_snapshot_count,
+			injection_points_transaction_snapshot_xact_completion_count()
+				AS txsnapshot_count,
+			injection_points_xact_completion_count_shadow()
+				AS shadow_count,
+			injection_points_xact_completion_count()
+				AS legacy_count
+	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
-		injection_points_active_snapshot_xact_completion_count()
-			AS snap_xact_completion_count,
-		injection_points_transaction_snapshot_xact_completion_count()
-			AS txsnap_xact_completion_count,
-		injection_points_xact_completion_count_shadow()
-			AS shadow_xact_completion_count,
-		injection_points_xact_completion_count()
-			AS legacy_xact_completion_count
-	FROM csn_snapshot_completion_count_shadow
+		active_snapshot_count = 0 AS active_snapshot_count_is_zero,
+		txsnapshot_count = shadow_count AS txsnapshot_matches_shadow,
+		legacy_count = shadow_count AS legacy_matches_shadow
+	FROM counts, csn_snapshot_completion_count_shadow
 	WHERE id = 1;
 
-uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
---------+--------------------------+----------------------------+----------------------------+----------------------------
-t       |                         0|                          20|                          20|                           1
+uses_csn|active_snapshot_count_is_zero|txsnapshot_matches_shadow|legacy_matches_shadow
+--------+-----------------------------+-------------------------+---------------------
+t       |t                            |t                        |t                    
 (1 row)
 
 step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
@@ -76,21 +81,26 @@ injection_points_attach
 step w_update: UPDATE csn_snapshot_completion_count_shadow SET val = val + 1 WHERE id = 1;
 step w_commit: COMMIT; <waiting ...>
 step r_after: 
+	WITH counts AS (
+		SELECT injection_points_active_snapshot_xact_completion_count()
+				AS active_snapshot_count,
+			injection_points_transaction_snapshot_xact_completion_count()
+				AS txsnapshot_count,
+			injection_points_xact_completion_count_shadow()
+				AS shadow_count,
+			injection_points_xact_completion_count()
+				AS legacy_count
+	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
-		injection_points_active_snapshot_xact_completion_count()
-			AS snap_xact_completion_count,
-		injection_points_transaction_snapshot_xact_completion_count()
-			AS txsnap_xact_completion_count,
-		injection_points_xact_completion_count_shadow()
-			AS shadow_xact_completion_count,
-		injection_points_xact_completion_count()
-			AS legacy_xact_completion_count
-	FROM csn_snapshot_completion_count_shadow
+		active_snapshot_count = 0 AS active_snapshot_count_is_zero,
+		txsnapshot_count = shadow_count AS txsnapshot_matches_shadow,
+		legacy_count = shadow_count AS legacy_matches_shadow
+	FROM counts, csn_snapshot_completion_count_shadow
 	WHERE id = 1;
 
-uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
---------+--------------------------+----------------------------+----------------------------+----------------------------
-t       |                         0|                          25|                          25|                           1
+uses_csn|active_snapshot_count_is_zero|txsnapshot_matches_shadow|legacy_matches_shadow
+--------+-----------------------------+-------------------------+---------------------
+t       |t                            |t                        |t                    
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
@@ -130,21 +140,26 @@ injection_points_attach
 step w_update_abort: UPDATE csn_snapshot_completion_count_shadow SET val = val + 2 WHERE id = 1;
 step w_abort: ABORT; <waiting ...>
 step r_before: 
+	WITH counts AS (
+		SELECT injection_points_active_snapshot_xact_completion_count()
+				AS active_snapshot_count,
+			injection_points_transaction_snapshot_xact_completion_count()
+				AS txsnapshot_count,
+			injection_points_xact_completion_count_shadow()
+				AS shadow_count,
+			injection_points_xact_completion_count()
+				AS legacy_count
+	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
-		injection_points_active_snapshot_xact_completion_count()
-			AS snap_xact_completion_count,
-		injection_points_transaction_snapshot_xact_completion_count()
-			AS txsnap_xact_completion_count,
-		injection_points_xact_completion_count_shadow()
-			AS shadow_xact_completion_count,
-		injection_points_xact_completion_count()
-			AS legacy_xact_completion_count
-	FROM csn_snapshot_completion_count_shadow
+		active_snapshot_count = 0 AS active_snapshot_count_is_zero,
+		txsnapshot_count = shadow_count AS txsnapshot_matches_shadow,
+		legacy_count = shadow_count AS legacy_matches_shadow
+	FROM counts, csn_snapshot_completion_count_shadow
 	WHERE id = 1;
 
-uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
---------+--------------------------+----------------------------+----------------------------+----------------------------
-t       |                         0|                          28|                          28|                           1
+uses_csn|active_snapshot_count_is_zero|txsnapshot_matches_shadow|legacy_matches_shadow
+--------+-----------------------------+-------------------------+---------------------
+t       |t                            |t                        |t                    
 (1 row)
 
 step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
@@ -184,21 +199,26 @@ injection_points_attach
 step w_update_abort: UPDATE csn_snapshot_completion_count_shadow SET val = val + 2 WHERE id = 1;
 step w_abort: ABORT; <waiting ...>
 step r_after: 
+	WITH counts AS (
+		SELECT injection_points_active_snapshot_xact_completion_count()
+				AS active_snapshot_count,
+			injection_points_transaction_snapshot_xact_completion_count()
+				AS txsnapshot_count,
+			injection_points_xact_completion_count_shadow()
+				AS shadow_count,
+			injection_points_xact_completion_count()
+				AS legacy_count
+	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
-		injection_points_active_snapshot_xact_completion_count()
-			AS snap_xact_completion_count,
-		injection_points_transaction_snapshot_xact_completion_count()
-			AS txsnap_xact_completion_count,
-		injection_points_xact_completion_count_shadow()
-			AS shadow_xact_completion_count,
-		injection_points_xact_completion_count()
-			AS legacy_xact_completion_count
-	FROM csn_snapshot_completion_count_shadow
+		active_snapshot_count = 0 AS active_snapshot_count_is_zero,
+		txsnapshot_count = shadow_count AS txsnapshot_matches_shadow,
+		legacy_count = shadow_count AS legacy_matches_shadow
+	FROM counts, csn_snapshot_completion_count_shadow
 	WHERE id = 1;
 
-uses_csn|snap_xact_completion_count|txsnap_xact_completion_count|shadow_xact_completion_count|legacy_xact_completion_count
---------+--------------------------+----------------------------+----------------------------+----------------------------
-t       |                         0|                          33|                          33|                           1
+uses_csn|active_snapshot_count_is_zero|txsnapshot_matches_shadow|legacy_matches_shadow
+--------+-----------------------------+-------------------------+---------------------
+t       |t                            |t                        |t                    
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>

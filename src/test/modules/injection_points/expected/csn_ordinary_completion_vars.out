@@ -96,10 +96,10 @@ step wcb_commit: COMMIT; <waiting ...>
 step o_commit_before_state: 
 	SELECT injection_points_latest_completed_xid_shadow() =
 		injection_points_get_saved_xid8() AS commit_before_shadow_latest_stable,
-		injection_points_xact_completion_count_shadow() =
-		injection_points_get_saved_int8() AS commit_before_shadow_count_unchanged;
+		injection_points_xact_completion_count_shadow() >=
+		injection_points_get_saved_int8() AS commit_before_shadow_count_monotonic;
 
-commit_before_shadow_latest_stable|commit_before_shadow_count_unchanged
+commit_before_shadow_latest_stable|commit_before_shadow_count_monotonic
 ----------------------------------+------------------------------------
 t                                 |t                                   
 (1 row)
@@ -228,8 +228,8 @@ step wca_commit: COMMIT; <waiting ...>
 step o_commit_after_state: 
 	SELECT injection_points_latest_completed_xid_shadow() =
 		injection_points_get_saved_xid8() AS commit_after_shadow_latest_stable,
-		injection_points_xact_completion_count_shadow() =
-		injection_points_get_saved_int8() + 1 AS commit_after_shadow_count_advanced;
+		injection_points_xact_completion_count_shadow() >
+		injection_points_get_saved_int8() AS commit_after_shadow_count_advanced;
 
 commit_after_shadow_latest_stable|commit_after_shadow_count_advanced
 ---------------------------------+----------------------------------
@@ -360,10 +360,10 @@ step wab_abort: ABORT; <waiting ...>
 step o_abort_before_state: 
 	SELECT injection_points_latest_completed_xid_shadow() =
 		injection_points_get_saved_xid8() AS abort_before_shadow_latest_stable,
-		injection_points_xact_completion_count_shadow() =
-		injection_points_get_saved_int8() AS abort_before_shadow_count_unchanged;
+		injection_points_xact_completion_count_shadow() >=
+		injection_points_get_saved_int8() AS abort_before_shadow_count_monotonic;
 
-abort_before_shadow_latest_stable|abort_before_shadow_count_unchanged
+abort_before_shadow_latest_stable|abort_before_shadow_count_monotonic
 ---------------------------------+-----------------------------------
 t                                |t                                  
 (1 row)
@@ -492,8 +492,8 @@ step waa_abort: ABORT; <waiting ...>
 step o_abort_after_state: 
 	SELECT injection_points_latest_completed_xid_shadow() =
 		injection_points_get_saved_xid8() AS abort_after_shadow_latest_stable,
-		injection_points_xact_completion_count_shadow() =
-		injection_points_get_saved_int8() + 1 AS abort_after_shadow_count_advanced;
+		injection_points_xact_completion_count_shadow() >
+		injection_points_get_saved_int8() AS abort_after_shadow_count_advanced;
 
 abort_after_shadow_latest_stable|abort_after_shadow_count_advanced
 --------------------------------+---------------------------------

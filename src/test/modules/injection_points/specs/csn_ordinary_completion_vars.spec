@@ -1,5 +1,7 @@
 # Stage 3 H1-E characterization: ordinary completion metadata is published
-# through the shadow-backed contract at ordinary finish publication.
+# through the shadow-backed contract at ordinary finish publication. Completion
+# counts are monotonic because xid-less observer transactions can also advance
+# the global generation.
 
 setup
 {
@@ -170,8 +172,8 @@ step o_commit_before_state
 {
 	SELECT injection_points_latest_completed_xid_shadow() =
 		injection_points_get_saved_xid8() AS commit_before_shadow_latest_stable,
-		injection_points_xact_completion_count_shadow() =
-		injection_points_get_saved_int8() AS commit_before_shadow_count_unchanged;
+		injection_points_xact_completion_count_shadow() >=
+		injection_points_get_saved_int8() AS commit_before_shadow_count_monotonic;
 }
 step o_capture_commit_after
 {
@@ -196,8 +198,8 @@ step o_commit_after_state
 {
 	SELECT injection_points_latest_completed_xid_shadow() =
 		injection_points_get_saved_xid8() AS commit_after_shadow_latest_stable,
-		injection_points_xact_completion_count_shadow() =
-		injection_points_get_saved_int8() + 1 AS commit_after_shadow_count_advanced;
+		injection_points_xact_completion_count_shadow() >
+		injection_points_get_saved_int8() AS commit_after_shadow_count_advanced;
 }
 step o_capture_abort_before
 {
@@ -222,8 +224,8 @@ step o_abort_before_state
 {
 	SELECT injection_points_latest_completed_xid_shadow() =
 		injection_points_get_saved_xid8() AS abort_before_shadow_latest_stable,
-		injection_points_xact_completion_count_shadow() =
-		injection_points_get_saved_int8() AS abort_before_shadow_count_unchanged;
+		injection_points_xact_completion_count_shadow() >=
+		injection_points_get_saved_int8() AS abort_before_shadow_count_monotonic;
 }
 step o_capture_abort_after
 {
@@ -248,8 +250,8 @@ step o_abort_after_state
 {
 	SELECT injection_points_latest_completed_xid_shadow() =
 		injection_points_get_saved_xid8() AS abort_after_shadow_latest_stable,
-		injection_points_xact_completion_count_shadow() =
-		injection_points_get_saved_int8() + 1 AS abort_after_shadow_count_advanced;
+		injection_points_xact_completion_count_shadow() >
+		injection_points_get_saved_int8() AS abort_after_shadow_count_advanced;
 }
 
 step o_save_count

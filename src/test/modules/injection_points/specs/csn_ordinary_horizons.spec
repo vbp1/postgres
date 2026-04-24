@@ -1,6 +1,7 @@
 # Stage 3 H1-C characterization: ComputeXidHorizons() surfaces still keep the
-# ordinary xid in view while the writer is blocked before the legacy helper,
-# but no longer do so once the writer is blocked after the helper.
+# ordinary xid in view while the writer is blocked before ordinary completion
+# publication, and still keep the compatibility xid in view until cleanup runs
+# after publication.
 
 setup
 {
@@ -129,16 +130,16 @@ step o_after_capture
 	FROM csn_ordinary_horizons_state
 	WHERE label = 'after';
 }
-step o_after_not_visible
+step o_after_visible
 {
-	SELECT injection_points_oldest_considered_running_xid() <>
+	SELECT injection_points_oldest_considered_running_xid() =
 		(SELECT fxid
 		 FROM csn_ordinary_horizons_state
-		 WHERE label = 'after') AS after_not_seen_by_oldest_considered_running;
-	SELECT injection_points_oldest_nonremovable_xid() <>
+		 WHERE label = 'after') AS after_seen_by_oldest_considered_running;
+	SELECT injection_points_oldest_nonremovable_xid() =
 		(SELECT fxid
 		 FROM csn_ordinary_horizons_state
-		 WHERE label = 'after') AS after_not_seen_by_oldest_nonremovable;
+		 WHERE label = 'after') AS after_seen_by_oldest_nonremovable;
 }
 
 session ctl
@@ -148,4 +149,4 @@ step wake_after		{ SELECT injection_points_wakeup('ordinary-after-procarray-prim
 step detach_after	{ SELECT injection_points_detach('ordinary-after-procarray-primary'); }
 
 permutation reset wb_seed wb_prepare o_before_capture wb_commit o_before_visible wake_before(wb_commit) detach_before wb_unlock
-permutation reset wa_seed wa_prepare o_after_capture wa_commit o_after_not_visible wake_after(wa_commit) detach_after wa_unlock
+permutation reset wa_seed wa_prepare o_after_capture wa_commit o_after_visible wake_after(wa_commit) detach_after wa_unlock

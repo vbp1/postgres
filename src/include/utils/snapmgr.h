@@ -108,7 +108,13 @@ extern void UnregisterSnapshotFromOwner(Snapshot snapshot, ResourceOwner owner);
 
 extern void AtSubCommit_Snapshot(int level);
 extern void AtSubAbort_Snapshot(int level);
-extern void AtEOXact_Snapshot(bool isCommit, bool resetXmin);
+extern void AtEOXact_Snapshot(bool isCommit, bool resetXmin, bool resetReuse);
+extern bool SnapMgrShouldForceSnapshotFallback(void);
+extern bool SnapMgrShouldPreserveSnapshotFallbackForExplicitBegin(void);
+extern void SnapMgrForceSnapshotFallback(void);
+extern void SnapMgrForceSnapshotFallbackSticky(void);
+extern void SnapMgrReleaseSnapshotFallbackSticky(void);
+extern void SnapMgrConsumeSnapshotFallback(void);
 
 extern void ImportSnapshot(const char *idstr);
 extern bool XactHasExportedSnapshots(void);

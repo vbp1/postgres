@@ -100,7 +100,7 @@ t
 (1 row)
 
 
-starting permutation: reset wa_seed wa_prepare o_after_capture wa_commit o_after_not_visible wake_after detach_after wa_unlock
+starting permutation: reset wa_seed wa_prepare o_after_capture wa_commit o_after_visible wake_after detach_after wa_unlock
 step reset: 
 	TRUNCATE csn_ordinary_oldest_active_xid_state;
 	UPDATE csn_ordinary_oldest_active_xid_data SET val = 0 WHERE id = 1;
@@ -161,15 +161,15 @@ t
 (1 row)
 
 step wa_commit: COMMIT; <waiting ...>
-step o_after_not_visible: 
-	SELECT injection_points_oldest_active_xid(false, false) <>
+step o_after_visible: 
+	SELECT injection_points_oldest_active_xid(false, false) =
 		(SELECT fxid
 		 FROM csn_ordinary_oldest_active_xid_state
-		 WHERE label = 'after') AS after_not_seen_by_oldest_active_reader;
+		 WHERE label = 'after') AS after_seen_by_oldest_active_reader;
 
-after_not_seen_by_oldest_active_reader
---------------------------------------
-t                                     
+after_seen_by_oldest_active_reader
+----------------------------------
+t                                 
 (1 row)
 
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>

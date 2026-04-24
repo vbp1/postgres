@@ -1,6 +1,7 @@
 # Stage 3 H1-C characterization: GetRunningTransactionData() still includes
-# the ordinary xid while the writer is blocked before the legacy helper, but
-# no longer includes it once the writer is blocked after the helper.
+# the ordinary xid while the writer is blocked before ordinary completion
+# publication, and still includes the compatibility xid until cleanup runs
+# after publication.
 
 setup
 {
@@ -71,14 +72,14 @@ step o_before_visible
 		injection_points_latest_completed_xid_shadow()
 		AS before_running_xacts_latest_completed_uses_shadow;
 }
-step o_after_not_visible
+step o_after_visible
 {
 	SELECT injection_points_running_xacts_include_backend(
 		(SELECT pid
 		 FROM csn_ordinary_running_xacts_state
 		 WHERE label = 'after'),
 		true
-	) = false AS after_not_seen_by_running_xacts;
+	) AS after_seen_by_running_xacts;
 	SELECT injection_points_running_xacts_latest_completed_xid(true) =
 		injection_points_latest_completed_xid_shadow()
 		AS after_running_xacts_latest_completed_uses_shadow;
@@ -91,4 +92,4 @@ step wake_after		{ SELECT injection_points_wakeup('ordinary-after-procarray-prim
 step detach_after	{ SELECT injection_points_detach('ordinary-after-procarray-primary'); }
 
 permutation reset wb_seed wb_prepare wb_commit o_before_visible wake_before(wb_commit) detach_before
-permutation reset wa_seed wa_prepare wa_commit o_after_not_visible wake_after(wa_commit) detach_after
+permutation reset wa_seed wa_prepare wa_commit o_after_visible wake_after(wa_commit) detach_after

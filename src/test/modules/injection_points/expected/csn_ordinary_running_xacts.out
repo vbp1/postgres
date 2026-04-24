@@ -68,7 +68,7 @@ injection_points_detach
 (1 row)
 
 
-starting permutation: reset wa_seed wa_prepare wa_commit o_after_not_visible wake_after detach_after
+starting permutation: reset wa_seed wa_prepare wa_commit o_after_visible wake_after detach_after
 step reset: 
 	TRUNCATE csn_ordinary_running_xacts_state;
 	UPDATE csn_ordinary_running_xacts_data SET val = 0 WHERE id = 1;
@@ -100,20 +100,20 @@ t
 (1 row)
 
 step wa_commit: COMMIT; <waiting ...>
-step o_after_not_visible: 
+step o_after_visible: 
 	SELECT injection_points_running_xacts_include_backend(
 		(SELECT pid
 		 FROM csn_ordinary_running_xacts_state
 		 WHERE label = 'after'),
 		true
-	) = false AS after_not_seen_by_running_xacts;
+	) AS after_seen_by_running_xacts;
 	SELECT injection_points_running_xacts_latest_completed_xid(true) =
 		injection_points_latest_completed_xid_shadow()
 		AS after_running_xacts_latest_completed_uses_shadow;
 
-after_not_seen_by_running_xacts
--------------------------------
-t                              
+after_seen_by_running_xacts
+---------------------------
+t                          
 (1 row)
 
 after_running_xacts_latest_completed_uses_shadow

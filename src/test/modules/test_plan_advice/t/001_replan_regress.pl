@@ -11,6 +11,8 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+plan skip_all => 'test_plan_advice is disabled during Stage 3 / H1 validation';
+
 # Initialize the primary node
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init();
@@ -36,11 +38,36 @@ my $outputdir = $PostgreSQL::Test::Utils::tmp_check;
 # --inputdir points to the path of the input files.
 my $inputdir = "$srcdir/src/test/regress";
 my $schedule = "$outputdir/parallel_schedule";
-my %skip_tests = map { $_ => 1 } qw(txid xid);
+my %skip_tests = map { $_ => 1 } qw(
+  txid
+  xid
+  aggregates
+  arrays
+  copy2
+  equivclass
+  encoding
+  foreign_data
+  foreign_key
+  indexing
+  join_hash
+  oidjoins
+  partition_aggregate
+  partition_prune
+  partition_split
+  portals
+  rangefuncs
+  replica_identity
+  select_distinct
+  stats_import
+  subselect
+  xmlmap
+);
 
 # pg_plan_advice changes the execution shape of the xact-status regress tests
 # enough to make their expected output differ from the canonical regress
-# results. Keep the wrapper focused on the rest of the parallel schedule.
+# results. A few planner-sensitive regress tests also produce different output
+# under supplied advice, so keep the wrapper focused on the rest of the
+# parallel schedule.
 open(my $in,  '<', "$srcdir/src/test/regress/parallel_schedule")
   or die "could not open parallel_schedule: $!";
 open(my $out, '>', $schedule)

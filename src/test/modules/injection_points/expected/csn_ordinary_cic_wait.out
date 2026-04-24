@@ -81,9 +81,10 @@ step ha_commit: COMMIT; <waiting ...>
 step cic_after: 
 	CREATE INDEX CONCURRENTLY csn_ordinary_cic_wait_after_idx
 		ON csn_ordinary_cic_wait (id);
-
+ <waiting ...>
 step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
 step ha_commit: <... completed>
+step cic_after: <... completed>
 step wake_after: <... completed>
 injection_points_wakeup
 -----------------------

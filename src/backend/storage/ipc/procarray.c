@@ -145,8 +145,17 @@ typedef struct ProcArrayOrdinaryMirrorEpochState
 
 static ProcArrayOrdinaryMirrorEpochState *procArrayOrdinaryMirrorEpochState;
 
+typedef struct ProcArrayCSNSafeEpochState
+{
+	int			nslots;
+	pg_atomic_uint64 epochs[FLEXIBLE_ARRAY_MEMBER];
+} ProcArrayCSNSafeEpochState;
+
+static ProcArrayCSNSafeEpochState *procArrayCSNSafeEpochState;
+
 typedef struct ProcArrayOrdinaryMirrorFinishedState
 {
+	pg_atomic_uint64 transition_seq;
 	int			nslots;
 	pg_atomic_uint32 flags[FLEXIBLE_ARRAY_MEMBER];
 } ProcArrayOrdinaryMirrorFinishedState;
@@ -336,6 +345,16 @@ static PGPROC *allProcs;
 static TransactionId cachedXidIsNotInProgress = InvalidTransactionId;
 
 /*
+ * Same-backend handoff for the most recent ordinary xid-bearing finish.
+ *
+ * Ordinary commit/abort publication is lock-free in H1-E. If the successor
+ * statement in the same backend reaches GetSnapshotData() before the passive
+ * latestCompletedXid shadow is observed as advanced, nudge the shadow
+ * forward using the already-finished xid recorded here.
+ */
+static TransactionId backendLocalRecentOrdinaryFinishedXid = InvalidTransactionId;
+
+/*
  * Bookkeeping for tracking emulated transactions in recovery
  */
 
@@ -432,6 +451,9 @@ static void RecomputeCSNOldestActiveXid(void);
 static inline bool ProcIsCSNSnapshotSafeToIgnore(PGPROC *proc);
 static inline bool ProcIsOrdinaryPrimaryMirrorFinished(PGPROC *proc);
 static inline bool ProcIsOrdinaryPrimaryMirrorCompletionVisible(PGPROC *proc);
+static inline uint64 ProcArrayReadOrdinaryFinishTransitionSeq(void);
+static inline void ProcArrayBeginOrdinaryFinishTransition(void);
+static inline void ProcArrayEndOrdinaryFinishTransition(void);
 static bool ProcCouldAdvanceCSNOldestActiveXid(PGPROC *proc);
 
 static inline FullTransactionId FullXidRelativeTo(FullTransactionId rel,
@@ -493,6 +515,11 @@ ProcArrayShmemRequest(void *arg)
 										mul_size(sizeof(pg_atomic_uint64), PROCARRAY_ALLPROCS)),
 					   .ptr = (void **) &procArrayOrdinaryMirrorEpochState,
 		);
+	ShmemRequestStruct(.name = "ProcArray CSN Safe Epoch State",
+					   .size = add_size(offsetof(ProcArrayCSNSafeEpochState, epochs),
+										mul_size(sizeof(pg_atomic_uint64), PROCARRAY_ALLPROCS)),
+					   .ptr = (void **) &procArrayCSNSafeEpochState,
+		);
 	ShmemRequestStruct(.name = "ProcArray Ordinary Mirror Finished State",
 					   .size = add_size(offsetof(ProcArrayOrdinaryMirrorFinishedState, flags),
 										mul_size(sizeof(pg_atomic_uint32), PROCARRAY_ALLPROCS)),
@@ -523,6 +550,10 @@ ProcArrayShmemInit(void *arg)
 	procArrayOrdinaryMirrorEpochState->nslots = PROCARRAY_ALLPROCS;
 	for (int procno = 0; procno < PROCARRAY_ALLPROCS; procno++)
 		pg_atomic_init_u64(&procArrayOrdinaryMirrorEpochState->epochs[procno], 0);
+	procArrayCSNSafeEpochState->nslots = PROCARRAY_ALLPROCS;
+	for (int procno = 0; procno < PROCARRAY_ALLPROCS; procno++)
+		pg_atomic_init_u64(&procArrayCSNSafeEpochState->epochs[procno], 0);
+	pg_atomic_init_u64(&procArrayOrdinaryMirrorFinishedState->transition_seq, 0);
 	procArrayOrdinaryMirrorFinishedState->nslots = PROCARRAY_ALLPROCS;
 	for (int procno = 0; procno < PROCARRAY_ALLPROCS; procno++)
 		pg_atomic_init_u32(&procArrayOrdinaryMirrorFinishedState->flags[procno], 0);
@@ -836,9 +867,9 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 /*
  * ProcArrayEndTransactionPrimary -- end ordinary primary transaction exposure
  *
- * This removes the ordinary backend from xid/xmin snapshot membership and
- * advances the reuse counters, but leaves unlocked virtual-xid and other
- * backend-local cleanup to the caller.
+ * This publishes the ordinary backend's completion record and advances the
+ * reuse counters, but leaves xid/xmin compatibility cleanup and unlocked
+ * virtual-xid / backend-local cleanup to the caller.
  */
 void
 ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
@@ -848,78 +879,111 @@ ProcArrayEndTransactionPrimary(PGPROC *proc, TransactionId latestXid)
 
 	if (TransactionIdIsValid(latestXid))
 	{
-		int			pgxactoff = proc->pgxactoff;
-
 		Assert(TransactionIdIsValid(proc->xid));
-
-		Assert(TransactionIdIsValid(ProcGlobal->xids[pgxactoff]));
-		Assert(ProcGlobal->xids[pgxactoff] == proc->xid);
+		Assert(TransactionIdIsValid(ProcGlobal->xids[proc->pgxactoff]));
+		Assert(ProcGlobal->xids[proc->pgxactoff] == proc->xid);
+		ProcArrayBeginOrdinaryFinishTransition();
 
 		/*
 		 * H1-E switch: supported ordinary readers now key off completion
-		 * publication rather than the lock-owned xid/xmin cleanup point.
-		 * Publish completion metadata first, then mark the ordinary mirror
-		 * finished, and only then clear the compatibility fields.
+		 * publication rather than the lock-owned xid/xmin cleanup point. Keep
+		 * the xid/xmin compatibility fields intact until the caller clears the
+		 * old virtual xid, so readers that still treat this backend as active
+		 * cannot lose it merely because completion publication already
+		 * happened.
 		 */
 		MaintainLatestCompletedXidShadowAtomic(latestXid);
-		INJECTION_POINT("xact-completion-advance-ordinary-primary", NULL);
-		pg_atomic_add_fetch_u64(&TransamVariables->xactCompletionCountShadow, 1);
-		ProcArrayMarkOrdinaryMirrorFinished(proc);
-
-		ProcGlobal->xids[pgxactoff] = InvalidTransactionId;
-		proc->xid = InvalidTransactionId;
-		proc->xmin = InvalidTransactionId;
-
-		/* must be cleared with xid/xmin: */
-		/* avoid unnecessarily dirtying shared cachelines */
-		if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
-		{
-			proc->statusFlags &= ~PROC_VACUUM_STATE_MASK;
-			ProcGlobal->statusFlags[pgxactoff] = proc->statusFlags;
-		}
-
 		/*
-		 * Clear the subtransaction-XID cache before the PGPROC slot can be
-		 * reused by the next top-level transaction in this backend.
+		 * Treat xactCompletionCountShadow as the publication point for the
+		 * ordinary lock-free completion record. Readers that observe the new
+		 * count must also be able to observe the corresponding
+		 * latestCompletedXidShadow update.
 		 */
-		Assert(ProcGlobal->subxidStates[pgxactoff].count == proc->subxidStatus.count &&
-			   ProcGlobal->subxidStates[pgxactoff].overflowed == proc->subxidStatus.overflowed);
-		if (proc->subxidStatus.count > 0 || proc->subxidStatus.overflowed)
-		{
-			ProcGlobal->subxidStates[pgxactoff].count = 0;
-			ProcGlobal->subxidStates[pgxactoff].overflowed = false;
-			proc->subxidStatus.count = 0;
-			proc->subxidStatus.overflowed = false;
-		}
+		pg_write_barrier();
+		INJECTION_POINT("xact-completion-advance-ordinary-primary", NULL);
+		TransamAdvanceXactCompletionCount();
+		backendLocalRecentOrdinaryFinishedXid = latestXid;
+		ProcArrayMarkOrdinaryMirrorFinished(proc);
+		ProcArrayEndOrdinaryFinishTransition();
 	}
 	else
 	{
-		bool		needProcArrayLock;
-
 		Assert(!TransactionIdIsValid(proc->xid));
 		Assert(proc->subxidStatus.count == 0);
 		Assert(!proc->subxidStatus.overflowed);
 
-		needProcArrayLock =
-			TransactionIdIsValid(proc->xmin) ||
-			(proc->statusFlags & PROC_VACUUM_STATE_MASK) != 0;
-
-		if (needProcArrayLock)
-		{
-			ProcArrayMarkOrdinaryMirrorFinished(proc);
-			proc->xmin = InvalidTransactionId;
-
-			/* must be cleared with xid/xmin: */
-			/* avoid unnecessarily dirtying shared cachelines */
-			if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
-			{
-				proc->statusFlags &= ~PROC_VACUUM_STATE_MASK;
-				ProcGlobal->statusFlags[proc->pgxactoff] = proc->statusFlags;
-			}
-		}
-		else
-			proc->xmin = InvalidTransactionId;
+		ProcArrayBeginOrdinaryFinishTransition();
+		/*
+		 * xid-less ordinary transactions can still change backend-local
+		 * visibility state, for example after temp-object work. Publish a new
+		 * completion generation even when there is no xid/xmin compatibility
+		 * cleanup to perform so later snapshots do not reuse a stale image
+		 * across that boundary.
+		 */
+		TransamAdvanceXactCompletionCount();
+		backendLocalRecentOrdinaryFinishedXid = InvalidTransactionId;
+		ProcArrayMarkOrdinaryMirrorFinished(proc);
+		ProcArrayEndOrdinaryFinishTransition();
 	}
+}
+
+/*
+ * ProcArrayEndTransactionPrimaryCleanup -- clear ordinary compatibility state
+ *
+ * The ordinary completion record is already published. This helper retires
+ * the xid/xmin/subxid/statusFlags compatibility fields only after the caller
+ * has cleared the backend's old virtual xid.
+ */
+void
+ProcArrayEndTransactionPrimaryCleanup(PGPROC *proc)
+{
+	int			pgxactoff = proc->pgxactoff;
+
+	Assert(!LocalTransactionIdIsValid(proc->vxid.lxid));
+
+	/*
+	 * Readers already treat ordinary finish transitions as retry points.
+	 * Reuse the same sequence while clearing the xid/xmin compatibility tail
+	 * so snapshot scans cannot install a mixed view of pre- and post-cleanup
+	 * state after the old virtual xid is gone.
+	 */
+	ProcArrayBeginOrdinaryFinishTransition();
+
+	if (TransactionIdIsValid(proc->xid))
+	{
+		Assert(TransactionIdIsValid(ProcGlobal->xids[pgxactoff]));
+		Assert(ProcGlobal->xids[pgxactoff] == proc->xid);
+
+		ProcGlobal->xids[pgxactoff] = InvalidTransactionId;
+		proc->xid = InvalidTransactionId;
+	}
+
+	if (TransactionIdIsValid(proc->xmin))
+		proc->xmin = InvalidTransactionId;
+
+	/* must be cleared with xid/xmin: */
+	/* avoid unnecessarily dirtying shared cachelines */
+	if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
+	{
+		proc->statusFlags &= ~PROC_VACUUM_STATE_MASK;
+		ProcGlobal->statusFlags[pgxactoff] = proc->statusFlags;
+	}
+
+	/*
+	 * Clear the subtransaction-XID cache before the PGPROC slot can be
+	 * reused by the next top-level transaction in this backend.
+	 */
+	Assert(ProcGlobal->subxidStates[pgxactoff].count == proc->subxidStatus.count &&
+		   ProcGlobal->subxidStates[pgxactoff].overflowed == proc->subxidStatus.overflowed);
+	if (proc->subxidStatus.count > 0 || proc->subxidStatus.overflowed)
+	{
+		ProcGlobal->subxidStates[pgxactoff].count = 0;
+		ProcGlobal->subxidStates[pgxactoff].overflowed = false;
+		proc->subxidStatus.count = 0;
+		proc->subxidStatus.overflowed = false;
+	}
+
+	ProcArrayEndOrdinaryFinishTransition();
 }
 
 /*
@@ -1178,21 +1242,36 @@ ProcArrayClearTransaction(PGPROC *proc)
 static void
 MaintainLatestCompletedXid(TransactionId latestXid)
 {
-	FullTransactionId cur_latest = TransamVariables->latestCompletedXid;
+	FullTransactionId cur_latest;
 
-	Assert(FullTransactionIdIsValid(cur_latest));
 	Assert(!RecoveryInProgress());
 	Assert(LWLockHeldByMe(ProcArrayLock));
 
+	/*
+	 * H1-E ordinary commit advances latestCompletedXidShadow without
+	 * ProcArrayLock. Use the shadow as the authoritative value here, otherwise
+	 * legacy ProcArray writers can copy a stale embedded value back into the
+	 * shadow and move snapshot xmax backwards.
+	 */
+	cur_latest = ProcArrayReadLatestCompletedXidShadow();
+	Assert(FullTransactionIdIsValid(cur_latest));
+
 	if (TransactionIdPrecedes(XidFromFullTransactionId(cur_latest), latestXid))
 	{
-		TransamVariables->latestCompletedXid =
-			FullXidRelativeTo(cur_latest, latestXid);
+		cur_latest = FullXidRelativeTo(cur_latest, latestXid);
 	}
-	ProcArrayWriteLatestCompletedXidShadow(TransamVariables->latestCompletedXid);
+
+	if (!FullTransactionIdIsValid(TransamVariables->latestCompletedXid) ||
+		TransactionIdPrecedes(XidFromFullTransactionId(TransamVariables->latestCompletedXid),
+							  XidFromFullTransactionId(cur_latest)))
+	{
+		TransamVariables->latestCompletedXid = cur_latest;
+	}
+
+	ProcArrayWriteLatestCompletedXidShadow(cur_latest);
 
 	Assert(IsBootstrapProcessingMode() ||
-		   FullTransactionIdIsNormal(TransamVariables->latestCompletedXid));
+		   FullTransactionIdIsNormal(cur_latest));
 }
 
 static void
@@ -1357,7 +1436,38 @@ RecomputeCSNOldestActiveXid(void)
 static inline bool
 ProcIsCSNSnapshotSafeToIgnore(PGPROC *proc)
 {
-	return (proc->csnFlags & PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE) != 0;
+	int			procNumber;
+	uint64		slotEpoch;
+	uint64		publishedEpoch;
+	uint64		safeEpoch;
+
+	if ((proc->csnFlags & PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE) == 0)
+		return false;
+
+	/*
+	 * The CSN-safe marker belongs to one ordinary xid-bearing generation.
+	 * After the backend advances its slot epoch for the next top-level
+	 * transaction, readers must stop applying the previous generation's
+	 * marker even if they can still observe the old flag value transiently.
+	 */
+	if (!TransactionIdIsValid(proc->xid))
+		return false;
+
+	procNumber = GetNumberFromPGProc(proc);
+	if (procNumber < 0 || procNumber >= PROCARRAY_ALLPROCS)
+		return false;
+
+	publishedEpoch = ProcArrayReadPublishedOrdinaryMirrorEpoch(proc);
+	if (publishedEpoch == 0)
+		return false;
+
+	slotEpoch = ProcArrayReadSlotEpoch(procNumber);
+	if (slotEpoch == 0)
+		return false;
+
+	safeEpoch = pg_atomic_read_u64(&procArrayCSNSafeEpochState->epochs[procNumber]);
+
+	return safeEpoch == slotEpoch && publishedEpoch == slotEpoch;
 }
 
 static inline bool
@@ -1374,11 +1484,47 @@ ProcIsOrdinaryPrimaryMirrorFinished(PGPROC *proc)
 		&procArrayOrdinaryMirrorFinishedState->flags[procNumber]) != 0;
 }
 
+static inline uint64
+ProcArrayReadOrdinaryFinishTransitionSeq(void)
+{
+	Assert(procArrayOrdinaryMirrorFinishedState != NULL);
+
+	return pg_atomic_read_u64(&procArrayOrdinaryMirrorFinishedState->transition_seq);
+}
+
+static inline void
+ProcArrayBeginOrdinaryFinishTransition(void)
+{
+	Assert(procArrayOrdinaryMirrorFinishedState != NULL);
+
+	pg_atomic_add_fetch_u64(&procArrayOrdinaryMirrorFinishedState->transition_seq, 1);
+	pg_write_barrier();
+}
+
+static inline void
+ProcArrayEndOrdinaryFinishTransition(void)
+{
+	Assert(procArrayOrdinaryMirrorFinishedState != NULL);
+
+	pg_write_barrier();
+	pg_atomic_add_fetch_u64(&procArrayOrdinaryMirrorFinishedState->transition_seq, 1);
+}
+
 static inline bool
 ProcIsOrdinaryPrimaryMirrorCompletionVisible(PGPROC *proc)
 {
 	uint64		slotEpoch;
 	uint64		publishedEpoch;
+
+	/*
+	 * A backend with an active virtual xact is already in a new top-level
+	 * generation. Treating it as the previous finished ordinary generation
+	 * would let readers skip a live xid if they observe stale finished-state
+	 * bits from the previous generation alongside freshly published xid
+	 * mirrors for the current one.
+	 */
+	if (LocalTransactionIdIsValid(proc->vxid.lxid))
+		return false;
 
 	if (!ProcIsOrdinaryPrimaryMirrorFinished(proc))
 		return false;
@@ -1469,13 +1615,23 @@ ProcCouldAdvanceCSNOldestActiveXid(PGPROC *proc)
 void
 ProcArrayMarkCSNSnapshotSafeToIgnore(PGPROC *proc)
 {
+	int			procNumber;
+	uint64		slotEpoch;
+
 	Assert(proc == MyProc);
 	Assert(TransactionIdIsValid(proc->xid));
+	procNumber = GetNumberFromPGProc(proc);
+	Assert(procNumber >= 0 && procNumber < PROCARRAY_ALLPROCS);
+	slotEpoch = ProcArrayReadSlotEpoch(procNumber);
+	Assert(slotEpoch > 0);
 
 	/*
 	 * Publish prior commit-status writes before making this backend ignorable
 	 * to supported CSN snapshots.
 	 */
+	pg_write_barrier();
+	pg_atomic_write_u64(&procArrayCSNSafeEpochState->epochs[procNumber],
+						slotEpoch);
 	pg_write_barrier();
 	proc->csnFlags |= PROC_CSN_SNAPSHOT_SAFE_TO_IGNORE;
 }
@@ -1495,10 +1651,12 @@ ProcArrayBeginOrdinaryPrimaryEpoch(PGPROC *proc)
 	Assert(proc->vxid.procNumber == MyProcNumber);
 
 	ProcArrayAdvanceSlotEpoch(proc->vxid.procNumber);
+	proc->csnFlags = 0;
 
 	/*
-	 * Readers must see the new slot epoch before the previous finished
-	 * mirror generation can become eligible for reuse.
+	 * Readers must see the new slot epoch and cleared generation-local CSN
+	 * marker before the previous finished mirror generation can become
+	 * eligible for reuse.
 	 */
 	pg_write_barrier();
 	pg_atomic_write_u32(
@@ -2694,6 +2852,8 @@ GetSnapshotDataBuildsCSN(bool takenDuringRecovery, bool suboverflowed)
 	 */
 	return !takenDuringRecovery &&
 		!suboverflowed &&
+		(MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE) == 0 &&
+		!SnapMgrShouldForceSnapshotFallback() &&
 		!IsolationIsSerializable();
 }
 
@@ -2828,6 +2988,7 @@ GetSnapshotData(Snapshot snapshot)
 	int			mypgxactoff;
 	TransactionId myxid;
 	uint64		curXactCompletionCount;
+	uint64		ordinaryFinishSeq;
 	CommitSeqNo snapshotCsnCandidate = InvalidCommitSeqNo;
 	bool		snapshotCsnLocked = false;
 
@@ -2868,19 +3029,44 @@ GetSnapshotData(Snapshot snapshot)
 					 errmsg("out of memory")));
 	}
 
+retry:
+	count = 0;
+	subcount = 0;
+	suboverflowed = false;
+	commitCriticalSectionSeen = false;
+	snapshotCsnCandidate = InvalidCommitSeqNo;
+	snapshotCsnLocked = false;
+	ordinaryFinishSeq = 0;
+	replication_slot_xmin = InvalidTransactionId;
+	replication_slot_catalog_xmin = InvalidTransactionId;
+
 	/*
 	 * It is sufficient to get shared lock on ProcArrayLock, even if we are
 	 * going to set MyProc->xmin.
 	 */
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	ordinaryFinishSeq = ProcArrayReadOrdinaryFinishTransitionSeq();
+	if (ordinaryFinishSeq & 1)
+	{
+		LWLockRelease(ProcArrayLock);
+		goto retry;
+	}
 
 	if (GetSnapshotDataReuse(snapshot))
 	{
+		uint64		endXactCompletionCount;
+		uint64		endOrdinaryFinishSeq;
+
+		endXactCompletionCount = TransamReadXactCompletionCountShadow();
+		endOrdinaryFinishSeq = ProcArrayReadOrdinaryFinishTransitionSeq();
 		LWLockRelease(ProcArrayLock);
+		if (endXactCompletionCount != snapshot->snapXactCompletionCount ||
+			endOrdinaryFinishSeq != ordinaryFinishSeq ||
+			(endOrdinaryFinishSeq & 1))
+			goto retry;
 
 		if (TransactionIdIsNormal(TransactionXmin))
 			SetCSNOldestActiveXidIfEarlier(TransactionXmin);
-
 		return snapshot;
 	}
 
@@ -2904,18 +3090,44 @@ GetSnapshotData(Snapshot snapshot)
 	 * the separate passive latestCompletedXid shadow so this reader no longer
 	 * depends on the embedded transam field directly.
 	 */
+	curXactCompletionCount = TransamReadXactCompletionCountShadow();
+	/*
+	 * xactCompletionCountShadow is the publication generation for ordinary
+	 * lock-free commit. After observing it, pair with the writer-side
+	 * barrier above so latestCompletedXidShadow cannot be read from an older
+	 * generation.
+	 */
+	pg_read_barrier();
 	latest_completed = ProcArrayReadLatestCompletedXidShadow();
+
+	if (TransactionIdIsValid(backendLocalRecentOrdinaryFinishedXid))
+	{
+		TransactionId localFinishedXid = backendLocalRecentOrdinaryFinishedXid;
+		TransactionId localXmax = XidFromFullTransactionId(latest_completed);
+
+		TransactionIdAdvance(localXmax);
+		if (!TransactionIdPrecedes(localFinishedXid, localXmax))
+		{
+			MaintainLatestCompletedXidShadowAtomic(localFinishedXid);
+			pg_read_barrier();
+			latest_completed = ProcArrayReadLatestCompletedXidShadow();
+		}
+	}
+
 	mypgxactoff = MyProc->pgxactoff;
 	myxid = other_xids[mypgxactoff];
 	Assert(myxid == MyProc->xid);
 
 	oldestxid = TransamVariables->oldestXid;
-	curXactCompletionCount = TransamReadXactCompletionCountShadow();
 
 	/* xmax is always latestCompletedXid + 1 */
 	xmax = XidFromFullTransactionId(latest_completed);
 	TransactionIdAdvance(xmax);
 	Assert(TransactionIdIsNormal(xmax));
+
+	if (TransactionIdIsValid(backendLocalRecentOrdinaryFinishedXid) &&
+		TransactionIdPrecedes(backendLocalRecentOrdinaryFinishedXid, xmax))
+		backendLocalRecentOrdinaryFinishedXid = InvalidTransactionId;
 
 	/* initialize xmin calculation with xmax */
 	xmin = xmax;
@@ -2965,9 +3177,25 @@ GetSnapshotData(Snapshot snapshot)
 				continue;
 
 			/*
-			 * Check commit-critical-section state before any xid-based skip.
-			 * A backend that already reserved or published a CSN can still
-			 * make this snapshot's CSN unsafe even if its xid is >= xmax.
+			 * We don't include our own XIDs (if any) in the snapshot. It
+			 * needs to be included in the xmin computation, but we did so
+			 * outside the loop.
+			 */
+			if (pgxactoff == mypgxactoff)
+				continue;
+
+			/*
+			 * Only xid-bearing backends can still matter for the commit-
+			 * critical-section fallback. With the lock-free ordinary finish
+			 * path, a same-backend successor can already publish a new vxid
+			 * while still showing a stale DELAY_CHKPT_IN_COMMIT from the prior
+			 * generation, but without a new xid assigned yet. Treating that
+			 * xid-less state as commit-critical causes unrelated snapshots to
+			 * fall back spuriously.
+			 *
+			 * xid >= xmax remains a hazard here: such a backend might already
+			 * have reserved or published a CSN even though it doesn't need an
+			 * explicit xip entry in this snapshot.
 			 */
 			delayChkptFlags = proc->delayChkptFlags;
 			if (delayChkptFlags & DELAY_CHKPT_IN_COMMIT)
@@ -2975,14 +3203,6 @@ GetSnapshotData(Snapshot snapshot)
 				commitCriticalSectionSeen = true;
 				INJECTION_POINT("snapshot-saw-delay-chkpt-in-commit", NULL);
 			}
-
-			/*
-			 * We don't include our own XIDs (if any) in the snapshot. It
-			 * needs to be included in the xmin computation, but we did so
-			 * outside the loop.
-			 */
-			if (pgxactoff == mypgxactoff)
-				continue;
 
 			/*
 			 * The only way we are able to get here with a non-normal xid is
@@ -3114,6 +3334,27 @@ GetSnapshotData(Snapshot snapshot)
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
 
+	/*
+	 * Ordinary commit publication is no longer serialized by ProcArrayLock.
+	 * If a completion happened while we were scanning, rebuild from a fresh
+	 * procarray view instead of installing a mixed snapshot.
+	 */
+	if (TransamReadXactCompletionCountShadow() != curXactCompletionCount)
+	{
+		if (snapshotCsnLocked)
+			LWLockRelease(XidGenLock);
+		LWLockRelease(ProcArrayLock);
+		goto retry;
+	}
+	if (ProcArrayReadOrdinaryFinishTransitionSeq() != ordinaryFinishSeq ||
+		(ordinaryFinishSeq & 1))
+	{
+		if (snapshotCsnLocked)
+			LWLockRelease(XidGenLock);
+		LWLockRelease(ProcArrayLock);
+		goto retry;
+	}
+
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = xmin;
 	INJECTION_POINT("snapshot-after-install-xmin", NULL);
@@ -3225,7 +3466,6 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->active_count = 0;
 	snapshot->regd_count = 0;
 	snapshot->copied = false;
-
 	return snapshot;
 }
 

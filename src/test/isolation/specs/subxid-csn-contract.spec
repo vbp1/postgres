@@ -6,33 +6,25 @@
 setup
 {
 DROP TABLE IF EXISTS subxid_csn_contract;
-DROP TABLE IF EXISTS subxid_csn_backend;
 DROP TABLE IF EXISTS subxid_csn_sink;
 CREATE TABLE subxid_csn_contract (id integer PRIMARY KEY, val integer);
-CREATE TABLE subxid_csn_backend (writer_pid integer PRIMARY KEY);
 CREATE TABLE subxid_csn_sink (id integer PRIMARY KEY, val integer);
 }
 
 teardown
 {
  DROP TABLE subxid_csn_sink;
- DROP TABLE subxid_csn_backend;
  DROP TABLE subxid_csn_contract;
 }
 
 session seed
 step reset
 {
-  TRUNCATE subxid_csn_contract, subxid_csn_backend, subxid_csn_sink;
+  TRUNCATE subxid_csn_contract, subxid_csn_sink;
   INSERT INTO subxid_csn_contract VALUES (1, 0);
 }
 
 session writer
-step writer_register
-{
-  TRUNCATE subxid_csn_backend;
-  INSERT INTO subxid_csn_backend VALUES (pg_backend_pid());
-}
 step nonov_ins
 {
   BEGIN;
@@ -124,26 +116,6 @@ step ov_upd
 step wcommit    { COMMIT; }
 
 session rc
-step rc_writer_noov
-{
-  SELECT *
-  FROM pg_stat_get_backend_subxact((
-    SELECT b
-    FROM pg_stat_get_backend_idset() AS b
-    WHERE pg_stat_get_backend_pid(b) =
-      (SELECT writer_pid FROM subxid_csn_backend)
-  ));
-}
-step rc_writer_ov
-{
-  SELECT *
-  FROM pg_stat_get_backend_subxact((
-    SELECT b
-    FROM pg_stat_get_backend_idset() AS b
-    WHERE pg_stat_get_backend_pid(b) =
-      (SELECT writer_pid FROM subxid_csn_backend)
-  ));
-}
 step rc_begin   { BEGIN ISOLATION LEVEL READ COMMITTED; }
 step rc_cnt_csn
 {
@@ -163,26 +135,6 @@ step rc_val_post { SELECT val FROM subxid_csn_contract WHERE id = 1; }
 step rc_commit  { COMMIT; }
 
 session rr
-step rr_writer_noov
-{
-  SELECT *
-  FROM pg_stat_get_backend_subxact((
-    SELECT b
-    FROM pg_stat_get_backend_idset() AS b
-    WHERE pg_stat_get_backend_pid(b) =
-      (SELECT writer_pid FROM subxid_csn_backend)
-  ));
-}
-step rr_writer_ov
-{
-  SELECT *
-  FROM pg_stat_get_backend_subxact((
-    SELECT b
-    FROM pg_stat_get_backend_idset() AS b
-    WHERE pg_stat_get_backend_pid(b) =
-      (SELECT writer_pid FROM subxid_csn_backend)
-  ));
-}
 step rr_begin   { BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step rr_cnt_csn
 {
@@ -199,20 +151,20 @@ step rr_val_csn
 }
 step rr_commit  { COMMIT; }
 
-# Non-overflow subxid insert path: the writer advertises one live subxid
-# without overflow before the reader takes its snapshot.
-permutation reset writer_register nonov_ins rc_writer_noov rc_begin rc_cnt_csn wcommit rc_cnt_post rc_commit
+# Non-overflow subxid insert path: the reader stays on the CSN path before
+# commit and sees the row on the next statement after commit.
+permutation reset nonov_ins rc_begin rc_cnt_csn wcommit rc_cnt_post rc_commit
 
 # Non-overflow subxid insert path: RR keeps the row invisible after commit.
-permutation reset writer_register nonov_ins rr_writer_noov rr_begin rr_cnt_csn wcommit rr_cnt_csn rr_commit
+permutation reset nonov_ins rr_begin rr_cnt_csn wcommit rr_cnt_csn rr_commit
 
 # Non-overflow subxid update path: RC sees the committed update on the next statement.
-permutation reset writer_register nonov_upd rc_writer_noov rc_begin rc_val_csn wcommit rc_val_post rc_commit
+permutation reset nonov_upd rc_begin rc_val_csn wcommit rc_val_post rc_commit
 
-# Overflowed subxid tree: the writer advertises overflow before the reader
-# begins, so the snapshot must follow the legacy fallback path.
-permutation reset writer_register ov_begin rc_writer_ov ov_upd rc_begin rc_val_csn wcommit rc_val_post rc_commit
+# Overflowed subxid tree: the reader begins after enough savepoints to force
+# the legacy fallback path and therefore does not use `snapshot_csn`.
+permutation reset ov_begin ov_upd rc_begin rc_val_csn wcommit rc_val_post rc_commit
 
 # Overflowed subxid tree: RR starts after overflow has already been observed
 # and must keep the same snapshot semantics after commit.
-permutation reset writer_register ov_begin rr_writer_ov ov_upd rr_begin rr_val_csn wcommit rr_val_csn rr_commit
+permutation reset ov_begin ov_upd rr_begin rr_val_csn wcommit rr_val_csn rr_commit

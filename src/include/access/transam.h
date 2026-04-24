@@ -439,9 +439,14 @@ TransamAdvanceXactCompletionCount(void)
 {
 	uint64		completionCount;
 
-	completionCount = ++TransamVariables->xactCompletionCount;
-	pg_atomic_write_u64(&TransamVariables->xactCompletionCountShadow,
-						completionCount);
+	/*
+	 * H1-E ordinary commit can advance the shadow without holding
+	 * ProcArrayLock. Keep the shadow authoritative so legacy callers cannot
+	 * overwrite it from a stale embedded counter.
+	 */
+	completionCount =
+		pg_atomic_add_fetch_u64(&TransamVariables->xactCompletionCountShadow, 1);
+	TransamVariables->xactCompletionCount = completionCount;
 
 	return completionCount;
 }

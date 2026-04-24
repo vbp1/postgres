@@ -1,6 +1,7 @@
 # Stage 3 H1-C characterization: the general oldest-active-xid reader still
-# sees the ordinary xid while the writer is blocked before the legacy helper,
-# but no longer sees that xid once the writer is blocked after the helper.
+# sees the ordinary xid while the writer is blocked before ordinary completion
+# publication, and still sees the compatibility xid until cleanup runs after
+# publication.
 
 setup
 {
@@ -125,12 +126,12 @@ step o_after_capture
 	FROM csn_ordinary_oldest_active_xid_state
 	WHERE label = 'after';
 }
-step o_after_not_visible
+step o_after_visible
 {
-	SELECT injection_points_oldest_active_xid(false, false) <>
+	SELECT injection_points_oldest_active_xid(false, false) =
 		(SELECT fxid
 		 FROM csn_ordinary_oldest_active_xid_state
-		 WHERE label = 'after') AS after_not_seen_by_oldest_active_reader;
+		 WHERE label = 'after') AS after_seen_by_oldest_active_reader;
 }
 
 session ctl
@@ -140,4 +141,4 @@ step wake_after		{ SELECT injection_points_wakeup('ordinary-after-procarray-prim
 step detach_after	{ SELECT injection_points_detach('ordinary-after-procarray-primary'); }
 
 permutation reset wb_seed wb_prepare o_before_capture wb_commit o_before_visible wake_before(wb_commit) detach_before wb_unlock
-permutation reset wa_seed wa_prepare o_after_capture wa_commit o_after_not_visible wake_after(wa_commit) detach_after wa_unlock
+permutation reset wa_seed wa_prepare o_after_capture wa_commit o_after_visible wake_after(wa_commit) detach_after wa_unlock

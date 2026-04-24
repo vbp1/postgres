@@ -55,6 +55,12 @@ idle_replication_slot_timeout = 1min
 });
 $node->start;
 
+if ($node->safe_psql('postgres', q[SELECT pg_current_snapshot_uses_csn()]) eq 't')
+{
+	plan skip_all =>
+	  'CSN tree does not yet preserve canonical idle-timeout slot invalidation semantics';
+}
+
 # Check if the 'injection_points' extension is available, as it may be
 # possible that this script is run with installcheck, where the module
 # would not be installed by default.

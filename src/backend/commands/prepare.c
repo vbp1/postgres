@@ -189,6 +189,7 @@ ExecuteQuery(ParseState *pstate,
 	portal = CreateNewPortal();
 	/* Don't display the portal in pg_cursors, it is for internal use only */
 	portal->visible = false;
+	elog(LOG, "debug execute query: portal=%s visible=%d", portal->name, portal->visible);
 
 	/* Copy the plan's saved query string into the portal's memory */
 	query_string = MemoryContextStrdup(portal->portalContext,

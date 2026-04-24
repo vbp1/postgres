@@ -2,6 +2,11 @@
 # - s1: heap_update($FROM_SYSCACHE), without a snapshot or pin
 # - s2: ALTER TABLE making $FROM_SYSCACHE a dead tuple
 # - s3: "VACUUM pg_class" making $FROM_SYSCACHE become LP_UNUSED
+#
+# Stage 3/H1 ordinary commit publication happens after commit invalidations
+# are sent. While s2 is stopped at transaction-end-process-inval, its ProcArray
+# xid must still hold the pruning horizon, so the old stale-syscache pruning
+# race is unreachable until invalidations are released.
 
 # This is a derivative work of inplace.spec, which exercises the corresponding
 # race condition for inplace updates.
@@ -131,6 +136,14 @@ step r3		{ ROLLBACK; }
 
 # Non-blocking actions.
 session s4
+step cutoffblocked4	{
+	WITH barrier AS MATERIALIZED (
+		SELECT pg_current_xact_id() AS xid
+	)
+	SELECT removable_cutoff('pg_database') < xid
+		AS delayed_inval_holds_pruning
+	FROM barrier;
+}
 step waitprunable4	{ CALL vactest.wait_prunable(); }
 # Eliminate HEAPTUPLE_DEAD.  See above discussion of FREEZE.
 step vac4		{ VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) pg_class; }
@@ -163,22 +176,24 @@ step inspect4	{
 permutation
 	cachefill1			# reads pg_class tuple T0, xmax invalid
 	at2					# T0 dead, T1 live
-	waitprunable4		# T0 prunable
-	vac4				# T0 becomes LP_UNUSED
-	grant1				# pauses at heap_update(T0)
+	cutoffblocked4		# delayed inval holds pruning horizon
 	wakeinval4(at2)		# at2 sends inval message
-	wakegrant4(grant1)	# s1 wakes: "tuple concurrently deleted"
+	waitprunable4		# T0 prunable after invalidation
+	vac4				# T0 becomes LP_UNUSED
+	grant1				# pauses while updating the current catalog tuple
+	wakegrant4(grant1)	# s1 wakes after the stale-cache race is closed
 
 # add mkrels4: LP_UNUSED becomes a different rel's row
 permutation
 	cachefill1			# reads pg_class tuple T0, xmax invalid
 	at2					# T0 dead, T1 live
-	waitprunable4		# T0 prunable
-	vac4				# T0 becomes LP_UNUSED
-	grant1				# pauses at heap_update(T0)
+	cutoffblocked4		# delayed inval holds pruning horizon
 	wakeinval4(at2)		# at2 sends inval message
+	waitprunable4		# T0 prunable after invalidation
+	vac4				# T0 becomes LP_UNUSED
+	grant1				# pauses while updating the current catalog tuple
 	mkrels4				# T0 becomes a new rel
-	wakegrant4(grant1)	# s1 wakes: "duplicate key value violates unique"
+	wakegrant4(grant1)	# s1 wakes after the stale-cache race is closed
 
 # TID from syscache becomes LP_UNUSED, then becomes a newer version of the
 # original rel's row.
@@ -188,10 +203,11 @@ permutation
 	at2					# T0 dead, T1 live
 	mkrels4				# T1's page becomes full
 	r3					# clears MyProc->xmin
-	waitprunable4		# T0 prunable
-	vac4				# T0 becomes LP_UNUSED
-	grant1				# pauses at heap_update(T0)
+	cutoffblocked4		# delayed inval holds pruning horizon
 	wakeinval4(at2)		# at2 sends inval message
+	waitprunable4		# T0 prunable after invalidation
+	vac4				# T0 becomes LP_UNUSED
+	grant1				# pauses while updating the current catalog tuple
 	at4					# T1 dead, T0 live
-	wakegrant4(grant1)	# s1 wakes: T0 dead, T2 live
+	wakegrant4(grant1)	# s1 wakes after the stale-cache race is closed
 	inspect4			# observe loss of at2+at4 changes XXX is an extant bug

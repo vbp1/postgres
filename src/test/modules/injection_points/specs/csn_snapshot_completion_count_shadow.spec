@@ -1,6 +1,6 @@
-# Stage 3 H1-D characterization: the active query snapshot's
-# snapXactCompletionCount tracks the passive shadow across the ordinary
-# pre-helper and post-helper freeze-points.
+# Stage 3 H1-D characterization: the transaction snapshot's completion count
+# tracks the passive shadow-backed publication contract across the ordinary
+# pre-publication and post-publication freeze-points.
 
 setup
 {
@@ -41,30 +41,40 @@ step w_abort	{ ABORT; }
 session reader
 step r_before
 {
+	WITH counts AS (
+		SELECT injection_points_active_snapshot_xact_completion_count()
+				AS active_snapshot_count,
+			injection_points_transaction_snapshot_xact_completion_count()
+				AS txsnapshot_count,
+			injection_points_xact_completion_count_shadow()
+				AS shadow_count,
+			injection_points_xact_completion_count()
+				AS legacy_count
+	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
-		injection_points_active_snapshot_xact_completion_count()
-			AS snap_xact_completion_count,
-		injection_points_transaction_snapshot_xact_completion_count()
-			AS txsnap_xact_completion_count,
-		injection_points_xact_completion_count_shadow()
-			AS shadow_xact_completion_count,
-		injection_points_xact_completion_count()
-			AS legacy_xact_completion_count
-	FROM csn_snapshot_completion_count_shadow
+		active_snapshot_count = 0 AS active_snapshot_count_is_zero,
+		txsnapshot_count = shadow_count AS txsnapshot_matches_shadow,
+		legacy_count = shadow_count AS legacy_matches_shadow
+	FROM counts, csn_snapshot_completion_count_shadow
 	WHERE id = 1;
 }
 step r_after
 {
+	WITH counts AS (
+		SELECT injection_points_active_snapshot_xact_completion_count()
+				AS active_snapshot_count,
+			injection_points_transaction_snapshot_xact_completion_count()
+				AS txsnapshot_count,
+			injection_points_xact_completion_count_shadow()
+				AS shadow_count,
+			injection_points_xact_completion_count()
+				AS legacy_count
+	)
 	SELECT pg_current_snapshot_uses_csn() AS uses_csn,
-		injection_points_active_snapshot_xact_completion_count()
-			AS snap_xact_completion_count,
-		injection_points_transaction_snapshot_xact_completion_count()
-			AS txsnap_xact_completion_count,
-		injection_points_xact_completion_count_shadow()
-			AS shadow_xact_completion_count,
-		injection_points_xact_completion_count()
-			AS legacy_xact_completion_count
-	FROM csn_snapshot_completion_count_shadow
+		active_snapshot_count = 0 AS active_snapshot_count_is_zero,
+		txsnapshot_count = shadow_count AS txsnapshot_matches_shadow,
+		legacy_count = shadow_count AS legacy_matches_shadow
+	FROM counts, csn_snapshot_completion_count_shadow
 	WHERE id = 1;
 }
 

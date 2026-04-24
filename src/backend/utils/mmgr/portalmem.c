@@ -531,7 +531,13 @@ PortalDrop(Portal portal, bool isTopCommit)
 										portal->resowner);
 		portal->holdSnapshot = NULL;
 	}
-
+	if (portal->execSnapshot)
+	{
+		if (portal->resowner)
+			UnregisterSnapshotFromOwner(portal->execSnapshot,
+										portal->resowner);
+		portal->execSnapshot = NULL;
+	}
 	/*
 	 * Release any resources still attached to the portal.  There are several
 	 * cases being covered here:
@@ -636,15 +642,19 @@ PortalHashTableDeleteAll(void)
 static void
 HoldPortal(Portal portal)
 {
+	elog(LOG, "debug hold portal: HoldPortal start for \"%s\"", portal->name);
 	/*
 	 * Note that PersistHoldablePortal() must release all resources used by
 	 * the portal that are local to the creating transaction.
 	 */
 	PortalCreateHoldStore(portal);
+	elog(LOG, "debug hold portal: hold store created for \"%s\"", portal->name);
 	PersistHoldablePortal(portal);
+	elog(LOG, "debug hold portal: persisted for \"%s\"", portal->name);
 
 	/* drop cached plan reference, if any */
 	PortalReleaseCachedPlan(portal);
+	elog(LOG, "debug hold portal: cached plan released for \"%s\"", portal->name);
 
 	/*
 	 * Any resources belonging to the portal will be released in the upcoming
@@ -652,6 +662,7 @@ HoldPortal(Portal portal)
 	 * resources.
 	 */
 	portal->resowner = NULL;
+	elog(LOG, "debug hold portal: resowner cleared for \"%s\"", portal->name);
 
 	/*
 	 * Having successfully exported the holdable cursor, mark it as not
@@ -660,6 +671,7 @@ HoldPortal(Portal portal)
 	portal->createSubid = InvalidSubTransactionId;
 	portal->activeSubid = InvalidSubTransactionId;
 	portal->createLevel = 0;
+	elog(LOG, "debug hold portal: HoldPortal done for \"%s\"", portal->name);
 }
 
 /*
@@ -713,6 +725,13 @@ PreCommit_Portals(bool isPrepare)
 					UnregisterSnapshotFromOwner(portal->holdSnapshot,
 												portal->resowner);
 				portal->holdSnapshot = NULL;
+			}
+			if (portal->execSnapshot)
+			{
+				if (portal->resowner)
+					UnregisterSnapshotFromOwner(portal->execSnapshot,
+												portal->resowner);
+				portal->execSnapshot = NULL;
 			}
 			portal->resowner = NULL;
 			/* Clear portalSnapshot too, for cleanliness */
@@ -1156,6 +1175,9 @@ pg_cursor(PG_FUNCTION_ARGS)
 		if (!portal->sourceText)
 			continue;
 
+		elog(LOG, "debug pg_cursor: portal=%s visible=%d source=%s",
+			 portal->name, portal->visible, portal->sourceText);
+
 		values[0] = CStringGetTextDatum(portal->name);
 		values[1] = CStringGetTextDatum(portal->sourceText);
 		values[2] = BoolGetDatum(portal->cursorOptions & CURSOR_OPT_HOLD);
@@ -1273,6 +1295,13 @@ ForgetPortalSnapshots(void)
 		{
 			portal->portalSnapshot = NULL;
 			numPortalSnaps++;
+		}
+		if (portal->execSnapshot != NULL)
+		{
+			if (portal->resowner)
+				UnregisterSnapshotFromOwner(portal->execSnapshot,
+											portal->resowner);
+			portal->execSnapshot = NULL;
 		}
 		/* portal->holdSnapshot will be cleaned up in PreCommit_Portals */
 	}

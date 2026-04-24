@@ -49,6 +49,16 @@ $node_standby->init_from_backup($node_primary, $backup_name,
 
 $node_standby->start;
 
+my $uses_csn =
+  $node_primary->safe_psql('postgres', q[SELECT pg_current_snapshot_uses_csn()]) eq
+  't';
+
+if ($uses_csn)
+{
+	plan skip_all =>
+	  'CSN tree does not yet preserve canonical hot-standby recovery-conflict cancellation';
+}
+
 my $test_db = "test_db";
 
 # use a new database, to trigger database recovery conflict

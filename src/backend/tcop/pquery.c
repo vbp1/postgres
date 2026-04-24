@@ -439,6 +439,7 @@ PortalStart(Portal portal, ParamListInfo params,
 
 	Assert(PortalIsValid(portal));
 	Assert(portal->status == PORTAL_DEFINED);
+	Assert(portal->execSnapshot == NULL);
 
 	/*
 	 * Set up global portal context pointers.
@@ -535,7 +536,9 @@ PortalStart(Portal portal, ParamListInfo params,
 
 			case PORTAL_ONE_RETURNING:
 			case PORTAL_ONE_MOD_WITH:
-
+				if (snapshot)
+					portal->execSnapshot =
+						RegisterSnapshotOnOwner(snapshot, portal->resowner);
 				/*
 				 * We don't start the executor until we are told to run the
 				 * portal.  We do need to set up the result tupdesc.
@@ -557,7 +560,9 @@ PortalStart(Portal portal, ParamListInfo params,
 				break;
 
 			case PORTAL_UTIL_SELECT:
-
+				if (snapshot)
+					portal->execSnapshot =
+						RegisterSnapshotOnOwner(snapshot, portal->resowner);
 				/*
 				 * We don't set snapshot here, because PortalRunUtility will
 				 * take care of it if needed.
@@ -578,6 +583,23 @@ PortalStart(Portal portal, ParamListInfo params,
 				break;
 
 			case PORTAL_MULTI_QUERY:
+				if (snapshot)
+				{
+					ListCell   *lc;
+
+					foreach(lc, portal->stmts)
+					{
+						PlannedStmt *pstmt = lfirst_node(PlannedStmt, lc);
+
+						if (pstmt->utilityStmt == NULL)
+						{
+							portal->execSnapshot =
+								RegisterSnapshotOnOwner(snapshot,
+													 portal->resowner);
+							break;
+						}
+					}
+				}
 				/* Need do nothing now */
 				portal->tupDesc = NULL;
 				break;
@@ -1124,7 +1146,17 @@ PortalRunUtility(Portal portal, PlannedStmt *pstmt,
 	 */
 	if (PlannedStmtRequiresSnapshot(pstmt))
 	{
-		Snapshot	snapshot = GetTransactionSnapshot();
+		Snapshot	snapshot;
+
+		/*
+		 * Utility execution must see up-to-date same-backend catalog state.
+		 * Reusing the outer execution seed here hides freshly committed DDL
+		 * from follow-on utility statements, and DECLARE CURSOR also manages a
+		 * separate cursor portal lifecycle of its own. Acquire a fresh
+		 * per-statement transaction snapshot instead of reusing any portal
+		 * execution seed.
+		 */
+		snapshot = GetTransactionSnapshot();
 
 		/* If told to, register the snapshot we're using and save in portal */
 		if (setHoldSnapshot)
@@ -1233,7 +1265,12 @@ PortalRunMulti(Portal portal,
 			 */
 			if (!active_snapshot_set)
 			{
-				Snapshot	snapshot = GetTransactionSnapshot();
+				Snapshot	snapshot;
+
+				if (portal->execSnapshot != NULL)
+					snapshot = portal->execSnapshot;
+				else
+					snapshot = GetTransactionSnapshot();
 
 				/* If told to, register the snapshot and save in portal */
 				if (setHoldSnapshot)
@@ -1782,7 +1819,10 @@ EnsurePortalSnapshotExists(void)
 	 * that the snapshot belongs to the portal's transaction level, else we
 	 * risk portalSnapshot becoming a dangling pointer.
 	 */
-	PushActiveSnapshotWithLevel(GetTransactionSnapshot(), portal->createLevel);
+	if (portal->execSnapshot != NULL)
+		PushActiveSnapshotWithLevel(portal->execSnapshot, portal->createLevel);
+	else
+		PushActiveSnapshotWithLevel(GetTransactionSnapshot(), portal->createLevel);
 	/* PushActiveSnapshotWithLevel might have copied the snapshot */
 	portal->portalSnapshot = GetActiveSnapshot();
 }

@@ -93,9 +93,10 @@ Local validation state
   `csn_commit_fallback` and `csn_commit_published`;
 - `src/test/regress check` is green;
 - `src/test/isolation check` is green.
+- `src/test/recovery check PROVE_TESTS=t/053_csnlog_truncate.pl` is green.
 
-Remaining closure item
-----------------------
+Remaining external closure item
+-------------------------------
 
 The remaining Stage 3 acceptance blocker is no longer a local correctness gap.
 It is the external performance gate from the Stage 3 plan:

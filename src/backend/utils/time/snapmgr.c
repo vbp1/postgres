@@ -149,6 +149,9 @@ SnapshotData SnapshotToastData = {SNAPSHOT_TOAST};
 static Snapshot CurrentSnapshot = NULL;
 static Snapshot SecondarySnapshot = NULL;
 static Snapshot CatalogSnapshot = NULL;
+static bool ForceSnapshotFallback = false;
+static bool ForceSnapshotFallbackSticky = false;
+static bool ForceSnapshotFallbackFromTempNamespace = false;
 static Snapshot HistoricSnapshot = NULL;
 
 /*
@@ -334,6 +337,7 @@ GetTransactionSnapshot(void)
 			CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
 
 		FirstSnapshotSet = true;
+		SnapMgrConsumeSnapshotFallback();
 		return CurrentSnapshot;
 	}
 
@@ -344,6 +348,7 @@ GetTransactionSnapshot(void)
 	InvalidateCatalogSnapshot();
 
 	CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+	SnapMgrConsumeSnapshotFallback();
 
 	return CurrentSnapshot;
 }
@@ -375,8 +380,50 @@ GetLatestSnapshot(void)
 		return GetTransactionSnapshot();
 
 	SecondarySnapshot = GetSnapshotData(&SecondarySnapshotData);
+	SnapMgrConsumeSnapshotFallback();
 
 	return SecondarySnapshot;
+}
+
+bool
+SnapMgrShouldForceSnapshotFallback(void)
+{
+	return ForceSnapshotFallback;
+}
+
+bool
+SnapMgrShouldPreserveSnapshotFallbackForExplicitBegin(void)
+{
+	return ForceSnapshotFallbackFromTempNamespace;
+}
+
+void
+SnapMgrForceSnapshotFallback(void)
+{
+	ForceSnapshotFallback = true;
+}
+
+void
+SnapMgrForceSnapshotFallbackSticky(void)
+{
+	ForceSnapshotFallback = true;
+	ForceSnapshotFallbackSticky = true;
+}
+
+void
+SnapMgrReleaseSnapshotFallbackSticky(void)
+{
+	ForceSnapshotFallbackSticky = false;
+}
+
+void
+SnapMgrConsumeSnapshotFallback(void)
+{
+	if (ForceSnapshotFallbackSticky)
+		return;
+
+	ForceSnapshotFallback = false;
+	ForceSnapshotFallbackFromTempNamespace = false;
 }
 
 /*
@@ -599,6 +646,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 	}
 
 	FirstSnapshotSet = true;
+	SnapMgrConsumeSnapshotFallback();
 }
 
 /*
@@ -1021,7 +1069,7 @@ AtSubAbort_Snapshot(int level)
  *		Snapshot manager's cleanup function for end of transaction
  */
 void
-AtEOXact_Snapshot(bool isCommit, bool resetXmin)
+AtEOXact_Snapshot(bool isCommit, bool resetXmin, bool resetReuse)
 {
 	/*
 	 * In transaction-snapshot mode we must release our privately-managed
@@ -1100,6 +1148,28 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 	SecondarySnapshot = NULL;
 
 	FirstSnapshotSet = false;
+
+	/*
+	 * Rebuild static snapshots across every top-level transaction boundary so
+	 * the next statement cannot reuse the previous transaction's backend-
+	 * local image. Temp-object activity remains a separate reason to keep the
+	 * successor statement on the conservative fallback path, but ordinary
+	 * successors should otherwise return to the regular snapshot-selection
+	 * path.
+	 */
+	CurrentSnapshotData.snapXactCompletionCount = 0;
+	SecondarySnapshotData.snapXactCompletionCount = 0;
+
+	if (resetReuse || (MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE) != 0)
+	{
+		CurrentSnapshotData.snapshot_csn = InvalidCommitSeqNo;
+		SecondarySnapshotData.snapshot_csn = InvalidCommitSeqNo;
+	}
+
+	ForceSnapshotFallbackSticky = false;
+	ForceSnapshotFallbackFromTempNamespace =
+		(MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE) != 0;
+	ForceSnapshotFallback = ForceSnapshotFallbackFromTempNamespace;
 
 	/*
 	 * During normal commit processing, the ordinary primary path clears

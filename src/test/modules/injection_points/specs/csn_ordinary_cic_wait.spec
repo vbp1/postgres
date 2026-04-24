@@ -1,6 +1,6 @@
 # Stage 3 H1-B characterization: CREATE INDEX CONCURRENTLY still waits for an
-# ordinary snapshot holder blocked before ProcArrayEndTransactionPrimary(), but
-# no longer waits once that helper has returned and xmin has been cleared.
+# ordinary snapshot holder blocked before ordinary completion publication, and
+# still waits while compatibility cleanup is pending after publication.
 
 setup
 {
@@ -62,10 +62,9 @@ step wake_after		{ SELECT injection_points_wakeup('ordinary-after-procarray-prim
 step detach_after	{ SELECT injection_points_detach('ordinary-after-procarray-primary'); }
 
 # WaitForOlderSnapshots still sees the repeatable-read backend while it is
-# blocked before the ordinary ProcArray cleanup helper clears xmin.
+# blocked before ordinary completion publication.
 permutation reset hb_begin hb_commit cic_before(*) wake_before(hb_commit) detach_before
 
-# Once the helper has returned and xmin is gone, CREATE INDEX CONCURRENTLY no
-# longer waits for the same backend even though backend-local cleanup still
-# has not finished.
-permutation reset ha_begin ha_commit cic_after wake_after(ha_commit) detach_after
+# After publication but before backend-local compatibility cleanup, CREATE
+# INDEX CONCURRENTLY still waits for the same backend.
+permutation reset ha_begin ha_commit cic_after(*) wake_after(ha_commit) detach_after

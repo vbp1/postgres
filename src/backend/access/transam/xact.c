@@ -2462,19 +2462,6 @@ CommitTransaction(void)
 	TRACE_POSTGRESQL_TRANSACTION_COMMIT(MyProc->vxid.lxid);
 
 	/*
-	 * Let others know about no transaction in progress by me. Note that this
-	 * must be done _before_ releasing locks we hold and _after_
-	 * RecordTransactionCommit.
-	 */
-	ProcArrayEndTransactionPrimary(MyProc, latestXid);
-	/* Test-only hook for the H1-B completion-visible but not reusable window. */
-	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
-	MyProc->vxid.lxid = InvalidLocalTransactionId;
-	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
-	/* Test-only hook for the H1-B post-vxid-clear, pre-reuse window. */
-	INJECTION_POINT("ordinary-after-vxid-clear", NULL);
-
-	/*
 	 * This is all post-commit cleanup.  Note that if an error is raised here,
 	 * it's too late to abort the transaction.  This should be just
 	 * noncritical resource releasing.
@@ -2518,6 +2505,30 @@ CommitTransaction(void)
 	 */
 	AtEOXact_Inval(true);
 
+	/*
+	 * Let others know about no transaction in progress by me only after
+	 * catalog invalidation messages are made visible, but still before
+	 * releasing locks. This preserves the lock-free ordinary path while
+	 * avoiding a window where concurrent backends can treat catalog-changing
+	 * transactions as finished before receiving their invalidation traffic.
+	 */
+	ProcArrayEndTransactionPrimary(MyProc, latestXid);
+	/* Test-only hook for the H1-B completion-visible but not reusable window. */
+	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
+	MyProc->vxid.lxid = InvalidLocalTransactionId;
+	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
+	ProcArrayEndTransactionPrimaryCleanup(MyProc);
+	/*
+	 * The next top-level transaction in the same backend can begin
+	 * immediately after this function returns. Make the ordinary finish
+	 * publication and the preceding commit-status/cache-invalidation writes
+	 * globally ordered before that successor transaction starts reading
+	 * visibility state.
+	 */
+	pg_memory_barrier();
+	/* Test-only hook for the H1-B post-vxid-clear, pre-reuse window. */
+	INJECTION_POINT("ordinary-after-vxid-clear", NULL);
+
 	AtEOXact_MultiXact();
 
 	ResourceOwnerRelease(TopTransactionResourceOwner,
@@ -2559,7 +2570,8 @@ CommitTransaction(void)
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
 	AtEOXact_PgStat(true, is_parallel_worker);
-	AtEOXact_Snapshot(true, false);
+	AtEOXact_Snapshot(true, false,
+					  !TransactionIdIsValid(latestXid));
 	AtEOXact_ApplyLauncher(true);
 	AtEOXact_LogicalRepWorkers(true);
 	AtEOXact_LogicalCtl();
@@ -2854,7 +2866,7 @@ PrepareTransaction(void)
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
 	/* don't call AtEOXact_PgStat here; we fixed pgstat state above */
-	AtEOXact_Snapshot(true, true);
+	AtEOXact_Snapshot(true, true, false);
 	/* we treat PREPARE as ROLLBACK so far as waking workers goes */
 	AtEOXact_ApplyLauncher(false);
 	AtEOXact_LogicalRepWorkers(false);
@@ -3039,22 +3051,10 @@ AbortTransaction(void)
 	TRACE_POSTGRESQL_TRANSACTION_ABORT(MyProc->vxid.lxid);
 
 	/*
-	 * Let others know about no transaction in progress by me. Note that this
-	 * must be done _before_ releasing locks we hold and _after_
-	 * RecordTransactionAbort.
-	 */
-	ProcArrayEndTransactionPrimary(MyProc, latestXid);
-	/* Test-only hook for the H1-B completion-visible but not reusable window. */
-	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
-	MyProc->vxid.lxid = InvalidLocalTransactionId;
-	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
-	/* Test-only hook for the H1-B post-vxid-clear, pre-reuse window. */
-	INJECTION_POINT("ordinary-after-vxid-clear", NULL);
-
-	/*
 	 * Post-abort cleanup.  See notes in CommitTransaction() concerning
-	 * ordering.  We can skip all of it if the transaction failed before
-	 * creating a resource owner.
+	 * ordering.  We can skip most of it if the transaction failed before
+	 * creating a resource owner, but the ordinary primary completion
+	 * publication still has to happen before we finish the abort path.
 	 */
 	if (TopTransactionResourceOwner != NULL)
 	{
@@ -3071,6 +3071,7 @@ AbortTransaction(void)
 		AtEOXact_RelationCache(false);
 		AtEOXact_TypeCache();
 		AtEOXact_Inval(false);
+
 		AtEOXact_MultiXact();
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_LOCKS,
@@ -3097,6 +3098,21 @@ AbortTransaction(void)
 	}
 
 	/*
+	 * As on commit, keep the ordinary primary completion publication after
+	 * cache invalidation state is settled when possible, but always before
+	 * leaving the abort path.
+	 */
+	ProcArrayEndTransactionPrimary(MyProc, latestXid);
+	/* Test-only hook for the H1-B completion-visible but not reusable window. */
+	INJECTION_POINT("ordinary-after-procarray-primary", NULL);
+	MyProc->vxid.lxid = InvalidLocalTransactionId;
+	ProcArrayClearCSNSnapshotSafeToIgnore(MyProc);
+	ProcArrayEndTransactionPrimaryCleanup(MyProc);
+	pg_memory_barrier();
+	/* Test-only hook for the H1-B post-vxid-clear, pre-reuse window. */
+	INJECTION_POINT("ordinary-after-vxid-clear", NULL);
+
+	/*
 	 * State remains TRANS_ABORT until CleanupTransaction().
 	 */
 	RESUME_INTERRUPTS();
@@ -3121,7 +3137,7 @@ CleanupTransaction(void)
 	 * do abort cleanup processing
 	 */
 	AtCleanup_Portals();		/* now safe to release portal memory */
-	AtEOXact_Snapshot(false, true); /* and release the transaction's snapshots */
+	AtEOXact_Snapshot(false, true, false); /* and release the transaction's snapshots */
 
 	CurrentResourceOwner = NULL;	/* and resource owner */
 	if (TopTransactionResourceOwner)
@@ -4032,6 +4048,18 @@ BeginTransactionBlock(void)
 			 * We are not inside a transaction block, so allow one to begin.
 			 */
 		case TBLOCK_STARTED:
+			/*
+			 * Stage 3/H1 keeps a one-shot fallback marker for the next
+			 * successor snapshot after ordinary finish. An explicit BEGIN
+			 * starts a regular transaction block whose first statement should
+			 * normally use the regular CSN-capable path rather than inheriting
+			 * an autocommit-only ordinary-successor fallback. However, after a
+			 * transaction touched temp namespace state we still need the next
+			 * explicit-block snapshot to stay on the conservative fallback
+			 * path until that reason is consumed by snapshot acquisition.
+			 */
+			if (!SnapMgrShouldPreserveSnapshotFallbackForExplicitBegin())
+				SnapMgrConsumeSnapshotFallback();
 			s->blockState = TBLOCK_BEGIN;
 			break;
 
@@ -4041,6 +4069,8 @@ BeginTransactionBlock(void)
 			 * commands, which is a bit odd but matches historical practice.)
 			 */
 		case TBLOCK_IMPLICIT_INPROGRESS:
+			if (!SnapMgrShouldPreserveSnapshotFallbackForExplicitBegin())
+				SnapMgrConsumeSnapshotFallback();
 			s->blockState = TBLOCK_BEGIN;
 			break;
 
