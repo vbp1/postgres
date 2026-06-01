@@ -1,0 +1,109 @@
+Parsed test spec with 4 sessions
+
+starting permutation: reset w_begin_commit w_commit r_count r_val detach
+step reset: 
+	UPDATE csn_ordinary_lock_count SET val = 0 WHERE id = 1;
+
+step w_begin_commit: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-lock', 'count');
+	SELECT injection_points_get_count('ordinary-before-procarray-lock');
+	UPDATE csn_ordinary_lock_count SET val = 1 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_get_count
+--------------------------
+                         0
+(1 row)
+
+step w_commit: COMMIT;
+step r_count: 
+	SELECT injection_points_get_count('ordinary-before-procarray-lock');
+
+injection_points_get_count
+--------------------------
+                         0
+(1 row)
+
+step r_val: 
+	SELECT val
+	FROM csn_ordinary_lock_count
+	WHERE id = 1;
+
+val
+---
+  1
+(1 row)
+
+step detach: 
+	SELECT injection_points_detach('ordinary-before-procarray-lock');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: reset w_begin_abort w_abort r_count r_val detach
+step reset: 
+	UPDATE csn_ordinary_lock_count SET val = 0 WHERE id = 1;
+
+step w_begin_abort: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-lock', 'count');
+	SELECT injection_points_get_count('ordinary-before-procarray-lock');
+	UPDATE csn_ordinary_lock_count SET val = 2 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_get_count
+--------------------------
+                         0
+(1 row)
+
+step w_abort: ABORT;
+step r_count: 
+	SELECT injection_points_get_count('ordinary-before-procarray-lock');
+
+injection_points_get_count
+--------------------------
+                         0
+(1 row)
+
+step r_val: 
+	SELECT val
+	FROM csn_ordinary_lock_count
+	WHERE id = 1;
+
+val
+---
+  0
+(1 row)
+
+step detach: 
+	SELECT injection_points_detach('ordinary-before-procarray-lock');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

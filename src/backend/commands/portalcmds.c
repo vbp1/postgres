@@ -338,6 +338,8 @@ PersistHoldablePortal(Portal portal)
 	 */
 	Assert(portal->createSubid != InvalidSubTransactionId);
 	Assert(queryDesc != NULL);
+	elog(LOG, "debug hold portal: PersistHoldablePortal entry for \"%s\"",
+		 portal->name);
 
 	/*
 	 * Caller must have created the tuplestore already ... but not a snapshot.
@@ -379,6 +381,8 @@ PersistHoldablePortal(Portal portal)
 		MemoryContextSwitchTo(PortalContext);
 
 		PushActiveSnapshot(queryDesc->snapshot);
+		elog(LOG, "debug hold portal: active snapshot pushed for \"%s\"",
+			 portal->name);
 
 		/*
 		 * If the portal is marked scrollable, we need to store the entire
@@ -429,6 +433,8 @@ PersistHoldablePortal(Portal portal)
 
 		/* Fetch the result set into the tuplestore */
 		ExecutorRun(queryDesc, direction, 0);
+		elog(LOG, "debug hold portal: executor run finished for \"%s\"",
+			 portal->name);
 
 		queryDesc->dest->rDestroy(queryDesc->dest);
 		queryDesc->dest = NULL;
@@ -440,6 +446,8 @@ PersistHoldablePortal(Portal portal)
 		ExecutorFinish(queryDesc);
 		ExecutorEnd(queryDesc);
 		FreeQueryDesc(queryDesc);
+		elog(LOG, "debug hold portal: querydesc freed for \"%s\"",
+			 portal->name);
 
 		/*
 		 * Set the position in the result set.
@@ -490,6 +498,8 @@ PersistHoldablePortal(Portal portal)
 
 	/* Mark portal not active */
 	portal->status = PORTAL_READY;
+	elog(LOG, "debug hold portal: PersistHoldablePortal finished for \"%s\"",
+		 portal->name);
 
 	ActivePortal = saveActivePortal;
 	CurrentResourceOwner = saveResourceOwner;

@@ -13,6 +13,7 @@
 #ifndef SNAPSHOT_H
 #define SNAPSHOT_H
 
+#include "access/transam.h"
 #include "lib/pairingheap.h"
 
 
@@ -207,6 +208,13 @@ typedef struct SnapshotData
 	 * transactions completed since the last GetSnapshotData().
 	 */
 	uint64		snapXactCompletionCount;
+
+	/*
+	 * Prototype CSN visibility boundary for primary MVCC snapshots. An
+	 * invalid value means that callers must stay on legacy xid-array
+	 * semantics for this snapshot shape.
+	 */
+	CommitSeqNo snapshot_csn;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */

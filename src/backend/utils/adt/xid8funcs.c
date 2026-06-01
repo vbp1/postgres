@@ -26,6 +26,7 @@
 
 #include "postgres.h"
 
+#include "access/clog.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "funcapi.h"
@@ -413,6 +414,23 @@ pg_current_snapshot(PG_FUNCTION_ARGS)
 }
 
 /*
+ * pg_current_snapshot_uses_csn() returns bool
+ *
+ *		Return true if the active MVCC snapshot carries a valid CSN boundary.
+ */
+Datum
+pg_current_snapshot_uses_csn(PG_FUNCTION_ARGS)
+{
+	Snapshot	cur;
+
+	cur = GetActiveSnapshot();
+	if (cur == NULL)
+		elog(ERROR, "no active snapshot set");
+
+	PG_RETURN_BOOL(SnapshotUsesCSN(cur));
+}
+
+/*
  * pg_snapshot_in(cstring) returns pg_snapshot
  *
  *		input function for type pg_snapshot
@@ -640,42 +658,94 @@ pg_snapshot_xip(PG_FUNCTION_ARGS)
 Datum
 pg_xact_status(PG_FUNCTION_ARGS)
 {
-	const char *status;
+	const char *status = NULL;
 	FullTransactionId fxid = PG_GETARG_FULLTRANSACTIONID(0);
+	TransactionCSNStatus xidstatus;
 	TransactionId xid;
+	XidStatus	clogstatus;
+	XLogRecPtr	ignored;
+	bool		use_csn_fallback = false;
+	bool		unresolved_history = false;
 
 	/*
-	 * We must protect against concurrent truncation of clog entries to avoid
-	 * an I/O error on SLRU lookup.
+	 * We must validate the xid range while holding XactTruncationLock so
+	 * future xids still error out consistently. While clog history is still
+	 * retained, keep using the direct xid status so committed subxacts report
+	 * their own status. Once clog has forgotten the xid, fall back to the
+	 * CSN-aware path so forgotten committed xids can degrade to NULL instead
+	 * of being misreported as aborted.
 	 */
 	LWLockAcquire(XactTruncationLock, LW_SHARED);
 	if (TransactionIdInRecentPast(fxid, &xid))
 	{
 		Assert(TransactionIdIsValid(xid));
-
-		/*
-		 * Like when doing visibility checks on a row, check whether the
-		 * transaction is still in progress before looking into the CLOG.
-		 * Otherwise we would incorrectly return "committed" for a transaction
-		 * that is committing and has already updated the CLOG, but hasn't
-		 * removed its XID from the proc array yet. (See comment on that race
-		 * condition at the top of heapam_visibility.c)
-		 */
 		if (TransactionIdIsInProgress(xid))
+		{
+			LWLockRelease(XactTruncationLock);
 			status = "in progress";
-		else if (TransactionIdDidCommit(xid))
-			status = "committed";
+		}
+		else if (!TransactionIdPrecedes(xid, TransamVariables->oldestClogXid))
+		{
+			clogstatus = TransactionIdGetStatus(xid, &ignored);
+			LWLockRelease(XactTruncationLock);
+
+			switch (clogstatus)
+			{
+				case TRANSACTION_STATUS_IN_PROGRESS:
+					use_csn_fallback = true;
+					unresolved_history = true;
+					break;
+
+				case TRANSACTION_STATUS_COMMITTED:
+				case TRANSACTION_STATUS_SUB_COMMITTED:
+					status = "committed";
+					break;
+
+				case TRANSACTION_STATUS_ABORTED:
+					status = "aborted";
+					break;
+
+				default:
+					elog(ERROR, "unrecognized transaction status %u",
+						 clogstatus);
+			}
+		}
 		else
 		{
-			/* it must have aborted or crashed */
-			status = "aborted";
+			LWLockRelease(XactTruncationLock);
+			use_csn_fallback = true;
+			unresolved_history = true;
+		}
+
+		if (use_csn_fallback)
+		{
+			xidstatus = TransactionIdGetCSNStatus(xid, NULL);
+
+			switch (xidstatus)
+			{
+				case TRANSACTION_CSN_STATUS_IN_PROGRESS:
+				case TRANSACTION_CSN_STATUS_COMMITTING:
+					status = unresolved_history ? NULL : "in progress";
+					break;
+
+				case TRANSACTION_CSN_STATUS_COMMITTED:
+					status = "committed";
+					break;
+
+				case TRANSACTION_CSN_STATUS_ABORTED:
+					status = "aborted";
+					break;
+
+				case TRANSACTION_CSN_STATUS_INVALID:
+					status = NULL;
+					break;
+			}
 		}
 	}
 	else
 	{
-		status = NULL;
+		LWLockRelease(XactTruncationLock);
 	}
-	LWLockRelease(XactTruncationLock);
 
 	if (status == NULL)
 		PG_RETURN_NULL();

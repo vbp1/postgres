@@ -15,8 +15,9 @@
 #define TRANSAM_H
 
 #include "access/xlogdefs.h"
-
-
+#ifndef FRONTEND
+#include "port/atomics.h"
+#endif
 /* ----------------
  *		Special transaction ID values
  *
@@ -85,6 +86,84 @@ FullTransactionIdFromU64(uint64 value)
 	result.value = value;
 
 	return result;
+}
+
+/*
+ * Commit sequence numbers for the Stage 1 CSN prototype.
+ *
+ * Zeroed SLRU pages must read as InvalidCommitSeqNo, and FrozenCommitSeqNo is
+ * ordered before every normal CSN.  The upper part of the range is reserved
+ * for transient states and a prototype subtransaction-parent encoding, so
+ * normal committed CSNs stay dense and monotonic.
+ */
+typedef uint64 CommitSeqNo;
+
+#define InvalidCommitSeqNo		((CommitSeqNo) 0)
+#define FrozenCommitSeqNo		((CommitSeqNo) 1)
+#define FirstNormalCommitSeqNo	((CommitSeqNo) 2)
+#define FirstSubTransParentCommitSeqNo ((CommitSeqNo) UINT64CONST(0xFFFF000000000000))
+#define LastSubTransParentCommitSeqNo	((CommitSeqNo) UINT64CONST(0xFFFF0000FFFFFFFF))
+#define MaxNormalCommitSeqNo	((CommitSeqNo) (FirstSubTransParentCommitSeqNo - 1))
+#define CommittingCommitSeqNo	((CommitSeqNo) (PG_UINT64_MAX - 2))
+#define InProgressCommitSeqNo	((CommitSeqNo) (PG_UINT64_MAX - 1))
+#define AbortedCommitSeqNo		((CommitSeqNo) PG_UINT64_MAX)
+
+#define CommitSeqNoIsValid(csn)		((csn) != InvalidCommitSeqNo)
+#define CommitSeqNoIsFrozen(csn)	((csn) == FrozenCommitSeqNo)
+#define CommitSeqNoIsNormal(csn) \
+	((csn) >= FirstNormalCommitSeqNo && (csn) <= MaxNormalCommitSeqNo)
+#define CommitSeqNoIsSubTransParent(csn) \
+	((csn) >= FirstSubTransParentCommitSeqNo && \
+	 (csn) <= LastSubTransParentCommitSeqNo)
+#define CommitSeqNoIsCommitting(csn)	((csn) == CommittingCommitSeqNo)
+#define CommitSeqNoIsInProgress(csn)	((csn) == InProgressCommitSeqNo)
+#define CommitSeqNoIsAborted(csn)		((csn) == AbortedCommitSeqNo)
+#define CommitSeqNoIsCommitted(csn) \
+	(CommitSeqNoIsFrozen(csn) || CommitSeqNoIsNormal(csn))
+#define CommitSeqNoIsSpecial(csn)		(!CommitSeqNoIsNormal(csn))
+
+static inline CommitSeqNo
+CommitSeqNoFromSubTransParent(TransactionId xid)
+{
+	Assert(TransactionIdIsNormal(xid));
+
+	return FirstSubTransParentCommitSeqNo | xid;
+}
+
+static inline TransactionId
+TransactionIdFromCommitSeqNoParent(CommitSeqNo csn)
+{
+	Assert(CommitSeqNoIsSubTransParent(csn));
+
+	return (TransactionId) csn;
+}
+
+static inline void
+CommitSeqNoAdvance(CommitSeqNo *dest)
+{
+	Assert(dest != NULL);
+	Assert(CommitSeqNoIsNormal(*dest));
+	Assert(*dest < MaxNormalCommitSeqNo);
+
+	(*dest)++;
+}
+
+static inline bool
+CommitSeqNoPrecedes(CommitSeqNo csn1, CommitSeqNo csn2)
+{
+	Assert(CommitSeqNoIsNormal(csn1));
+	Assert(CommitSeqNoIsNormal(csn2));
+
+	return csn1 < csn2;
+}
+
+static inline bool
+CommitSeqNoPrecedesOrEquals(CommitSeqNo csn1, CommitSeqNo csn2)
+{
+	Assert(CommitSeqNoIsNormal(csn1));
+	Assert(CommitSeqNoIsNormal(csn2));
+
+	return csn1 <= csn2;
 }
 
 /* advance a transaction ID variable, handling wraparound correctly */
@@ -218,6 +297,7 @@ typedef struct TransamVariablesData
 	 * These fields are protected by XidGenLock.
 	 */
 	FullTransactionId nextXid;	/* next XID to assign */
+	CommitSeqNo nextCommitSeqNo;	/* next CSN to assign */
 
 	TransactionId oldestXid;	/* cluster-wide minimum datfrozenxid */
 	TransactionId xidVacLimit;	/* start forcing autovacuums here */
@@ -246,10 +326,25 @@ typedef struct TransamVariablesData
 	 * not. There are likely other users of this.  Always above 1.
 	 */
 	uint64		xactCompletionCount;
+#ifndef FRONTEND
+	pg_atomic_uint64 xactCompletionCountShadow;	/* H1-D passive shadow;
+												 * legacy field remains
+												 * authoritative */
+#else
+	uint64		xactCompletionCountShadow;
+#endif
+
+	/*
+	 * Prototype-owned CSN runtime bookkeeping lower bound.  This does not
+	 * replace existing procarray, GlobalVis, or nonremovable horizon
+	 * machinery.
+	 */
+	TransactionId csnOldestActiveXid;
 
 	/*
 	 * These fields are protected by XactTruncationLock
 	 */
+	TransactionId oldestCsnlogXid;	/* oldest xid still retained in csnlog */
 	TransactionId oldestClogXid;	/* oldest it's safe to look up in clog */
 
 } TransamVariablesData;
@@ -332,6 +427,47 @@ extern bool TransactionStartedDuringRecovery(void);
 /* in transam/varsup.c */
 extern PGDLLIMPORT TransamVariablesData *TransamVariables;
 
+#ifndef FRONTEND
+static inline void
+TransamInitXactCompletionCountShadow(uint64 completionCount)
+{
+	pg_atomic_init_u64(&TransamVariables->xactCompletionCountShadow,
+					   completionCount);
+}
+
+static inline uint64
+TransamReadXactCompletionCountShadow(void)
+{
+	return pg_atomic_read_u64(&TransamVariables->xactCompletionCountShadow);
+}
+
+static inline uint64
+TransamAdvanceXactCompletionCount(void)
+{
+	uint64		completionCount;
+
+	/*
+	 * H1-E ordinary commit can advance the shadow without holding
+	 * ProcArrayLock. Keep the shadow authoritative so legacy callers cannot
+	 * overwrite it from a stale embedded counter.
+	 */
+	completionCount =
+		pg_atomic_add_fetch_u64(&TransamVariables->xactCompletionCountShadow, 1);
+	TransamVariables->xactCompletionCount = completionCount;
+
+	return completionCount;
+}
+#endif							/* FRONTEND */
+
+typedef enum TransactionCSNStatus
+{
+	TRANSACTION_CSN_STATUS_INVALID,
+	TRANSACTION_CSN_STATUS_IN_PROGRESS,
+	TRANSACTION_CSN_STATUS_COMMITTING,
+	TRANSACTION_CSN_STATUS_ABORTED,
+	TRANSACTION_CSN_STATUS_COMMITTED
+} TransactionCSNStatus;
+
 /*
  * prototypes for functions in transam/transam.c
  */
@@ -343,6 +479,19 @@ extern void TransactionIdAbortTree(TransactionId xid, int nxids, TransactionId *
 extern TransactionId TransactionIdLatest(TransactionId mainxid,
 										 int nxids, const TransactionId *xids);
 extern XLogRecPtr TransactionIdGetCommitLSN(TransactionId xid);
+extern void TransactionIdSetCSNInProgress(TransactionId xid);
+extern void TransactionIdSetCSNCommitting(TransactionId xid);
+extern void TransactionIdSetCSNCommitted(TransactionId xid, CommitSeqNo csn);
+extern void TransactionIdSetCSNCommittedTree(TransactionId xid, int nxids,
+											 TransactionId *xids,
+											 CommitSeqNo csn);
+extern void TransactionIdSetCSNAborted(TransactionId xid);
+extern void TransactionIdSetCSNAbortedTree(TransactionId xid, int nxids,
+										   TransactionId *xids);
+extern void SubTransactionIdSetCSNParent(TransactionId xid,
+										 TransactionId parentXid);
+extern TransactionCSNStatus TransactionIdGetCSNStatus(TransactionId xid,
+													  CommitSeqNo *csn);
 
 /* in transam/varsup.c */
 extern FullTransactionId GetNewTransactionId(bool isSubXact);

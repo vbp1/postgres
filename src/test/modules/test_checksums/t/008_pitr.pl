@@ -154,6 +154,19 @@ $node_primary->backup($backup_name);
 
 my ($pre_lsn, $post_lsn) = flip_data_checksums();
 
+# The PITR target must be available from a complete archived WAL segment before
+# the primary is stopped immediately below.  Otherwise a concurrent archive copy
+# can leave a partial segment behind, making recovery fail before it reaches the
+# target LSN.
+my $post_lsn_walfile = $node_primary->safe_psql('postgres',
+	"SELECT pg_walfile_name('$post_lsn'::pg_lsn)");
+$node_primary->safe_psql('postgres', 'SELECT pg_switch_wal()');
+my $archive_wait_query =
+  "SELECT '$post_lsn_walfile' <= last_archived_wal FROM pg_stat_archiver";
+$node_primary->poll_query_until('postgres', $archive_wait_query)
+  or die
+  "Timed out while waiting for WAL segment $post_lsn_walfile to be archived";
+
 $node_primary->safe_psql('postgres', "UPDATE t SET a = a + 1;");
 $node_primary->safe_psql('postgres', "SELECT pg_create_restore_point('a');");
 $node_primary->safe_psql('postgres', "UPDATE t SET a = a + 1;");

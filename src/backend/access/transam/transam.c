@@ -19,9 +19,12 @@
 
 #include "postgres.h"
 
+#include "access/csnlog.h"
 #include "access/clog.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
+#include "access/xlog.h"
+#include "storage/lwlock.h"
 #include "utils/snapmgr.h"
 
 /*
@@ -36,6 +39,9 @@ static XLogRecPtr cachedCommitLSN;
 
 /* Local functions */
 static XidStatus TransactionLogFetch(TransactionId transactionId);
+static bool TransactionIdCSNIsVisibilityCommitted(TransactionId xid);
+static TransactionCSNStatus TransactionIdGetLegacyCSNStatus(TransactionId xid,
+															CommitSeqNo *csn);
 
 
 /* ----------------------------------------------------------------
@@ -273,6 +279,135 @@ TransactionIdAbortTree(TransactionId xid, int nxids, TransactionId *xids)
 							   TRANSACTION_STATUS_ABORTED, InvalidXLogRecPtr);
 }
 
+void
+TransactionIdSetCSNInProgress(TransactionId xid)
+{
+	Assert(TransactionIdIsNormal(xid));
+
+	TransactionIdSetCommitSeqNo(xid, InProgressCommitSeqNo);
+}
+
+void
+TransactionIdSetCSNCommitting(TransactionId xid)
+{
+	Assert(TransactionIdIsNormal(xid));
+
+	TransactionIdSetCommitSeqNo(xid, CommittingCommitSeqNo);
+}
+
+void
+TransactionIdSetCSNCommitted(TransactionId xid, CommitSeqNo csn)
+{
+	Assert(TransactionIdIsNormal(xid));
+	Assert(CommitSeqNoIsNormal(csn));
+
+	TransactionIdSetCommitSeqNo(xid, csn);
+}
+
+void
+TransactionIdSetCSNCommittedTree(TransactionId xid, int nxids,
+								 TransactionId *xids, CommitSeqNo csn)
+{
+	while (--nxids >= 0)
+		TransactionIdSetCSNCommitted(xids[nxids], csn);
+
+	TransactionIdSetCSNCommitted(xid, csn);
+}
+
+void
+TransactionIdSetCSNAborted(TransactionId xid)
+{
+	Assert(TransactionIdIsNormal(xid));
+
+	TransactionIdSetCommitSeqNo(xid, AbortedCommitSeqNo);
+}
+
+void
+TransactionIdSetCSNAbortedTree(TransactionId xid, int nxids, TransactionId *xids)
+{
+	while (--nxids >= 0)
+		TransactionIdSetCSNAborted(xids[nxids]);
+
+	TransactionIdSetCSNAborted(xid);
+}
+
+void
+SubTransactionIdSetCSNParent(TransactionId xid, TransactionId parentXid)
+{
+	Assert(TransactionIdIsNormal(xid));
+	Assert(TransactionIdIsNormal(parentXid));
+
+	CSNLogSetSubTransParent(xid, parentXid);
+}
+
+TransactionCSNStatus
+TransactionIdGetCSNStatus(TransactionId xid, CommitSeqNo *csn)
+{
+	TransactionId currentXid = xid;
+
+	if (csn != NULL)
+		*csn = InvalidCommitSeqNo;
+
+	for (;;)
+	{
+		CommitSeqNo storedCsn;
+
+		if (!TransactionIdIsValid(currentXid))
+			return TRANSACTION_CSN_STATUS_INVALID;
+
+		if (!TransactionIdIsNormal(currentXid))
+		{
+			if (TransactionIdEquals(currentXid, BootstrapTransactionId) ||
+				TransactionIdEquals(currentXid, FrozenTransactionId))
+			{
+				if (csn != NULL)
+					*csn = FrozenCommitSeqNo;
+				return TRANSACTION_CSN_STATUS_COMMITTED;
+			}
+
+			return TRANSACTION_CSN_STATUS_ABORTED;
+		}
+
+		if (!TransactionIdPrecedes(currentXid, ReadNextTransactionId()))
+			return TRANSACTION_CSN_STATUS_INVALID;
+
+		if (!TransactionIdGetCommitSeqNoIfAny(currentXid, &storedCsn))
+			return TransactionIdGetLegacyCSNStatus(currentXid, csn);
+
+		if (CommitSeqNoIsSubTransParent(storedCsn))
+		{
+			TransactionId parentXid = TransactionIdFromCommitSeqNoParent(storedCsn);
+
+			if (!TransactionIdPrecedes(parentXid, currentXid))
+				elog(ERROR, "invalid csnlog parent mapping from transaction %u to %u",
+					 currentXid, parentXid);
+
+			currentXid = parentXid;
+			continue;
+		}
+
+		if (CommitSeqNoIsCommitted(storedCsn))
+		{
+			if (!CommitSeqNoIsFrozen(storedCsn) &&
+				!TransactionIdCSNIsVisibilityCommitted(currentXid))
+				return TRANSACTION_CSN_STATUS_COMMITTING;
+
+			if (csn != NULL)
+				*csn = storedCsn;
+			return TRANSACTION_CSN_STATUS_COMMITTED;
+		}
+		if (CommitSeqNoIsInProgress(storedCsn))
+			return TRANSACTION_CSN_STATUS_IN_PROGRESS;
+		if (CommitSeqNoIsCommitting(storedCsn))
+			return TRANSACTION_CSN_STATUS_COMMITTING;
+		if (CommitSeqNoIsAborted(storedCsn))
+			return TRANSACTION_CSN_STATUS_ABORTED;
+
+		elog(ERROR, "unrecognized csnlog state %llu for transaction %u",
+			 (unsigned long long) storedCsn, currentXid);
+	}
+}
+
 
 /*
  * TransactionIdLatest --- get latest XID among a main xact and its children
@@ -338,4 +473,102 @@ TransactionIdGetCommitLSN(TransactionId xid)
 	(void) TransactionIdGetStatus(xid, &result);
 
 	return result;
+}
+
+static bool
+TransactionIdCSNIsVisibilityCommitted(TransactionId xid)
+{
+	XidStatus	xidstatus;
+	XLogRecPtr	ignored;
+
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	if (TransactionIdPrecedes(xid, TransamVariables->oldestClogXid))
+	{
+		LWLockRelease(XactTruncationLock);
+		return true;
+	}
+
+	xidstatus = TransactionIdGetStatus(xid, &ignored);
+	LWLockRelease(XactTruncationLock);
+
+	return xidstatus == TRANSACTION_STATUS_COMMITTED;
+}
+
+static TransactionCSNStatus
+TransactionIdGetLegacyCSNStatus(TransactionId xid, CommitSeqNo *csn)
+{
+	for (;;)
+	{
+		XidStatus	xidstatus;
+		XLogRecPtr	ignored;
+
+		if (!TransactionIdIsValid(xid))
+			return TRANSACTION_CSN_STATUS_INVALID;
+
+		if (!TransactionIdIsNormal(xid))
+		{
+			if (TransactionIdEquals(xid, BootstrapTransactionId) ||
+				TransactionIdEquals(xid, FrozenTransactionId))
+			{
+				if (csn != NULL)
+					*csn = FrozenCommitSeqNo;
+				return TRANSACTION_CSN_STATUS_COMMITTED;
+			}
+
+			return TRANSACTION_CSN_STATUS_ABORTED;
+		}
+
+		if (!TransactionIdPrecedes(xid, ReadNextTransactionId()))
+			return TRANSACTION_CSN_STATUS_INVALID;
+
+		LWLockAcquire(XactTruncationLock, LW_SHARED);
+		if (TransactionIdPrecedes(xid, TransamVariables->oldestClogXid))
+		{
+			LWLockRelease(XactTruncationLock);
+
+			/*
+			 * If both csnlog and clog have forgotten this xid, there is no
+			 * safe general-status answer left for an arbitrary xid. Report it
+			 * as unavailable instead of inventing a committed result.
+			 */
+			return TRANSACTION_CSN_STATUS_INVALID;
+		}
+
+		xidstatus = TransactionIdGetStatus(xid, &ignored);
+		LWLockRelease(XactTruncationLock);
+
+		switch (xidstatus)
+		{
+			case TRANSACTION_STATUS_IN_PROGRESS:
+				return TRANSACTION_CSN_STATUS_IN_PROGRESS;
+
+			case TRANSACTION_STATUS_COMMITTED:
+				if (csn != NULL)
+					*csn = FrozenCommitSeqNo;
+				return TRANSACTION_CSN_STATUS_COMMITTED;
+
+			case TRANSACTION_STATUS_ABORTED:
+				return TRANSACTION_CSN_STATUS_ABORTED;
+
+			case TRANSACTION_STATUS_SUB_COMMITTED:
+				{
+					TransactionId subXid = xid;
+
+					if (TransactionIdPrecedes(xid, TransactionXmin))
+						return TRANSACTION_CSN_STATUS_ABORTED;
+
+					xid = SubTransGetParent(xid);
+					if (!TransactionIdIsValid(xid))
+					{
+						elog(WARNING, "no pg_subtrans entry for subcommitted XID %u",
+							 subXid);
+						return TRANSACTION_CSN_STATUS_ABORTED;
+					}
+					break;
+				}
+
+			default:
+				elog(ERROR, "unrecognized transaction status %u", xidstatus);
+		}
+	}
 }

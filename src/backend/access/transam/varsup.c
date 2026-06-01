@@ -14,6 +14,8 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "access/csn_mvcc_vars.h"
+#include "access/csnlog.h"
 #include "access/commit_ts.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
@@ -23,6 +25,7 @@
 #include "postmaster/autovacuum.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/subsystems.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -32,12 +35,14 @@
 #define VAR_OID_PREFETCH		8192
 
 static void VarsupShmemRequest(void *arg);
+static void VarsupShmemInit(void *arg);
 
 /* pointer to variables struct in shared memory */
 TransamVariablesData *TransamVariables = NULL;
 
 const ShmemCallbacks VarsupShmemCallbacks = {
 	.request_fn = VarsupShmemRequest,
+	.init_fn = VarsupShmemInit,
 };
 
 /*
@@ -50,6 +55,18 @@ VarsupShmemRequest(void *arg)
 					   .size = sizeof(TransamVariablesData),
 					   .ptr = (void **) &TransamVariables,
 		);
+
+	CSNLOGShmemRequest();
+}
+
+/*
+ * Initialize varsup-owned CSN prototype state.
+ */
+static void
+VarsupShmemInit(void *arg)
+{
+	CSNShmemInit();
+	CSNLOGShmemInit();
 }
 
 /*
@@ -197,6 +214,7 @@ GetNewTransactionId(bool isSubXact)
 	 * Extend pg_subtrans and pg_commit_ts too.
 	 */
 	ExtendCLOG(xid);
+	ExtendCSNLOG(xid);
 	ExtendCommitTs(xid);
 	ExtendSUBTRANS(xid);
 
@@ -252,6 +270,7 @@ GetNewTransactionId(bool isSubXact)
 		/* LWLockRelease acts as barrier */
 		MyProc->xid = xid;
 		ProcGlobal->xids[MyProc->pgxactoff] = xid;
+		ProcArrayPublishOrdinaryMirrorEpoch(MyProc);
 	}
 	else
 	{
@@ -272,6 +291,12 @@ GetNewTransactionId(bool isSubXact)
 	}
 
 	LWLockRelease(XidGenLock);
+
+	if (!isSubXact)
+	{
+		/* Initialize or tighten the prototype-owned CSN lower bound. */
+		SetCSNOldestActiveXidIfEarlier(xid);
+	}
 
 	return full_xid;
 }

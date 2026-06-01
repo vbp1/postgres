@@ -1,0 +1,243 @@
+Parsed test spec with 4 sessions
+
+starting permutation: reset wc_prepare wc_finish o_after_finish wake_after detach_after w_begin_new o_new_epoch wake_start detach_start w_rollback
+step reset: 
+	UPDATE csn_ordinary_mirror_epoch_data SET val = 0 WHERE id = 1;
+	SELECT injection_points_set_global_int8('mirror-pid', 0);
+	SELECT injection_points_set_global_int8('mirror-old-slot-epoch', 0);
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step wc_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT injection_points_attach('start-after-vxid-publication', 'wait');
+	SELECT injection_points_set_global_int8('mirror-pid', pg_backend_pid());
+	SELECT injection_points_set_global_int8(
+		'mirror-old-slot-epoch',
+		injection_points_backend_slot_epoch(pg_backend_pid())
+	);
+	UPDATE csn_ordinary_mirror_epoch_data SET val = 1 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step wc_finish: COMMIT; <waiting ...>
+step o_after_finish: 
+	SELECT injection_points_backend_ordinary_finished(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) AS ordinary_finished,
+		injection_points_backend_published_mirror_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) =
+		injection_points_backend_slot_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) AS mirror_matches_current_epoch;
+
+ordinary_finished|mirror_matches_current_epoch
+-----------------+----------------------------
+t                |t                           
+(1 row)
+
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step wc_finish: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_begin_new: BEGIN; <waiting ...>
+step o_new_epoch: 
+	SELECT injection_points_backend_ordinary_finished(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) = false AS finished_cleared,
+		injection_points_backend_slot_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) >
+		injection_points_get_global_int8('mirror-old-slot-epoch') AS slot_epoch_advanced,
+		injection_points_backend_published_mirror_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) <
+		injection_points_backend_slot_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) AS mirror_epoch_now_stale;
+
+finished_cleared|slot_epoch_advanced|mirror_epoch_now_stale
+----------------+-------------------+----------------------
+t               |t                  |t                     
+(1 row)
+
+step wake_start: SELECT injection_points_wakeup('start-after-vxid-publication'); <waiting ...>
+step w_begin_new: <... completed>
+step wake_start: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_start: SELECT injection_points_detach('start-after-vxid-publication');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_rollback: ROLLBACK;
+
+starting permutation: reset wa_prepare wa_finish o_after_finish wake_after detach_after w_begin_new o_new_epoch wake_start detach_start w_rollback
+step reset: 
+	UPDATE csn_ordinary_mirror_epoch_data SET val = 0 WHERE id = 1;
+	SELECT injection_points_set_global_int8('mirror-pid', 0);
+	SELECT injection_points_set_global_int8('mirror-old-slot-epoch', 0);
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step wa_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT injection_points_attach('start-after-vxid-publication', 'wait');
+	SELECT injection_points_set_global_int8('mirror-pid', pg_backend_pid());
+	SELECT injection_points_set_global_int8(
+		'mirror-old-slot-epoch',
+		injection_points_backend_slot_epoch(pg_backend_pid())
+	);
+	UPDATE csn_ordinary_mirror_epoch_data SET val = 2 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step wa_finish: ABORT; <waiting ...>
+step o_after_finish: 
+	SELECT injection_points_backend_ordinary_finished(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) AS ordinary_finished,
+		injection_points_backend_published_mirror_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) =
+		injection_points_backend_slot_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) AS mirror_matches_current_epoch;
+
+ordinary_finished|mirror_matches_current_epoch
+-----------------+----------------------------
+t                |t                           
+(1 row)
+
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step wa_finish: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_begin_new: BEGIN; <waiting ...>
+step o_new_epoch: 
+	SELECT injection_points_backend_ordinary_finished(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) = false AS finished_cleared,
+		injection_points_backend_slot_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) >
+		injection_points_get_global_int8('mirror-old-slot-epoch') AS slot_epoch_advanced,
+		injection_points_backend_published_mirror_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) <
+		injection_points_backend_slot_epoch(
+			injection_points_get_global_int8('mirror-pid')::int4
+		) AS mirror_epoch_now_stale;
+
+finished_cleared|slot_epoch_advanced|mirror_epoch_now_stale
+----------------+-------------------+----------------------
+t               |t                  |t                     
+(1 row)
+
+step wake_start: SELECT injection_points_wakeup('start-after-vxid-publication'); <waiting ...>
+step w_begin_new: <... completed>
+step wake_start: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_start: SELECT injection_points_detach('start-after-vxid-publication');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_rollback: ROLLBACK;

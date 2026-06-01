@@ -1,0 +1,310 @@
+Stage 1 CSN Prototype Design Baseline
+=====================================
+
+This note captures the Phase A baseline for a first-pass CSN prototype in
+this tree (`/home/vbponomarev/postgres`).  The goal is not feature parity
+with historical PolarDB code, but a narrow, testable design that can be
+implemented in small phases without silently mixing old and new MVCC rules.
+
+
+Stage 1 Scope
+-------------
+
+Supported in the prototype:
+
+* single-node primary execution
+* normal top-level DML
+* READ COMMITTED
+* REPEATABLE READ
+* top-level commit and abort
+
+Explicitly unsupported in Stage 1:
+
+* hot standby and crash recovery semantics
+* physical replication
+* logical decoding
+* exported/imported snapshots
+* SERIALIZABLE
+* 2PC
+* subxid overflow
+
+Unsupported modes must fail by guard rail or stay on an explicitly excluded
+legacy path.  They must not silently consume partially migrated CSN state.
+
+
+Minimal CSN Model
+-----------------
+
+The first pass introduces a new `csnlog` as the transaction-status source of
+truth for supported Stage 1 paths.  Each tracked xid is read as one of:
+
+* `INPROGRESS`
+* `COMMITTING`
+* `ABORTED`
+* `FROZEN`
+* normal committed CSN
+
+For supported normal xids, `csnlog` is authoritative.  Shared state is not a
+status store; it only publishes snapshot and horizon metadata:
+
+* `next_csn`
+* `latest_completed_xid`
+* `oldest_active_xid` as a prototype-owned CSN bookkeeping lower bound
+* `xactCompletionCount` integration with the existing snapshot reuse contract
+
+Existing pg_xact/legacy status checks remain only for bootstrap/frozen/ancient
+xids or for code paths that are explicitly outside Stage 1 scope.
+
+`oldest_active_xid` in Stage 1 does not replace existing procarray, GlobalVis,
+or nonremovable-horizon machinery.  Vacuum, pruning, index recycling, and
+related cleanup horizons continue to use existing procarray + GlobalVis
+contracts unless a later phase explicitly migrates them.  Phase F may keep
+the prototype-owned lower bound synchronized with backend lifecycle events so
+that `csnlog` can stay conservative, but it must not become an input to vacuum
+or horizon selection.
+
+
+Subxid Decision for the Prototype
+---------------------------------
+
+The first pass does not attempt full CSN-native subxid encoding in `csnlog`.
+Instead:
+
+* top-level xids are the first-class CSN carriers
+* existing SubTrans-based parent lookup remains available as a compatibility
+  aid for subxid-to-top-xid resolution
+* ordinary subtransaction semantics are outside supported Stage 1 scope, except
+  for the minimal parent-to-top-xid resolution needed for correctness
+
+Operational guard rail: Stage 1 does not support transactions that actually
+create subtransactions (`SAVEPOINT`, PL/pgSQL exception blocks, and similar
+paths) unless they are forced onto a fully legacy path or are hard-forbidden.
+The minimal parent-to-top-xid resolution described above is only a
+compatibility aid for excluded or transitional cases, not a claim that
+ordinary subtransaction execution is supported by the CSN prototype.
+
+There is also no SQL-visible CSN counter in Stage 1. Monotonic allocation is
+therefore exercised only indirectly through commit ordering and snapshot
+visibility in the regression and isolation tests. The existing
+`subxid-overflow` isolation test remains an explicit excluded-path check, not
+a claim of general subtransaction support.
+
+This keeps Wave 1 and Wave 2 small while preserving a clear upgrade path to a
+later design that can stamp subxids directly or encode parent information in
+`csnlog`.
+
+
+Snapshot Decision for the Prototype
+-----------------------------------
+
+The prototype keeps the current `SnapshotData` layout and xid arrays for
+compatibility, but Stage 1 supported visibility decisions move to CSN rules.
+
+For supported MVCC paths:
+
+* `snapshot_csn` becomes the committed-visibility boundary
+* `snapXactCompletionCount` remains part of snapshot reuse validation
+* `xip`/`subxip` data is compatibility state, not the semantic source of truth
+
+Phase D keeps this conservative:
+
+* only primary, non-overflowed MVCC snapshots get a valid `snapshot_csn`
+* unsupported snapshot shapes keep `snapshot_csn = InvalidCommitSeqNo` and
+  stay on the legacy xid-array path
+* fast snapshot reuse is disabled for CSN snapshots until the reuse contract
+  is widened beyond `snapXactCompletionCount`
+
+For `REPEATABLE READ` and other xact-snapshot modes, the first transaction
+snapshot must hold one stable `snapshot_csn` for the life of that
+FirstXactSnapshot-style snapshot.  Per-statement recomputation is acceptable
+only for statement-snapshot modes such as `READ COMMITTED`.
+
+If a code path cannot yet be migrated away from xid-array semantics, it must
+either:
+
+* stay explicitly outside Stage 1 scope, or
+* use a documented fallback path
+
+The prototype must not claim a CSN-based visibility model while still making
+semantic decisions from `XidInMVCCSnapshot()` in supported paths.
+
+Phase E enforces that rule in `HeapTupleSatisfiesMVCC()`:
+
+* supported MVCC snapshots (`SnapshotUsesCSN(snapshot)`) make semantic
+  visibility decisions from `TransactionIdGetCSNStatus()` plus
+  `snapshot_csn`
+* `COMMITTING` is treated as not visible
+* `COMMITTING` is a visibility guard only for the window where a final CSN is
+  already present in `csnlog` but `pg_xact` is not yet `COMMITTED`
+* once `pg_xact` is `COMMITTED`, the xid is visibility-ready even if the
+  commit record is still async / not yet flushed; WAL durability is not part
+  of the MVCC semantic answer
+* `INVALID` from the CSN status API means "no safe general-status answer",
+  not "aborted"; Stage 1 falls back to the legacy tuple-visibility path for
+  that tuple instead of inventing a CSN result
+* local-buffer relations (temporary-table heap access) remain on the legacy
+  path explicitly in Stage 1
+* current-transaction and command-id rules stay on the existing self-visible
+  path
+* unsupported snapshot shapes remain on the legacy xid-array path explicitly,
+  rather than mixing CSN and xid-array answers within one supported branch
+
+
+Minimal Publish and Locking Assumptions
+---------------------------------------
+
+The first pass assumes the following ordering:
+
+1. the committing xid is marked `COMMITTING` in `csnlog`
+2. a final CSN is allocated
+3. the final CSN is written to `csnlog`
+4. while holding the existing serialization point needed by the snapshot path
+   (`ProcArrayLock` exclusive in the current design), the backend publishes:
+   * `latest_completed_xid`
+   * `xactCompletionCount`
+   * procarray-visible transaction completion state
+
+Readers must not infer committed visibility from shared state alone.  A xid is
+committed-visible only after `csnlog` exposes a final committed CSN and the
+snapshot boundary test succeeds.
+
+Stage 1 should reuse existing lock domains where possible:
+
+* `ProcArrayLock` remains the snapshot/finish serialization point
+* `XidGenLock` and current transaction-assignment rules stay intact
+* `csnlog` provides its own local serialization for storage reads/writes
+
+The prototype is allowed to be conservative.  If a race cannot be proven safe,
+the path should report "not visible yet" or disable reuse rather than invent a
+new relaxed contract.
+
+
+Concrete Integration Points
+---------------------------
+
+First-wave files in this target tree:
+
+* `src/include/access/transam.h`
+  `CommitSeqNo` type, CSN state constants, public wrappers
+* `src/include/access/csnlog.h`
+  new `csnlog` API
+* `src/include/access/csn_mvcc_vars.h`
+  new CSN shared-state API
+* `src/backend/access/transam/csnlog.c`
+  `csnlog` skeleton and storage API
+* `src/backend/access/transam/csn_mvcc_vars.c`
+  CSN shared-state allocation and helpers
+* `src/backend/access/transam/varsup.c`
+  hook shared state into the current builtin shmem path
+* `src/include/storage/subsystemlist.h`
+  register CSN shared-memory callbacks in builtin order
+* `src/include/storage/proc.h`
+  only if a temporary per-backend field is unavoidable; design against the
+  current `PROC_HDR` / dense-array layout, not an older PGXACT model
+
+Later-wave files:
+
+* `src/backend/access/transam/transam.c`
+  CSN-aware xid status wrappers and legacy fallback rules
+* `src/backend/access/transam/xact.c`
+  commit/abort publish path
+* `src/backend/storage/ipc/procarray.c`
+  `snapshot_csn`, `xactCompletionCount`, reuse, horizons
+* `src/include/utils/snapshot.h`
+* `src/include/utils/snapmgr.h`
+* `src/backend/utils/time/snapmgr.c`
+* `src/backend/access/heap/heapam_visibility.c`
+* `src/backend/access/heap/heapam.c`
+
+The boundary is intentional: Wave 1 creates types, state, and storage only.
+Snapshot semantics, tuple visibility, and procarray lifecycle changes belong
+to later waves.
+
+
+Transaction-Status Chokepoint
+-----------------------------
+
+Supported Stage 1 paths must converge on a single transam-level status API.
+Direct semantic reads of legacy helpers are not acceptable in migrated paths.
+
+The intended chokepoint covers wrappers for:
+
+* in-progress checks
+* committed/aborted checks
+* commit sequence lookup
+* commit-LSN lookup where hint-bit safety still requires it
+
+In supported CSN paths, callers should not decide visibility by directly
+combining `TransactionIdIsInProgress()`, `TransactionIdDidCommit()`,
+`TransactionIdDidAbort()`, `XidInMVCCSnapshot()`, or
+`TransactionIdGetCommitLSN()`.
+
+
+Direct Legacy Status-Read Audit List
+------------------------------------
+
+Phase A should treat the following files as the initial audit surface:
+
+* `src/backend/access/heap/heapam_visibility.c`
+  status-sensitive visibility decisions and hint-bit interactions
+* `src/backend/access/heap/heapam.c`
+  direct `TransactionIdIsInProgress()` / commit-status consumers in tuple
+  locking and update-chain code
+* `src/backend/access/transam/multixact.c`
+  multi-transaction membership and status-sensitive tuple-lock interactions
+* `src/backend/storage/ipc/procarray.c`
+  snapshot acquisition, reuse, and `xactCompletionCount`
+* `src/backend/access/transam/transam.c`
+  central xid status helpers and ancient-xid fallback rules
+* `src/backend/storage/lmgr/lmgr.c`
+  lock-wait and xid-status consumers that can affect supported DML behavior
+
+Legacy helpers requiring explicit audit in supported paths:
+
+* `TransactionIdIsInProgress()`
+* `TransactionIdDidCommit()`
+* `TransactionIdDidAbort()`
+* `XidInMVCCSnapshot()`
+* `TransactionIdGetCommitLSN()`
+
+Any direct use that remains in Stage 1 must be classified as one of:
+
+* migrated behind the new CSN-aware wrapper
+* explicitly excluded from Stage 1 scope
+* still temporarily allowed because it does not change the semantic visibility
+  answer in supported mode
+
+Other direct status consumers in supported DML paths must meet the same rule:
+either migrate them, or explicitly exclude the path from Stage 1.
+
+
+First-Wave vs Later-Wave Boundaries
+-----------------------------------
+
+Wave 1 owns only the baseline CSN infrastructure:
+
+* types and constants
+* shared CSN MVCC state
+* `csnlog` skeleton
+* shmem registration
+
+Wave 2 and later own semantic behavior:
+
+* xid status publication
+* snapshot construction
+* visibility decisions
+* procarray horizons
+* tests
+
+Cleanup and nonremovable-horizon consumers remain on existing legacy horizon
+semantics in Stage 1, including `pruneheap.c`, `nbtpage.c`, vacuum/index
+recycling, and related GlobalVis users, unless a later phase explicitly
+migrates them.
+
+In particular, Phase F keeps `csnOldestActiveXid` as a CSN-local bookkeeping
+bound only.  It is not the authoritative source for `GetOldestNonRemovable`
+style decisions, and it must not change vacuum, pruning, or standby/recovery
+cleanup semantics.
+
+This boundary is deliberate.  The first commit should introduce a designable,
+compile-ready foundation without changing SQL-visible behavior.

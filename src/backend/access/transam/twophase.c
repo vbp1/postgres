@@ -77,6 +77,7 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
+#include "access/csn_mvcc_vars.h"
 #include "access/htup_details.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
@@ -230,6 +231,7 @@ static void RecordTransactionAbortPrepared(TransactionId xid,
 										   const char *gid);
 static void ProcessRecords(char *bufptr, FullTransactionId fxid,
 						   const TwoPhaseCallback callbacks[]);
+static void PublishPreparedTransactionCSNState(FullTransactionId fxid, char *buf);
 static void RemoveGXact(GlobalTransaction gxact);
 
 static void XlogReadTwoPhaseData(XLogRecPtr lsn, char **buf, int *len);
@@ -2179,6 +2181,34 @@ RecoverPreparedTransactions(void)
 }
 
 /*
+ * Make a prepared transaction visible to the prototype CSN status API during
+ * redo and restart processing.
+ */
+static void
+PublishPreparedTransactionCSNState(FullTransactionId fxid, char *buf)
+{
+	TwoPhaseFileHeader *hdr = (TwoPhaseFileHeader *) buf;
+	char	   *bufptr;
+	TransactionId *subxids;
+	int			i;
+
+	/*
+	 * Stage 1 does not try to preserve restart-stable CSNs. We only need
+	 * prepared transactions to remain visible as in-progress to the prototype
+	 * CSN status API during redo and restart processing.
+	 */
+	TransactionIdSetCSNInProgress(XidFromFullTransactionId(fxid));
+
+	bufptr = buf + MAXALIGN(sizeof(TwoPhaseFileHeader));
+	bufptr += MAXALIGN(hdr->gidlen);
+	subxids = (TransactionId *) bufptr;
+
+	for (i = 0; i < hdr->nsubxacts; i++)
+		SubTransactionIdSetCSNParent(subxids[i],
+									 XidFromFullTransactionId(fxid));
+}
+
+/*
  * ProcessTwoPhaseBuffer
  *
  * Given a FullTransactionId, read it either from disk or read it directly
@@ -2287,6 +2317,8 @@ ProcessTwoPhaseBuffer(FullTransactionId fxid,
 	subxids = (TransactionId *) (buf +
 								 MAXALIGN(sizeof(TwoPhaseFileHeader)) +
 								 MAXALIGN(hdr->gidlen));
+	if (setParent)
+		TransactionIdSetCSNInProgress(XidFromFullTransactionId(fxid));
 	for (i = 0; i < hdr->nsubxacts; i++)
 	{
 		TransactionId subxid = subxids[i];
@@ -2298,7 +2330,10 @@ ProcessTwoPhaseBuffer(FullTransactionId fxid,
 			AdvanceNextFullTransactionIdPastXid(subxid);
 
 		if (setParent)
+		{
 			SubTransSetParent(subxid, XidFromFullTransactionId(fxid));
+			SubTransactionIdSetCSNParent(subxid, XidFromFullTransactionId(fxid));
+		}
 	}
 
 	return buf;
@@ -2331,6 +2366,7 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	XLogRecPtr	recptr;
 	TimestampTz committs;
 	bool		replorigin;
+	CommitSeqNo commitSeqNo;
 
 	/*
 	 * Are we using the replication origins feature?  Or, in other words, are
@@ -2339,8 +2375,9 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	replorigin = (replorigin_xact_state.origin != InvalidReplOriginId &&
 				  replorigin_xact_state.origin != DoNotReplicateId);
 
-	/* Load the injection point before entering the critical section */
+	/* Load the injection points before entering the critical section */
 	INJECTION_POINT_LOAD("commit-after-delay-checkpoint");
+	INJECTION_POINT_LOAD("commit-after-csn-publication");
 
 	START_CRIT_SECTION();
 
@@ -2348,13 +2385,15 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_IN_COMMIT;
 
-	INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
-
 	/*
 	 * Ensures the DELAY_CHKPT_IN_COMMIT flag write is globally visible before
 	 * commit time is written.
 	 */
 	pg_write_barrier();
+	INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
+
+	TransactionIdSetCSNCommitting(xid);
+	commitSeqNo = GetNewCommitSeqNo();
 
 	/*
 	 * Note it is important to set committs value after marking ourselves as
@@ -2410,7 +2449,15 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	XLogFlush(recptr);
 
 	/* Mark the transaction committed in pg_xact */
+	TransactionIdSetCSNCommittedTree(xid, nchildren, children, commitSeqNo);
 	TransactionIdCommitTree(xid, nchildren, children);
+
+	/*
+	 * As in the plain commit path, supported CSN snapshots can now ignore
+	 * our legacy ProcArray slot while twophase cleanup finishes.
+	 */
+	ProcArrayMarkCSNSnapshotSafeToIgnore(MyProc);
+	INJECTION_POINT_CACHED("commit-after-csn-publication", NULL);
 
 	/* Checkpoint can proceed now */
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_IN_COMMIT;
@@ -2483,6 +2530,8 @@ RecordTransactionAbortPrepared(TransactionId xid,
 
 	/* Always flush, since we're about to remove the 2PC state file */
 	XLogFlush(recptr);
+
+	TransactionIdSetCSNAbortedTree(xid, nchildren, children);
 
 	/*
 	 * Mark the transaction aborted in clog.  This is not absolutely necessary
@@ -2600,6 +2649,8 @@ PrepareRedoAdd(FullTransactionId fxid, char *buf,
 	/* And insert it into the active array */
 	Assert(TwoPhaseState->numPrepXacts < max_prepared_xacts);
 	TwoPhaseState->prepXacts[TwoPhaseState->numPrepXacts++] = gxact;
+
+	PublishPreparedTransactionCSNState(fxid, buf);
 
 	if (origin_id != InvalidReplOriginId)
 	{

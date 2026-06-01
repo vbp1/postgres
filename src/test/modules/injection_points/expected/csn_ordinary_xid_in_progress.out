@@ -1,0 +1,235 @@
+Parsed test spec with 5 sessions
+
+starting permutation: reset wc_seed wc_prepare o_commit_running wc_finish o_commit_finished wake detach wc_unlock
+step reset: 
+	TRUNCATE csn_ordinary_xid_in_progress_state;
+
+step wc_seed: 
+	INSERT INTO csn_ordinary_xid_in_progress_state(label, pid, fxid)
+	VALUES ('commit', pg_backend_pid(), NULL);
+
+step wc_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-primary', 'wait');
+	SELECT pg_current_xact_id() IS NOT NULL AS writer_fxid_assigned;
+	SELECT pg_advisory_lock_shared(1, pg_current_xact_id()::text::int4);
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+writer_fxid_assigned
+--------------------
+t                   
+(1 row)
+
+pg_advisory_lock_shared
+-----------------------
+                       
+(1 row)
+
+step o_commit_running: 
+	SELECT count(*) = 1 AS advisory_lock_visible
+	FROM pg_locks
+	WHERE locktype = 'advisory'
+	  AND classid = 1
+	  AND pid = (
+		SELECT pid
+		FROM csn_ordinary_xid_in_progress_state
+		WHERE label = 'commit'
+	  );
+	UPDATE csn_ordinary_xid_in_progress_state
+	SET fxid = (
+		SELECT objid::text::xid8
+		FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = 1
+		  AND pid = (
+			SELECT pid
+			FROM csn_ordinary_xid_in_progress_state
+			WHERE label = 'commit'
+		  )
+	);
+	SELECT fxid IS NOT NULL AS commit_fxid_captured
+	FROM csn_ordinary_xid_in_progress_state
+	WHERE label = 'commit';
+	SELECT injection_points_xid_in_progress(
+		(SELECT fxid FROM csn_ordinary_xid_in_progress_state WHERE label = 'commit')
+	) AS commit_xid_running;
+
+advisory_lock_visible
+---------------------
+t                    
+(1 row)
+
+commit_fxid_captured
+--------------------
+t                   
+(1 row)
+
+commit_xid_running
+------------------
+t                 
+(1 row)
+
+step wc_finish: COMMIT; <waiting ...>
+step o_commit_finished: 
+	SELECT injection_points_xid_in_progress(
+		(SELECT fxid FROM csn_ordinary_xid_in_progress_state WHERE label = 'commit')
+	) AS commit_xid_running;
+
+commit_xid_running
+------------------
+f                 
+(1 row)
+
+step wake: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
+step wc_finish: <... completed>
+step wake: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach: SELECT injection_points_detach('ordinary-before-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step wc_unlock: 
+	SELECT pg_advisory_unlock_shared(
+		1,
+		(SELECT fxid::text::int4 FROM csn_ordinary_xid_in_progress_state
+		 WHERE label = 'commit')
+	);
+
+pg_advisory_unlock_shared
+-------------------------
+t                        
+(1 row)
+
+
+starting permutation: reset wa_seed wa_prepare o_abort_running wa_finish o_abort_finished wake detach wa_unlock
+step reset: 
+	TRUNCATE csn_ordinary_xid_in_progress_state;
+
+step wa_seed: 
+	INSERT INTO csn_ordinary_xid_in_progress_state(label, pid, fxid)
+	VALUES ('abort', pg_backend_pid(), NULL);
+
+step wa_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-primary', 'wait');
+	SELECT pg_current_xact_id() IS NOT NULL AS writer_fxid_assigned;
+	SELECT pg_advisory_lock_shared(1, pg_current_xact_id()::text::int4);
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+writer_fxid_assigned
+--------------------
+t                   
+(1 row)
+
+pg_advisory_lock_shared
+-----------------------
+                       
+(1 row)
+
+step o_abort_running: 
+	SELECT count(*) = 1 AS advisory_lock_visible
+	FROM pg_locks
+	WHERE locktype = 'advisory'
+	  AND classid = 1
+	  AND pid = (
+		SELECT pid
+		FROM csn_ordinary_xid_in_progress_state
+		WHERE label = 'abort'
+	  );
+	UPDATE csn_ordinary_xid_in_progress_state
+	SET fxid = (
+		SELECT objid::text::xid8
+		FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = 1
+		  AND pid = (
+			SELECT pid
+			FROM csn_ordinary_xid_in_progress_state
+			WHERE label = 'abort'
+		  )
+	);
+	SELECT fxid IS NOT NULL AS abort_fxid_captured
+	FROM csn_ordinary_xid_in_progress_state
+	WHERE label = 'abort';
+	SELECT injection_points_xid_in_progress(
+		(SELECT fxid FROM csn_ordinary_xid_in_progress_state WHERE label = 'abort')
+	) AS abort_xid_running;
+
+advisory_lock_visible
+---------------------
+t                    
+(1 row)
+
+abort_fxid_captured
+-------------------
+t                  
+(1 row)
+
+abort_xid_running
+-----------------
+t                
+(1 row)
+
+step wa_finish: ROLLBACK; <waiting ...>
+step o_abort_finished: 
+	SELECT injection_points_xid_in_progress(
+		(SELECT fxid FROM csn_ordinary_xid_in_progress_state WHERE label = 'abort')
+	) AS abort_xid_running;
+
+abort_xid_running
+-----------------
+f                
+(1 row)
+
+step wake: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
+step wa_finish: <... completed>
+step wake: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach: SELECT injection_points_detach('ordinary-before-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step wa_unlock: 
+	SELECT pg_advisory_unlock_shared(
+		1,
+		(SELECT fxid::text::int4 FROM csn_ordinary_xid_in_progress_state
+		 WHERE label = 'abort')
+	);
+
+pg_advisory_unlock_shared
+-------------------------
+t                        
+(1 row)
+

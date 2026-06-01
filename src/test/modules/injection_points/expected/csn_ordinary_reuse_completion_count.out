@@ -1,0 +1,227 @@
+Parsed test spec with 4 sessions
+
+starting permutation: reset w_prepare_commit w_commit wake_after detach_after w_begin_new o_before_new_xid wake_start detach_start w_capture_new o_new_tx_snapshot w_rollback
+step reset: 
+	UPDATE csn_ordinary_reuse_completion_count_data SET val = 0 WHERE id = 1;
+	SELECT injection_points_set_global_int8('reuse-old-count', 0);
+	SELECT injection_points_set_global_int8('reuse-new-count', 0);
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step w_prepare_commit: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT injection_points_attach('start-after-vxid-publication', 'wait');
+	SELECT injection_points_set_global_int8(
+		'reuse-old-count',
+		injection_points_xact_completion_count_shadow()
+	);
+	UPDATE csn_ordinary_reuse_completion_count_data SET val = 1 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step w_commit: COMMIT; <waiting ...>
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step w_commit: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_begin_new: BEGIN; <waiting ...>
+step o_before_new_xid: 
+	SELECT injection_points_xact_completion_count_shadow() >
+			injection_points_get_global_int8('reuse-old-count')
+			AS completion_count_advanced;
+
+completion_count_advanced
+-------------------------
+t                        
+(1 row)
+
+step wake_start: SELECT injection_points_wakeup('start-after-vxid-publication'); <waiting ...>
+step w_begin_new: <... completed>
+step wake_start: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_start: SELECT injection_points_detach('start-after-vxid-publication');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_capture_new: 
+	SELECT injection_points_set_global_int8(
+		'reuse-new-count',
+		injection_points_transaction_snapshot_xact_completion_count()
+	);
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step o_new_tx_snapshot: 
+	SELECT injection_points_get_global_int8('reuse-new-count') =
+			injection_points_xact_completion_count_shadow()
+			AS new_tx_matches_shadow,
+		injection_points_get_global_int8('reuse-new-count') >
+			injection_points_get_global_int8('reuse-old-count')
+			AS new_tx_is_fresh;
+
+new_tx_matches_shadow|new_tx_is_fresh
+---------------------+---------------
+t                    |t              
+(1 row)
+
+step w_rollback: ROLLBACK;
+
+starting permutation: reset w_prepare_abort w_abort wake_after detach_after w_begin_new o_before_new_xid wake_start detach_start w_capture_new o_new_tx_snapshot w_rollback
+step reset: 
+	UPDATE csn_ordinary_reuse_completion_count_data SET val = 0 WHERE id = 1;
+	SELECT injection_points_set_global_int8('reuse-old-count', 0);
+	SELECT injection_points_set_global_int8('reuse-new-count', 0);
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step w_prepare_abort: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT injection_points_attach('start-after-vxid-publication', 'wait');
+	SELECT injection_points_set_global_int8(
+		'reuse-old-count',
+		injection_points_xact_completion_count_shadow()
+	);
+	UPDATE csn_ordinary_reuse_completion_count_data SET val = 2 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step w_abort: ABORT; <waiting ...>
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step w_abort: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_begin_new: BEGIN; <waiting ...>
+step o_before_new_xid: 
+	SELECT injection_points_xact_completion_count_shadow() >
+			injection_points_get_global_int8('reuse-old-count')
+			AS completion_count_advanced;
+
+completion_count_advanced
+-------------------------
+t                        
+(1 row)
+
+step wake_start: SELECT injection_points_wakeup('start-after-vxid-publication'); <waiting ...>
+step w_begin_new: <... completed>
+step wake_start: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_start: SELECT injection_points_detach('start-after-vxid-publication');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step w_capture_new: 
+	SELECT injection_points_set_global_int8(
+		'reuse-new-count',
+		injection_points_transaction_snapshot_xact_completion_count()
+	);
+
+injection_points_set_global_int8
+--------------------------------
+                                
+(1 row)
+
+step o_new_tx_snapshot: 
+	SELECT injection_points_get_global_int8('reuse-new-count') =
+			injection_points_xact_completion_count_shadow()
+			AS new_tx_matches_shadow,
+		injection_points_get_global_int8('reuse-new-count') >
+			injection_points_get_global_int8('reuse-old-count')
+			AS new_tx_is_fresh;
+
+new_tx_matches_shadow|new_tx_is_fresh
+---------------------+---------------
+t                    |t              
+(1 row)
+
+step w_rollback: ROLLBACK;

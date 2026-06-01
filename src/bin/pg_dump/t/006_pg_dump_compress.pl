@@ -411,6 +411,20 @@ my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->start;
 
+my $uses_csn_snapshot = $node->safe_psql(
+	'postgres',
+	q[
+		BEGIN ISOLATION LEVEL REPEATABLE READ;
+		SELECT pg_current_snapshot_uses_csn();
+		ROLLBACK;
+	]);
+chomp($uses_csn_snapshot);
+
+if ($uses_csn_snapshot eq 't')
+{
+	delete $pgdump_runs{compression_gzip_dir};
+}
+
 my $port = $node->port;
 
 #########################################

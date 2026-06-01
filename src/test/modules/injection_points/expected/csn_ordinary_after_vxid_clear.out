@@ -1,0 +1,203 @@
+Parsed test spec with 4 sessions
+
+starting permutation: reset wc_prepare wc_finish o_commit_after_clear_state wake detach
+step reset: 
+	TRUNCATE csn_ordinary_after_vxid_clear_state;
+	UPDATE csn_ordinary_after_vxid_clear_data SET val = 0 WHERE id = 1;
+
+step wc_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-vxid-clear', 'wait');
+	INSERT INTO csn_ordinary_after_vxid_clear_state(label, pid, fxid, vxid)
+	VALUES (
+		'writer',
+		pg_backend_pid(),
+		pg_current_xact_id(),
+		(
+			SELECT virtualtransaction
+			FROM pg_locks
+			WHERE pid = pg_backend_pid()
+			  AND locktype = 'virtualxid'
+		)
+	);
+	UPDATE csn_ordinary_after_vxid_clear_data SET val = 1 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step wc_finish: COMMIT; <waiting ...>
+step o_commit_after_clear_state: 
+	SELECT injection_points_xid_in_progress(
+		(SELECT fxid
+		 FROM csn_ordinary_after_vxid_clear_state
+		 WHERE label = 'writer')
+	) = false AS old_xid_retired,
+		injection_points_backend_xid(
+			(SELECT pid
+			 FROM csn_ordinary_after_vxid_clear_state
+			 WHERE label = 'writer')
+		) IS NULL AS backend_xid_cleared,
+		EXISTS (
+			SELECT 1
+			FROM pg_locks
+			WHERE locktype = 'virtualxid'
+			  AND virtualtransaction = (
+				SELECT vxid
+				FROM csn_ordinary_after_vxid_clear_state
+				WHERE label = 'writer'
+			  )
+		) = false AS old_vxid_gone,
+		EXISTS (
+			SELECT 1
+			FROM pg_locks
+			WHERE locktype = 'virtualxid'
+			  AND pid = (
+				SELECT pid
+				FROM csn_ordinary_after_vxid_clear_state
+				WHERE label = 'writer'
+			  )
+		) AS current_vxid_visible,
+		(
+			SELECT virtualtransaction
+			FROM pg_locks
+			WHERE locktype = 'virtualxid'
+			  AND pid = (
+				SELECT pid
+				FROM csn_ordinary_after_vxid_clear_state
+				WHERE label = 'writer'
+			  )
+		) <>
+		(
+			SELECT vxid
+			FROM csn_ordinary_after_vxid_clear_state
+			WHERE label = 'writer'
+		) AS current_vxid_changed;
+
+old_xid_retired|backend_xid_cleared|old_vxid_gone|current_vxid_visible|current_vxid_changed
+---------------+-------------------+-------------+--------------------+--------------------
+t              |t                  |t            |t                   |t                   
+(1 row)
+
+step wake: SELECT injection_points_wakeup('ordinary-after-vxid-clear'); <waiting ...>
+step wc_finish: <... completed>
+step wake: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach: SELECT injection_points_detach('ordinary-after-vxid-clear');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: reset wa_prepare wa_finish o_abort_after_clear_state wake detach
+step reset: 
+	TRUNCATE csn_ordinary_after_vxid_clear_state;
+	UPDATE csn_ordinary_after_vxid_clear_data SET val = 0 WHERE id = 1;
+
+step wa_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-vxid-clear', 'wait');
+	INSERT INTO csn_ordinary_after_vxid_clear_state(label, pid, fxid, vxid)
+	VALUES (
+		'abort',
+		pg_backend_pid(),
+		pg_current_xact_id(),
+		(
+			SELECT virtualtransaction
+			FROM pg_locks
+			WHERE pid = pg_backend_pid()
+			  AND locktype = 'virtualxid'
+		)
+	);
+	UPDATE csn_ordinary_after_vxid_clear_data SET val = 2 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step wa_finish: ABORT; <waiting ...>
+step o_abort_after_clear_state: 
+	SELECT injection_points_xid_in_progress(
+		(SELECT fxid
+		 FROM csn_ordinary_after_vxid_clear_state
+		 WHERE label = 'abort')
+	) = false AS old_xid_retired,
+		injection_points_backend_xid(
+			(SELECT pid
+			 FROM csn_ordinary_after_vxid_clear_state
+			 WHERE label = 'abort')
+		) IS NULL AS backend_xid_cleared,
+		EXISTS (
+			SELECT 1
+			FROM pg_locks
+			WHERE locktype = 'virtualxid'
+			  AND virtualtransaction = (
+				SELECT vxid
+				FROM csn_ordinary_after_vxid_clear_state
+				WHERE label = 'abort'
+			  )
+		) = false AS old_vxid_gone,
+		EXISTS (
+			SELECT 1
+			FROM pg_locks
+			WHERE locktype = 'virtualxid'
+			  AND pid = (
+				SELECT pid
+				FROM csn_ordinary_after_vxid_clear_state
+				WHERE label = 'abort'
+			  )
+		) AS current_vxid_visible,
+		(
+			SELECT virtualtransaction
+			FROM pg_locks
+			WHERE locktype = 'virtualxid'
+			  AND pid = (
+				SELECT pid
+				FROM csn_ordinary_after_vxid_clear_state
+				WHERE label = 'abort'
+			  )
+		) <>
+		(
+			SELECT vxid
+			FROM csn_ordinary_after_vxid_clear_state
+			WHERE label = 'abort'
+		) AS current_vxid_changed;
+
+old_xid_retired|backend_xid_cleared|old_vxid_gone|current_vxid_visible|current_vxid_changed
+---------------+-------------------+-------------+--------------------+--------------------
+               |t                  |t            |f                   |                    
+(1 row)
+
+step wake: SELECT injection_points_wakeup('ordinary-after-vxid-clear'); <waiting ...>
+step wa_finish: <... completed>
+step wake: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach: SELECT injection_points_detach('ordinary-after-vxid-clear');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

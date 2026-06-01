@@ -392,15 +392,41 @@ SKIP:
 	# differ because of locale changes. Additionally this provides test
 	# coverage for --create option.
 	#
-	# Use directory format so that we can use parallel dump/restore.
+	# Prefer directory format so that non-CSN snapshots still exercise
+	# parallel dump and restore.
 	my $dump_file = "$tempdir/regression.dump";
-	$oldnode->command_ok(
-		[
-			'pg_dump', '-Fd', '-j2', '--no-sync',
-			'-d' => $oldnode->connstr('regression'),
-			'--create', '-f' => $dump_file
-		],
-		'pg_dump on source instance');
+	my $uses_csn_snapshot = $oldnode->safe_psql(
+		'postgres',
+		q[
+			BEGIN ISOLATION LEVEL REPEATABLE READ;
+			SELECT pg_current_snapshot_uses_csn();
+			ROLLBACK;
+		]);
+	chomp($uses_csn_snapshot);
+
+	if ($uses_csn_snapshot eq 't')
+	{
+		# Parallel pg_dump depends on synchronized snapshot export, which is
+		# intentionally rejected for CSN-sensitive snapshots on this branch.
+		# Keep the dump/restore roundtrip coverage with a single dump worker.
+		$oldnode->command_ok(
+			[
+				'pg_dump', '-Fc', '--no-sync',
+				'-d' => $oldnode->connstr('regression'),
+				'--create', '-f' => $dump_file
+			],
+			'pg_dump on source instance');
+	}
+	else
+	{
+		$oldnode->command_ok(
+			[
+				'pg_dump', '-Fd', '-j2', '--no-sync',
+				'-d' => $oldnode->connstr('regression'),
+				'--create', '-f' => $dump_file
+			],
+			'pg_dump on source instance');
+	}
 
 	$dstnode->command_ok(
 		[ 'pg_restore', '--create', '-j2', '-d' => 'postgres', $dump_file ],

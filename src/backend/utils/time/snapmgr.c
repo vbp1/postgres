@@ -149,6 +149,9 @@ SnapshotData SnapshotToastData = {SNAPSHOT_TOAST};
 static Snapshot CurrentSnapshot = NULL;
 static Snapshot SecondarySnapshot = NULL;
 static Snapshot CatalogSnapshot = NULL;
+static bool ForceSnapshotFallback = false;
+static bool ForceSnapshotFallbackSticky = false;
+static bool ForceSnapshotFallbackFromTempNamespace = false;
 static Snapshot HistoricSnapshot = NULL;
 
 /*
@@ -247,6 +250,8 @@ ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snap)
  *
  * Only these fields need to be sent to the cooperating backend; the
  * remaining ones can (and must) be set by the receiver upon restore.
+ * snapshot_csn is included so internal binary transport preserves CSN-aware
+ * MVCC snapshots.
  */
 typedef struct SerializedSnapshotData
 {
@@ -257,6 +262,7 @@ typedef struct SerializedSnapshotData
 	bool		suboverflowed;
 	bool		takenDuringRecovery;
 	CommandId	curcid;
+	CommitSeqNo snapshot_csn;
 } SerializedSnapshotData;
 
 /*
@@ -331,6 +337,7 @@ GetTransactionSnapshot(void)
 			CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
 
 		FirstSnapshotSet = true;
+		SnapMgrConsumeSnapshotFallback();
 		return CurrentSnapshot;
 	}
 
@@ -341,6 +348,7 @@ GetTransactionSnapshot(void)
 	InvalidateCatalogSnapshot();
 
 	CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+	SnapMgrConsumeSnapshotFallback();
 
 	return CurrentSnapshot;
 }
@@ -372,8 +380,50 @@ GetLatestSnapshot(void)
 		return GetTransactionSnapshot();
 
 	SecondarySnapshot = GetSnapshotData(&SecondarySnapshotData);
+	SnapMgrConsumeSnapshotFallback();
 
 	return SecondarySnapshot;
+}
+
+bool
+SnapMgrShouldForceSnapshotFallback(void)
+{
+	return ForceSnapshotFallback;
+}
+
+bool
+SnapMgrShouldPreserveSnapshotFallbackForExplicitBegin(void)
+{
+	return ForceSnapshotFallbackFromTempNamespace;
+}
+
+void
+SnapMgrForceSnapshotFallback(void)
+{
+	ForceSnapshotFallback = true;
+}
+
+void
+SnapMgrForceSnapshotFallbackSticky(void)
+{
+	ForceSnapshotFallback = true;
+	ForceSnapshotFallbackSticky = true;
+}
+
+void
+SnapMgrReleaseSnapshotFallbackSticky(void)
+{
+	ForceSnapshotFallbackSticky = false;
+}
+
+void
+SnapMgrConsumeSnapshotFallback(void)
+{
+	if (ForceSnapshotFallbackSticky)
+		return;
+
+	ForceSnapshotFallback = false;
+	ForceSnapshotFallbackFromTempNamespace = false;
 }
 
 /*
@@ -546,6 +596,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 			   sourcesnap->subxcnt * sizeof(TransactionId));
 	CurrentSnapshot->suboverflowed = sourcesnap->suboverflowed;
 	CurrentSnapshot->takenDuringRecovery = sourcesnap->takenDuringRecovery;
+	CurrentSnapshot->snapshot_csn = InvalidCommitSeqNo;
 	/* NB: curcid should NOT be copied, it's a local matter */
 
 	CurrentSnapshot->snapXactCompletionCount = 0;
@@ -595,6 +646,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 	}
 
 	FirstSnapshotSet = true;
+	SnapMgrConsumeSnapshotFallback();
 }
 
 /*
@@ -943,7 +995,8 @@ SnapshotResetXmin(void)
 
 	if (pairingheap_is_empty(&RegisteredSnapshots))
 	{
-		MyProc->xmin = TransactionXmin = InvalidTransactionId;
+		TransactionXmin = InvalidTransactionId;
+		ProcArrayUpdateXmin(MyProc, InvalidTransactionId);
 		return;
 	}
 
@@ -951,7 +1004,10 @@ SnapshotResetXmin(void)
 										pairingheap_first(&RegisteredSnapshots));
 
 	if (TransactionIdPrecedes(MyProc->xmin, minSnapshot->xmin))
-		MyProc->xmin = TransactionXmin = minSnapshot->xmin;
+	{
+		TransactionXmin = minSnapshot->xmin;
+		ProcArrayUpdateXmin(MyProc, minSnapshot->xmin);
+	}
 }
 
 /*
@@ -1013,7 +1069,7 @@ AtSubAbort_Snapshot(int level)
  *		Snapshot manager's cleanup function for end of transaction
  */
 void
-AtEOXact_Snapshot(bool isCommit, bool resetXmin)
+AtEOXact_Snapshot(bool isCommit, bool resetXmin, bool resetReuse)
 {
 	/*
 	 * In transaction-snapshot mode we must release our privately-managed
@@ -1094,9 +1150,31 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 	FirstSnapshotSet = false;
 
 	/*
-	 * During normal commit processing, we call ProcArrayEndTransaction() to
-	 * reset the MyProc->xmin. That call happens prior to the call to
-	 * AtEOXact_Snapshot(), so we need not touch xmin here at all.
+	 * Rebuild static snapshots across every top-level transaction boundary so
+	 * the next statement cannot reuse the previous transaction's backend-
+	 * local image. Temp-object activity remains a separate reason to keep the
+	 * successor statement on the conservative fallback path, but ordinary
+	 * successors should otherwise return to the regular snapshot-selection
+	 * path.
+	 */
+	CurrentSnapshotData.snapXactCompletionCount = 0;
+	SecondarySnapshotData.snapXactCompletionCount = 0;
+
+	if (resetReuse || (MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE) != 0)
+	{
+		CurrentSnapshotData.snapshot_csn = InvalidCommitSeqNo;
+		SecondarySnapshotData.snapshot_csn = InvalidCommitSeqNo;
+	}
+
+	ForceSnapshotFallbackSticky = false;
+	ForceSnapshotFallbackFromTempNamespace =
+		(MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE) != 0;
+	ForceSnapshotFallback = ForceSnapshotFallbackFromTempNamespace;
+
+	/*
+	 * During normal commit processing, the ordinary primary path clears
+	 * MyProc->xmin before AtEOXact_Snapshot() runs, so we need not touch xmin
+	 * here at all.
 	 */
 	if (resetXmin)
 		SnapshotResetXmin();
@@ -1160,6 +1238,11 @@ ExportSnapshot(Snapshot snapshot)
 	 * Importers of the snapshot must see them as still running, so get their
 	 * XIDs to add them to the snapshot.
 	 */
+	if (SnapshotUsesCSN(snapshot))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot export a CSN-sensitive snapshot")));
+
 	nchildren = xactGetCommittedChildren(&children);
 
 	/*
@@ -1516,6 +1599,17 @@ ImportSnapshot(const char *idstr)
 	}
 
 	snapshot.takenDuringRecovery = parseIntFromText("rec:", &filebuf, path);
+	snapshot.snapshot_csn = InvalidCommitSeqNo;
+
+	/*
+	 * SQL-level snapshot import/export remains text-only and does not support
+	 * CSN-sensitive snapshots.  If a CSN marker is present in the file, reject
+	 * the import explicitly rather than silently downgrading it.
+	 */
+	if (strncmp(filebuf, "csn:", 4) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot import a CSN-sensitive snapshot")));
 
 	/*
 	 * Do some additional sanity checking, just to protect ourselves.  We
@@ -1747,6 +1841,7 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 	serialized_snapshot.suboverflowed = snapshot->suboverflowed;
 	serialized_snapshot.takenDuringRecovery = snapshot->takenDuringRecovery;
 	serialized_snapshot.curcid = snapshot->curcid;
+	serialized_snapshot.snapshot_csn = snapshot->snapshot_csn;
 
 	/*
 	 * Ignore the SubXID array if it has overflowed, unless the snapshot was
@@ -1820,6 +1915,7 @@ RestoreSnapshot(char *start_address)
 	snapshot->takenDuringRecovery = serialized_snapshot.takenDuringRecovery;
 	snapshot->curcid = serialized_snapshot.curcid;
 	snapshot->snapXactCompletionCount = 0;
+	snapshot->snapshot_csn = serialized_snapshot.snapshot_csn;
 
 	/* Copy XIDs, if present. */
 	if (serialized_snapshot.xcnt > 0)
@@ -1855,34 +1951,9 @@ RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
 	SetTransactionSnapshot(snapshot, NULL, InvalidPid, source_pgproc);
 }
 
-/*
- * XidInMVCCSnapshot
- *		Is the given XID still-in-progress according to the snapshot?
- *
- * Note: GetSnapshotData never stores either top xid or subxids of our own
- * backend into a snapshot, so these xids will not be reported as "running"
- * by this function.  This is OK for current uses, because we always check
- * TransactionIdIsCurrentTransactionId first, except when it's known the
- * XID could not be ours anyway.
- */
-bool
-XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+static bool
+XidInMVCCSnapshotLegacy(TransactionId xid, Snapshot snapshot)
 {
-	/*
-	 * Make a quick range check to eliminate most XIDs without looking at the
-	 * xip arrays.  Note that this is OK even if we convert a subxact XID to
-	 * its parent below, because a subxact with XID < xmin has surely also got
-	 * a parent with XID < xmin, while one with XID >= xmax must belong to a
-	 * parent that was not yet committed at the time of this snapshot.
-	 */
-
-	/* Any xid < xmin is not in-progress */
-	if (TransactionIdPrecedes(xid, snapshot->xmin))
-		return false;
-	/* Any xid >= xmax is in-progress */
-	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
-		return true;
-
 	/*
 	 * Snapshot information is stored slightly differently in snapshots taken
 	 * during recovery.
@@ -1960,6 +2031,76 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	}
 
 	return false;
+}
+
+static bool
+XidInMVCCSnapshotCSN(TransactionId xid, Snapshot snapshot)
+{
+	CommitSeqNo xidcsn = InvalidCommitSeqNo;
+	TransactionCSNStatus xidstatus;
+
+	Assert(SnapshotUsesCSN(snapshot));
+
+	xidstatus = TransactionIdGetCSNStatus(xid, &xidcsn);
+
+	switch (xidstatus)
+	{
+		case TRANSACTION_CSN_STATUS_INVALID:
+
+			/*
+			 * The supported CSN path must not invent an answer when the status
+			 * API cannot prove one. Fall back to the existing xid-array logic
+			 * explicitly until F1 removes that compatibility dependency too.
+			 */
+			return XidInMVCCSnapshotLegacy(xid, snapshot);
+		case TRANSACTION_CSN_STATUS_IN_PROGRESS:
+		case TRANSACTION_CSN_STATUS_COMMITTING:
+			return true;
+		case TRANSACTION_CSN_STATUS_ABORTED:
+			return false;
+		case TRANSACTION_CSN_STATUS_COMMITTED:
+			if (CommitSeqNoIsFrozen(xidcsn))
+				return false;
+
+			return !CommitSeqNoPrecedes(xidcsn, snapshot->snapshot_csn);
+	}
+
+	pg_unreachable();
+}
+
+/*
+ * XidInMVCCSnapshot
+ *		Is the given XID still-in-progress according to the snapshot?
+ *
+ * Note: GetSnapshotData never stores either top xid or subxids of our own
+ * backend into a snapshot, so these xids will not be reported as "running"
+ * by this function.  This is OK for current uses, because we always check
+ * TransactionIdIsCurrentTransactionId first, except when it's known the
+ * XID could not be ours anyway.
+ */
+bool
+XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+{
+	/*
+	 * Make a quick range check to eliminate most XIDs without looking at the
+	 * snapshot payload. Note that this is OK even if a later fallback converts
+	 * a subxact XID to its parent below, because a subxact with XID < xmin has
+	 * surely also got a parent with XID < xmin, while one with XID >= xmax
+	 * must belong to a parent that was not yet committed at the time of this
+	 * snapshot.
+	 */
+
+	/* Any xid < xmin is not in-progress */
+	if (TransactionIdPrecedes(xid, snapshot->xmin))
+		return false;
+	/* Any xid >= xmax is in-progress */
+	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
+		return true;
+
+	if (SnapshotUsesCSN(snapshot))
+		return XidInMVCCSnapshotCSN(xid, snapshot);
+
+	return XidInMVCCSnapshotLegacy(xid, snapshot);
 }
 
 /* ResourceOwner callbacks */

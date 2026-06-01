@@ -1,0 +1,99 @@
+Parsed test spec with 5 sessions
+
+starting permutation: reset hb_begin hb_commit cic_before wake_before detach_before
+seed: NOTICE:  index "csn_ordinary_cic_wait_before_idx" does not exist, skipping
+seed: NOTICE:  index "csn_ordinary_cic_wait_after_idx" does not exist, skipping
+step reset: 
+	DROP INDEX IF EXISTS csn_ordinary_cic_wait_before_idx;
+	DROP INDEX IF EXISTS csn_ordinary_cic_wait_after_idx;
+
+step hb_begin: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-primary', 'wait');
+	SELECT count(*) FROM csn_ordinary_cic_wait;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+count
+-----
+   10
+(1 row)
+
+step hb_commit: COMMIT; <waiting ...>
+step cic_before: 
+	CREATE INDEX CONCURRENTLY csn_ordinary_cic_wait_before_idx
+		ON csn_ordinary_cic_wait (id);
+ <waiting ...>
+step wake_before: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
+step hb_commit: <... completed>
+step cic_before: <... completed>
+step wake_before: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_before: SELECT injection_points_detach('ordinary-before-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: reset ha_begin ha_commit cic_after wake_after detach_after
+seed: NOTICE:  index "csn_ordinary_cic_wait_before_idx" does not exist, skipping
+seed: NOTICE:  index "csn_ordinary_cic_wait_after_idx" does not exist, skipping
+step reset: 
+	DROP INDEX IF EXISTS csn_ordinary_cic_wait_before_idx;
+	DROP INDEX IF EXISTS csn_ordinary_cic_wait_after_idx;
+
+step ha_begin: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-after-procarray-primary', 'wait');
+	SELECT count(*) FROM csn_ordinary_cic_wait;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+count
+-----
+   10
+(1 row)
+
+step ha_commit: COMMIT; <waiting ...>
+step cic_after: 
+	CREATE INDEX CONCURRENTLY csn_ordinary_cic_wait_after_idx
+		ON csn_ordinary_cic_wait (id);
+ <waiting ...>
+step wake_after: SELECT injection_points_wakeup('ordinary-after-procarray-primary'); <waiting ...>
+step ha_commit: <... completed>
+step cic_after: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-after-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

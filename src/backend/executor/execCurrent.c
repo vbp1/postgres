@@ -69,6 +69,16 @@ execCurrentOf(CurrentOfExpr *cexpr,
 				(errcode(ERRCODE_UNDEFINED_CURSOR),
 				 errmsg("cursor \"%s\" does not exist", cursor_name)));
 
+	elog(LOG,
+		 "debug current of: cursor=%s strategy=%d atStart=%d atEnd=%d pos=%llu queryDesc=%p estate=%p",
+		 cursor_name,
+		 (int) portal->strategy,
+		 portal->atStart,
+		 portal->atEnd,
+		 (unsigned long long) portal->portalPos,
+		 portal->queryDesc,
+		 portal->queryDesc ? portal->queryDesc->estate : NULL);
+
 	/*
 	 * We have to watch out for non-SELECT queries as well as held cursors,
 	 * both of which may have null queryDesc.

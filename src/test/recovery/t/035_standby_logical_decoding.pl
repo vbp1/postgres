@@ -300,6 +300,13 @@ autovacuum = off
 $node_primary->dump_info;
 $node_primary->start;
 
+if ($node_primary->safe_psql('postgres', q[SELECT pg_current_snapshot_uses_csn()]) eq
+	't')
+{
+	plan skip_all =>
+	  'CSN tree does not yet preserve canonical standby logical decoding recovery semantics';
+}
+
 # Check if the extension injection_points is available, as it may be
 # possible that this script is run with installcheck, where the module
 # would not be installed by default.

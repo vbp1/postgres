@@ -1113,6 +1113,7 @@ exec_simple_query(const char *query_string)
 	{
 		RawStmt    *parsetree = lfirst_node(RawStmt, parsetree_item);
 		bool		snapshot_set = false;
+		bool		force_fallback_snapshot = false;
 		CommandTag	commandTag;
 		QueryCompletion qc;
 		MemoryContext per_parsetree_context = NULL;
@@ -1171,6 +1172,8 @@ exec_simple_query(const char *query_string)
 		/* If we got a cancel signal in parsing or prior command, quit */
 		CHECK_FOR_INTERRUPTS();
 
+		force_fallback_snapshot = SnapMgrShouldForceSnapshotFallback();
+
 		/*
 		 * Set up a snapshot if parse analysis/planning will need one.
 		 */
@@ -1220,7 +1223,16 @@ exec_simple_query(const char *query_string)
 		 * https://postgr.es/m/flat/5075D8DF.6050500@fuzzy.cz for details.
 		 */
 		if (snapshot_set)
+		{
 			PopActiveSnapshot();
+			if (force_fallback_snapshot)
+			{
+				if (SnapMgrShouldPreserveSnapshotFallbackForExplicitBegin())
+					SnapMgrForceSnapshotFallbackSticky();
+				else
+					SnapMgrForceSnapshotFallback();
+			}
+		}
 
 		/* If we got a cancel signal in analysis or planning, quit */
 		CHECK_FOR_INTERRUPTS();
@@ -1246,9 +1258,18 @@ exec_simple_query(const char *query_string)
 						  NULL);
 
 		/*
-		 * Start the portal.  No parameters here.
+		 * If planning consumed a one-shot fallback marker, seed execution with
+		 * a fresh transaction snapshot after planning is complete.
 		 */
-		PortalStart(portal, NULL, 0, InvalidSnapshot);
+		{
+			Snapshot	exec_snapshot = InvalidSnapshot;
+
+			if (snapshot_set && force_fallback_snapshot)
+				exec_snapshot = GetTransactionSnapshot();
+
+			/* Start the portal.  No parameters here. */
+			PortalStart(portal, NULL, 0, exec_snapshot);
+		}
 
 		/*
 		 * Select the appropriate output format: text unless we are doing a
@@ -1297,6 +1318,12 @@ exec_simple_query(const char *query_string)
 		receiver->rDestroy(receiver);
 
 		PortalDrop(portal, false);
+		if (force_fallback_snapshot &&
+			SnapMgrShouldPreserveSnapshotFallbackForExplicitBegin())
+		{
+			SnapMgrReleaseSnapshotFallbackSticky();
+			SnapMgrConsumeSnapshotFallback();
+		}
 
 		if (lnext(parsetree_list, parsetree_item) == NULL)
 		{
@@ -1493,6 +1520,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 	if (parsetree_list != NIL)
 	{
 		bool		snapshot_set = false;
+		bool		force_fallback_snapshot = false;
 
 		raw_parse_tree = linitial_node(RawStmt, parsetree_list);
 
@@ -1518,6 +1546,8 @@ exec_parse_message(const char *query_string,	/* string to execute */
 		psrc = CreateCachedPlan(raw_parse_tree, query_string,
 								CreateCommandTag(raw_parse_tree->stmt));
 
+		force_fallback_snapshot = SnapMgrShouldForceSnapshotFallback();
+
 		/*
 		 * Set up a snapshot if parse analysis will need one.
 		 */
@@ -1540,7 +1570,11 @@ exec_parse_message(const char *query_string,	/* string to execute */
 
 		/* Done with the snapshot used for parsing */
 		if (snapshot_set)
+		{
 			PopActiveSnapshot();
+			if (force_fallback_snapshot)
+				SnapMgrForceSnapshotFallback();
+		}
 	}
 	else
 	{
@@ -1655,6 +1689,7 @@ exec_bind_message(StringInfo input_message)
 	MemoryContext oldContext;
 	bool		save_log_statement_stats = log_statement_stats;
 	bool		snapshot_set = false;
+	bool		force_fallback_snapshot = false;
 	char		msec_str[32];
 	ParamsErrorCbData params_data;
 	ErrorContextCallback params_errcxt;
@@ -2058,12 +2093,25 @@ exec_bind_message(StringInfo input_message)
 
 	/* Done with the snapshot used for parameter I/O and parsing/planning */
 	if (snapshot_set)
+	{
 		PopActiveSnapshot();
+		if (force_fallback_snapshot)
+			SnapMgrForceSnapshotFallback();
+	}
 
-	/*
-	 * And we're ready to start portal execution.
-	 */
-	PortalStart(portal, params, 0, InvalidSnapshot);
+		/*
+		 * If planning consumed a one-shot fallback marker, seed execution with
+		 * a fresh transaction snapshot after planning is complete.
+		 */
+		{
+			Snapshot	exec_snapshot = InvalidSnapshot;
+
+			if (snapshot_set && force_fallback_snapshot)
+				exec_snapshot = GetTransactionSnapshot();
+
+			/* And we're ready to start portal execution. */
+			PortalStart(portal, params, 0, exec_snapshot);
+		}
 
 	/*
 	 * Apply the result format requests to the portal.

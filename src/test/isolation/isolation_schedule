@@ -16,6 +16,8 @@ test: ri-trigger
 test: partial-index
 test: two-ids
 test: multiple-row-versions
+test: csn-stage1
+test: subxid-csn-contract
 test: index-only-scan
 test: index-only-bitmapscan
 test: predicate-lock-hot-tuple

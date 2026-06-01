@@ -1,0 +1,109 @@
+Parsed test spec with 5 sessions
+
+starting permutation: reset wb_seed wb_prepare wb_commit o_before_visible wake_before detach_before
+step reset: 
+	TRUNCATE csn_ordinary_delay_chkpt_vxid_state;
+	UPDATE csn_ordinary_delay_chkpt_vxid_data SET val = 0 WHERE id = 1;
+
+step wb_seed: 
+	INSERT INTO csn_ordinary_delay_chkpt_vxid_state(label, pid)
+	VALUES ('before', pg_backend_pid());
+
+step wb_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('commit-after-delay-checkpoint', 'wait');
+	UPDATE csn_ordinary_delay_chkpt_vxid_data SET val = 1 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step wb_commit: COMMIT; <waiting ...>
+step o_before_visible: 
+	SELECT injection_points_backend_delays_checkpoint(
+		(SELECT pid
+		 FROM csn_ordinary_delay_chkpt_vxid_state
+		 WHERE label = 'before'),
+		1
+	) AS before_seen_by_delay_chkpt_reader;
+
+before_seen_by_delay_chkpt_reader
+---------------------------------
+t                                
+(1 row)
+
+step wake_before: SELECT injection_points_wakeup('commit-after-delay-checkpoint'); <waiting ...>
+step wb_commit: <... completed>
+step wake_before: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_before: SELECT injection_points_detach('commit-after-delay-checkpoint');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: reset wa_seed wa_prepare wa_commit o_after_not_visible wake_after detach_after
+step reset: 
+	TRUNCATE csn_ordinary_delay_chkpt_vxid_state;
+	UPDATE csn_ordinary_delay_chkpt_vxid_data SET val = 0 WHERE id = 1;
+
+step wa_seed: 
+	INSERT INTO csn_ordinary_delay_chkpt_vxid_state(label, pid)
+	VALUES ('after', pg_backend_pid());
+
+step wa_prepare: 
+	BEGIN;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('ordinary-before-procarray-primary', 'wait');
+	UPDATE csn_ordinary_delay_chkpt_vxid_data SET val = 2 WHERE id = 1;
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step wa_commit: COMMIT; <waiting ...>
+step o_after_not_visible: 
+	SELECT injection_points_backend_delays_checkpoint(
+		(SELECT pid
+		 FROM csn_ordinary_delay_chkpt_vxid_state
+		 WHERE label = 'after'),
+		1
+	) = false AS after_not_seen_by_delay_chkpt_reader;
+
+after_not_seen_by_delay_chkpt_reader
+------------------------------------
+t                                   
+(1 row)
+
+step wake_after: SELECT injection_points_wakeup('ordinary-before-procarray-primary'); <waiting ...>
+step wa_commit: <... completed>
+step wake_after: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step detach_after: SELECT injection_points_detach('ordinary-before-procarray-primary');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

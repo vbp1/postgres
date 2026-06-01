@@ -74,6 +74,16 @@ extern PGDLLIMPORT SnapshotData SnapshotToastData;
 #define IsMVCCLikeSnapshot(snapshot)  \
 	(IsMVCCSnapshot(snapshot) || IsHistoricMVCCSnapshot(snapshot))
 
+/*
+ * Stage 1 CSN snapshots carry a prototype committed-visibility boundary in
+ * snapshot_csn. InvalidCommitSeqNo means this snapshot remains on the legacy
+ * xid-array path.
+ */
+#define SnapshotHasCSN(snapshot) \
+	(CommitSeqNoIsValid((snapshot)->snapshot_csn))
+#define SnapshotUsesCSN(snapshot) \
+	(IsMVCCSnapshot(snapshot) && SnapshotHasCSN(snapshot))
+
 extern Snapshot GetTransactionSnapshot(void);
 extern Snapshot GetLatestSnapshot(void);
 extern void SnapshotSetCommandId(CommandId curcid);
@@ -98,7 +108,13 @@ extern void UnregisterSnapshotFromOwner(Snapshot snapshot, ResourceOwner owner);
 
 extern void AtSubCommit_Snapshot(int level);
 extern void AtSubAbort_Snapshot(int level);
-extern void AtEOXact_Snapshot(bool isCommit, bool resetXmin);
+extern void AtEOXact_Snapshot(bool isCommit, bool resetXmin, bool resetReuse);
+extern bool SnapMgrShouldForceSnapshotFallback(void);
+extern bool SnapMgrShouldPreserveSnapshotFallbackForExplicitBegin(void);
+extern void SnapMgrForceSnapshotFallback(void);
+extern void SnapMgrForceSnapshotFallbackSticky(void);
+extern void SnapMgrReleaseSnapshotFallbackSticky(void);
+extern void SnapMgrConsumeSnapshotFallback(void);
 
 extern void ImportSnapshot(const char *idstr);
 extern bool XactHasExportedSnapshots(void);

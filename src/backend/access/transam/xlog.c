@@ -48,6 +48,8 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/csn_mvcc_vars.h"
+#include "access/csnlog.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
@@ -5605,6 +5607,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	/* Bootstrap the commit log, too */
 	BootStrapCLOG();
 	BootStrapCommitTs();
+	BootStrapCSNLOG();
 	BootStrapSUBTRANS();
 	BootStrapMultiXact();
 
@@ -5860,6 +5863,7 @@ StartupXLOG(void)
 	XLogRecPtr	abortedRecPtr;
 	XLogRecPtr	missingContrecPtr;
 	TransactionId oldestActiveXID;
+	bool		csnlogStarted = false;
 	bool		promoted = false;
 	char		timebuf[128];
 
@@ -6231,10 +6235,12 @@ StartupXLOG(void)
 			ProcArrayInitRecovery(XidFromFullTransactionId(TransamVariables->nextXid));
 
 			/*
-			 * Startup subtrans only.  CLOG, MultiXact and commit timestamp
-			 * have already been started up and other SLRUs are not maintained
-			 * during recovery and need not be started yet.
+			 * Startup xid-indexed transient SLRUs needed during recovery.
+			 * CLOG, MultiXact and commit timestamp have already been started
+			 * up and other SLRUs still need not be started yet.
 			 */
+			StartupCSNLOG(oldestActiveXID);
+			csnlogStarted = true;
 			StartupSUBTRANS(oldestActiveXID);
 
 			/*
@@ -6270,6 +6276,12 @@ StartupXLOG(void)
 
 				ProcArrayApplyRecoveryInfo(&running);
 			}
+		}
+		else
+		{
+			oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
+			StartupCSNLOG(oldestActiveXID);
+			csnlogStarted = true;
 		}
 
 		/*
@@ -6354,6 +6366,13 @@ StartupXLOG(void)
 	 * as potential problems are detected before any on-disk change is done.
 	 */
 	oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
+	if (!csnlogStarted)
+	{
+		StartupCSNLOG(oldestActiveXID);
+		csnlogStarted = true;
+	}
+	else
+		SetCSNOldestActiveXid(oldestActiveXID);
 
 	/*
 	 * Allow ordinary WAL segment creation before possibly switching to a new
@@ -6513,11 +6532,13 @@ StartupXLOG(void)
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	TransamVariables->latestCompletedXid = TransamVariables->nextXid;
 	FullTransactionIdRetreat(&TransamVariables->latestCompletedXid);
+	ProcArrayWriteLatestCompletedXidShadow(TransamVariables->latestCompletedXid);
 	LWLockRelease(ProcArrayLock);
 
 	/*
-	 * Start up subtrans, if not already done for hot standby.  (commit
-	 * timestamps are started below, if necessary.)
+	 * Start up xid-indexed transient SLRUs not maintained during replay, if
+	 * not already done for hot standby.  (commit timestamps are started
+	 * below, if necessary.)
 	 */
 	if (standbyState == STANDBY_DISABLED)
 		StartupSUBTRANS(oldestActiveXID);
@@ -6525,6 +6546,7 @@ StartupXLOG(void)
 	/*
 	 * Perform end of recovery actions for any SLRUs that need it.
 	 */
+	TrimCSNLOG();
 	TrimCLOG();
 	TrimMultiXact();
 
@@ -8056,6 +8078,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckpointStats.ckpt_write_t = GetCurrentTimestamp();
 	CheckPointCLOG();
 	CheckPointCommitTs();
+	CheckPointCSNLOG();
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();

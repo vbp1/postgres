@@ -296,7 +296,7 @@ SELECT txid_status(2); -- FrozenTransactionId is always committed
  committed
 (1 row)
 
-SELECT txid_status(3); -- in regress testing FirstNormalTransactionId will always be behind oldestXmin
+SELECT txid_status(3); -- FirstNormalTransactionId is too old to classify here
  txid_status 
 -------------
  
