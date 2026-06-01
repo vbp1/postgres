@@ -15,7 +15,9 @@
 #define TRANSAM_H
 
 #include "access/xlogdefs.h"
+#ifndef FRONTEND
 #include "port/atomics.h"
+#endif
 /* ----------------
  *		Special transaction ID values
  *
@@ -324,9 +326,13 @@ typedef struct TransamVariablesData
 	 * not. There are likely other users of this.  Always above 1.
 	 */
 	uint64		xactCompletionCount;
+#ifndef FRONTEND
 	pg_atomic_uint64 xactCompletionCountShadow;	/* H1-D passive shadow;
 												 * legacy field remains
 												 * authoritative */
+#else
+	uint64		xactCompletionCountShadow;
+#endif
 
 	/*
 	 * Prototype-owned CSN runtime bookkeeping lower bound.  This does not
@@ -421,6 +427,7 @@ extern bool TransactionStartedDuringRecovery(void);
 /* in transam/varsup.c */
 extern PGDLLIMPORT TransamVariablesData *TransamVariables;
 
+#ifndef FRONTEND
 static inline void
 TransamInitXactCompletionCountShadow(uint64 completionCount)
 {
@@ -450,6 +457,7 @@ TransamAdvanceXactCompletionCount(void)
 
 	return completionCount;
 }
+#endif							/* FRONTEND */
 
 typedef enum TransactionCSNStatus
 {
