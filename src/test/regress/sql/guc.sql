@@ -2,6 +2,9 @@
 -- we can't rely on any specific default value of vacuum_cost_delay
 SHOW datestyle;
 
+-- Check the default of the backend WAL flusher limit.
+SHOW wal_flush_backend_flushers;
+
 -- Check output style of CamelCase enum options
 SET intervalstyle to 'asd';
 

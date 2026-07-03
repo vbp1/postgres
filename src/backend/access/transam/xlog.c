@@ -90,6 +90,7 @@
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/proclist.h"
 #include "storage/reinit.h"
 #include "storage/spin.h"
 #include "storage/sync.h"
@@ -132,6 +133,7 @@ int			wal_sync_method = DEFAULT_WAL_SYNC_METHOD;
 int			wal_level = WAL_LEVEL_REPLICA;
 int			CommitDelay = 0;	/* precommit delay in microseconds */
 int			CommitSiblings = 5; /* # concurrent xacts needed to sleep */
+int			wal_flush_backend_flushers = 0;
 int			wal_retrieve_retry_interval = 5000;
 int			max_slot_wal_keep_size_mb = -1;
 int			wal_decode_buffer_size = 512 * 1024;
@@ -149,6 +151,14 @@ int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
  * which needs to iterate all the locks.
  */
 #define NUM_XLOGINSERT_LOCKS  8
+#define WAL_BACKEND_FLUSH_SHARDS  16
+
+struct WalBackendFlushShard
+{
+	pg_atomic_uint64 request;	/* highest requested WAL flush LSN */
+	proclist_head waiters;		/* backends waiting for WAL flush */
+	slock_t		mutex;			/* protects waiters */
+};
 
 /*
  * Max distance from last checkpoint, before triggering a new xlog-based
@@ -472,6 +482,8 @@ typedef struct XLogCtlData
 	pg_atomic_uint64 logInsertResult;	/* last byte + 1 inserted to buffers */
 	pg_atomic_uint64 logWriteResult;	/* last byte + 1 written out */
 	pg_atomic_uint64 logFlushResult;	/* last byte + 1 flushed */
+	pg_atomic_uint32 backendFlushers;	/* active backend WAL flushers */
+	struct WalBackendFlushShard backendFlushShards[WAL_BACKEND_FLUSH_SHARDS];
 
 	/*
 	 * Latest initialized page in the cache (last byte position + 1).
@@ -705,6 +717,13 @@ static void ReserveXLogInsertLocation(int size, XLogRecPtr *StartPos,
 static bool ReserveXLogSwitch(XLogRecPtr *StartPos, XLogRecPtr *EndPos,
 							  XLogRecPtr *PrevPtr);
 static XLogRecPtr WaitXLogInsertionsToFinish(XLogRecPtr upto);
+static bool WalBackendFlushersTryAcquire(void);
+static void WalBackendFlushersRelease(void);
+static XLogRecPtr WalBackendFlushRequestMax(XLogRecPtr record);
+static void WalBackendFlushRequestUpdate(struct WalBackendFlushShard *shard);
+static void WalBackendFlushWait(struct WalBackendFlushShard *shard, XLogRecPtr record);
+static void WalBackendFlushWakeWaiters(XLogRecPtr flushed_lsn);
+static void WalBackendFlushWakeWaiterForRetry(void);
 static char *GetXLogBuffer(XLogRecPtr ptr, TimeLineID tli);
 static XLogRecPtr XLogBytePosToRecPtr(uint64 bytepos);
 static XLogRecPtr XLogBytePosToEndRecPtr(uint64 bytepos);
@@ -2310,6 +2329,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	int			npages;
 	int			startidx;
 	uint32		startoffset;
+	XLogRecPtr	oldFlush;
 
 	/* We should always be inside a critical section here */
 	Assert(CritSectionCount > 0);
@@ -2318,6 +2338,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	 * Update local LogwrtResult (caller probably did this already, but...)
 	 */
 	RefreshXLogWriteResult(LogwrtResult);
+	oldFlush = LogwrtResult.Flush;
 
 	/*
 	 * Since successive pages in the xlog cache are consecutively allocated,
@@ -2578,6 +2599,8 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	pg_atomic_write_u64(&XLogCtl->logWriteResult, LogwrtResult.Write);
 	pg_write_barrier();
 	pg_atomic_write_u64(&XLogCtl->logFlushResult, LogwrtResult.Flush);
+	if (oldFlush < LogwrtResult.Flush)
+		WalBackendFlushWakeWaiters(LogwrtResult.Flush);
 
 #ifdef USE_ASSERT_CHECKING
 	{
@@ -2770,6 +2793,183 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 	LWLockRelease(ControlFileLock);
 }
 
+static bool
+WalBackendFlushersTryAcquire(void)
+{
+	uint32		old_flushers;
+
+	Assert(wal_flush_backend_flushers > 0);
+
+	old_flushers = pg_atomic_read_u32(&XLogCtl->backendFlushers);
+	for (;;)
+	{
+		uint32		expected;
+
+		if (old_flushers >= (uint32) wal_flush_backend_flushers)
+			return false;
+
+		expected = old_flushers;
+		if (pg_atomic_compare_exchange_u32(&XLogCtl->backendFlushers,
+										   &expected, old_flushers + 1))
+			return true;
+
+		old_flushers = expected;
+	}
+}
+
+static void
+WalBackendFlushersRelease(void)
+{
+	Assert(wal_flush_backend_flushers > 0);
+	pg_atomic_fetch_sub_u32(&XLogCtl->backendFlushers, 1);
+	WalBackendFlushWakeWaiterForRetry();
+}
+
+static void
+WalBackendFlushRequestUpdate(struct WalBackendFlushShard *shard)
+{
+	XLogRecPtr	requested = InvalidXLogRecPtr;
+	proclist_mutable_iter iter;
+
+	proclist_foreach_modify(iter, &shard->waiters,
+							backendFlushWaitLink)
+	{
+		PGPROC	   *proc = GetPGProcByNumber(iter.cur);
+
+		if (requested < proc->backendFlushWaitLSN)
+			requested = proc->backendFlushWaitLSN;
+	}
+
+	pg_atomic_write_u64(&shard->request, requested);
+}
+
+static XLogRecPtr
+WalBackendFlushRequestMax(XLogRecPtr record)
+{
+	XLogRecPtr	requested;
+
+	for (int i = 0; i < WAL_BACKEND_FLUSH_SHARDS; i++)
+	{
+		requested = pg_atomic_read_u64(&XLogCtl->backendFlushShards[i].request);
+		if (record < requested)
+			record = requested;
+	}
+	return record;
+}
+
+static void
+WalBackendFlushWait(struct WalBackendFlushShard *shard, XLogRecPtr record)
+{
+	Assert(MyProc != NULL);
+	Assert(MyProcNumber != INVALID_PROC_NUMBER);
+
+	ResetLatch(MyLatch);
+
+	SpinLockAcquire(&shard->mutex);
+	MyProc->backendFlushWaitLSN = record;
+	proclist_push_tail(&shard->waiters, MyProcNumber,
+					   backendFlushWaitLink);
+	if (pg_atomic_read_u64(&shard->request) < record)
+		pg_atomic_write_u64(&shard->request, record);
+	SpinLockRelease(&shard->mutex);
+
+	INJECTION_POINT("wal-backend-flush-wait", NULL);
+
+	RefreshXLogWriteResult(LogwrtResult);
+	if (record > LogwrtResult.Flush)
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 10,
+						 WAIT_EVENT_WAL_SYNC);
+	ResetLatch(MyLatch);
+
+	SpinLockAcquire(&shard->mutex);
+	if (proclist_contains(&shard->waiters, MyProcNumber,
+						  backendFlushWaitLink))
+	{
+		proclist_delete(&shard->waiters, MyProcNumber,
+						backendFlushWaitLink);
+		WalBackendFlushRequestUpdate(shard);
+	}
+	MyProc->backendFlushWaitLSN = InvalidXLogRecPtr;
+	SpinLockRelease(&shard->mutex);
+}
+
+static void
+WalBackendFlushWakeWaiters(XLogRecPtr flushed_lsn)
+{
+	if (wal_flush_backend_flushers == 0)
+		return;
+
+	for (int shardno = 0; shardno < WAL_BACKEND_FLUSH_SHARDS; shardno++)
+	{
+		struct WalBackendFlushShard *shard =
+			&XLogCtl->backendFlushShards[shardno];
+
+		for (;;)
+		{
+			PGPROC	   *wakeups[64];
+			int			nwakeups = 0;
+			proclist_mutable_iter iter;
+
+			SpinLockAcquire(&shard->mutex);
+
+			proclist_foreach_modify(iter, &shard->waiters,
+									backendFlushWaitLink)
+			{
+				PGPROC	   *proc = GetPGProcByNumber(iter.cur);
+
+				if (proc->backendFlushWaitLSN > flushed_lsn)
+					continue;
+
+				wakeups[nwakeups++] = proc;
+				proclist_delete(&shard->waiters, iter.cur,
+								backendFlushWaitLink);
+				if (nwakeups == lengthof(wakeups))
+					break;
+			}
+
+			if (nwakeups > 0)
+				WalBackendFlushRequestUpdate(shard);
+
+			SpinLockRelease(&shard->mutex);
+
+			for (int i = 0; i < nwakeups; i++)
+			{
+				INJECTION_POINT("wal-backend-flush-wakeup", NULL);
+				SetLatch(&wakeups[i]->procLatch);
+			}
+
+			if (nwakeups < lengthof(wakeups))
+				break;
+		}
+	}
+}
+
+static void
+WalBackendFlushWakeWaiterForRetry(void)
+{
+	PGPROC	   *wakeups[WAL_BACKEND_FLUSH_SHARDS];
+	int			nwakeups = 0;
+
+	if (wal_flush_backend_flushers == 0)
+		return;
+
+	for (int shardno = 0; shardno < WAL_BACKEND_FLUSH_SHARDS; shardno++)
+	{
+		struct WalBackendFlushShard *shard =
+			&XLogCtl->backendFlushShards[shardno];
+
+		SpinLockAcquire(&shard->mutex);
+		if (!proclist_is_empty(&shard->waiters))
+			wakeups[nwakeups++] = GetPGProcByNumber(shard->waiters.head);
+		SpinLockRelease(&shard->mutex);
+	}
+
+	for (int i = 0; i < nwakeups; i++)
+		SetLatch(&wakeups[i]->procLatch);
+}
+
 /*
  * Ensure that all XLOG data through the given position is flushed to disk.
  *
@@ -2782,6 +2982,8 @@ XLogFlush(XLogRecPtr record)
 	XLogRecPtr	WriteRqstPtr;
 	XLogwrtRqst WriteRqst;
 	TimeLineID	insertTLI = XLogCtl->InsertTimeLineID;
+	bool		backend_flush_limit_enabled;
+	struct WalBackendFlushShard *backend_flush_shard = NULL;
 
 	/*
 	 * During REDO, we are reading not writing WAL.  Therefore, instead of
@@ -2810,6 +3012,15 @@ XLogFlush(XLogRecPtr record)
 
 	START_CRIT_SECTION();
 
+	backend_flush_limit_enabled =
+		wal_flush_backend_flushers > 0 && AmRegularBackendProcess();
+	if (backend_flush_limit_enabled)
+	{
+		Assert(MyProcNumber != INVALID_PROC_NUMBER);
+		backend_flush_shard =
+			&XLogCtl->backendFlushShards[MyProcNumber % WAL_BACKEND_FLUSH_SHARDS];
+	}
+
 	/*
 	 * Since fsync is usually a horribly expensive operation, we try to
 	 * piggyback as much data as we can on each fsync: if we see any more data
@@ -2827,6 +3038,7 @@ XLogFlush(XLogRecPtr record)
 	 */
 	for (;;)
 	{
+		bool		backend_flusher_acquired = false;
 		XLogRecPtr	insertpos;
 
 		/* done already? */
@@ -2842,6 +3054,18 @@ XLogFlush(XLogRecPtr record)
 		if (WriteRqstPtr < XLogCtl->LogwrtRqst.Write)
 			WriteRqstPtr = XLogCtl->LogwrtRqst.Write;
 		SpinLockRelease(&XLogCtl->info_lck);
+
+		if (backend_flush_limit_enabled &&
+			!WalBackendFlushersTryAcquire())
+		{
+			WalBackendFlushWait(backend_flush_shard, record);
+			continue;
+		}
+		backend_flusher_acquired = backend_flush_limit_enabled;
+		if (backend_flusher_acquired)
+			INJECTION_POINT("wal-backend-flush-after-acquire", NULL);
+		if (backend_flush_limit_enabled)
+			WriteRqstPtr = WalBackendFlushRequestMax(WriteRqstPtr);
 		insertpos = WaitXLogInsertionsToFinish(WriteRqstPtr);
 
 		/*
@@ -2853,6 +3077,9 @@ XLogFlush(XLogRecPtr record)
 		 */
 		if (!LWLockAcquireOrWait(WALWriteLock, LW_EXCLUSIVE))
 		{
+			if (backend_flusher_acquired)
+				WalBackendFlushersRelease();
+
 			/*
 			 * The lock is now free, but we didn't acquire it yet. Before we
 			 * do, loop back to check if someone else flushed the record for
@@ -2866,6 +3093,8 @@ XLogFlush(XLogRecPtr record)
 		if (record <= LogwrtResult.Flush)
 		{
 			LWLockRelease(WALWriteLock);
+			if (backend_flusher_acquired)
+				WalBackendFlushersRelease();
 			break;
 		}
 
@@ -2903,6 +3132,8 @@ XLogFlush(XLogRecPtr record)
 		XLogWrite(WriteRqst, insertTLI, false);
 
 		LWLockRelease(WALWriteLock);
+		if (backend_flusher_acquired)
+			WalBackendFlushersRelease();
 		/* done */
 		break;
 	}
@@ -5060,6 +5291,15 @@ XLOGShmemInit(void)
 	pg_atomic_init_u64(&XLogCtl->logInsertResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
+	pg_atomic_init_u32(&XLogCtl->backendFlushers, 0);
+	for (i = 0; i < WAL_BACKEND_FLUSH_SHARDS; i++)
+	{
+		struct WalBackendFlushShard *shard = &XLogCtl->backendFlushShards[i];
+
+		pg_atomic_init_u64(&shard->request, InvalidXLogRecPtr);
+		proclist_init(&shard->waiters);
+		SpinLockInit(&shard->mutex);
+	}
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
 }
 

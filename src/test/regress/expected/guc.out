@@ -6,6 +6,13 @@ SHOW datestyle;
  Postgres, MDY
 (1 row)
 
+-- Check the default of the backend WAL flusher limit.
+SHOW wal_flush_backend_flushers;
+ wal_flush_backend_flushers 
+----------------------------
+ 0
+(1 row)
+
 -- Check output style of CamelCase enum options
 SET intervalstyle to 'asd';
 ERROR:  invalid value for parameter "IntervalStyle": "asd"

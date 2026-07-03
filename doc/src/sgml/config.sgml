@@ -3588,6 +3588,21 @@ include_dir 'conf.d'
         This parameter can only be set in the
         <filename>postgresql.conf</filename> file or on the server command line.
        </para>
+     </listitem>
+    </varlistentry>
+
+     <varlistentry id="guc-wal-flush-backend-flushers" xreflabel="wal_flush_backend_flushers">
+      <term><varname>wal_flush_backend_flushers</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>wal_flush_backend_flushers</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Sets the maximum number of backend processes that can flush WAL
+        concurrently.  The value <literal>0</literal>, which is the default,
+        disables this limit.  This parameter can only be set at server start.
+       </para>
       </listitem>
      </varlistentry>
 
