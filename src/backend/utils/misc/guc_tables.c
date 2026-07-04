@@ -3049,6 +3049,16 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"wal_flush_backend_flushers", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Sets the maximum number of client backends that can flush WAL concurrently."),
+			gettext_noop("0 disables the limit.")
+		},
+		&wal_flush_backend_flushers,
+		0, 0, MAX_BACKENDS,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"wal_skip_threshold", PGC_USERSET, WAL_SETTINGS,
 			gettext_noop("Minimum size of new file to fsync instead of writing WAL."),
 			NULL,
