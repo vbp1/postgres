@@ -569,14 +569,20 @@ typedef struct XLogCtlData
 	 * sleep on backendFlushCV; it is signaled when a slot is released and
 	 * broadcast when the flushed position advances.
 	 *
-	 * These fields are deliberately kept away from logFlushResult above:
-	 * backendFlushers takes compare-and-swap traffic from every throttled
-	 * backend and must not share a cache line with the log*Result fields that
-	 * RefreshXLogWriteResult() reads on every insert/write/flush.
+	 * All of these take atomic read-modify-write traffic from every
+	 * committing backend, so they must not share cache lines with anything
+	 * else that is hot: not with the log*Result fields that
+	 * RefreshXLogWriteResult() reads on every insert/write/flush, and not
+	 * with info_lck above, which every XLogFlush() entry and every
+	 * GetRedoRecPtr() call takes.  The condition variable's internal spinlock
+	 * is pounded harder than the counters (two acquisitions per waiter plus
+	 * every signal/broadcast), so it gets a cache line of its own as well.
 	 */
+	char		backendFlushPad1[PG_CACHE_LINE_SIZE];
 	pg_atomic_uint32 backendFlushers;	/* active backend WAL flushers */
 	pg_atomic_uint32 backendFlushWaiters;	/* backends waiting in XLogFlush */
 	pg_atomic_uint64 backendFlushRequest;	/* max flush LSN of waiters */
+	char		backendFlushPad2[PG_CACHE_LINE_SIZE];
 	ConditionVariable backendFlushCV;
 } XLogCtlData;
 
