@@ -83,6 +83,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -90,7 +91,6 @@
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
-#include "storage/proclist.h"
 #include "storage/reinit.h"
 #include "storage/spin.h"
 #include "storage/sync.h"
@@ -151,14 +151,6 @@ int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
  * which needs to iterate all the locks.
  */
 #define NUM_XLOGINSERT_LOCKS  8
-#define WAL_BACKEND_FLUSH_SHARDS  16
-
-struct WalBackendFlushShard
-{
-	pg_atomic_uint64 request;	/* highest requested WAL flush LSN */
-	proclist_head waiters;		/* backends waiting for WAL flush */
-	slock_t		mutex;			/* protects waiters */
-};
 
 /*
  * Max distance from last checkpoint, before triggering a new xlog-based
@@ -482,8 +474,6 @@ typedef struct XLogCtlData
 	pg_atomic_uint64 logInsertResult;	/* last byte + 1 inserted to buffers */
 	pg_atomic_uint64 logWriteResult;	/* last byte + 1 written out */
 	pg_atomic_uint64 logFlushResult;	/* last byte + 1 flushed */
-	pg_atomic_uint32 backendFlushers;	/* active backend WAL flushers */
-	struct WalBackendFlushShard backendFlushShards[WAL_BACKEND_FLUSH_SHARDS];
 
 	/*
 	 * Latest initialized page in the cache (last byte position + 1).
@@ -564,6 +554,30 @@ typedef struct XLogCtlData
 	XLogRecPtr	lastFpwDisableRecPtr;
 
 	slock_t		info_lck;		/* locks shared variables shown above */
+
+	/*
+	 * State for limiting the number of concurrent backend WAL flushers, see
+	 * wal_flush_backend_flushers.
+	 *
+	 * backendFlushers counts the client backends currently allowed to perform
+	 * the flush loop in XLogFlush().  backendFlushWaiters counts the backends
+	 * waiting for a slot or for their WAL to be flushed by someone else; it
+	 * gates the wakeup calls so that they cost nothing when the feature is
+	 * idle.  backendFlushRequest is a monotonically-advancing maximum of the
+	 * flush LSNs the waiters need; slot holders extend their flush requests
+	 * to cover it, so waiters piggyback on the holders' fsyncs.  Waiters
+	 * sleep on backendFlushCV; it is signaled when a slot is released and
+	 * broadcast when the flushed position advances.
+	 *
+	 * These fields are deliberately kept away from logFlushResult above:
+	 * backendFlushers takes compare-and-swap traffic from every throttled
+	 * backend and must not share a cache line with the log*Result fields that
+	 * RefreshXLogWriteResult() reads on every insert/write/flush.
+	 */
+	pg_atomic_uint32 backendFlushers;	/* active backend WAL flushers */
+	pg_atomic_uint32 backendFlushWaiters;	/* backends waiting in XLogFlush */
+	pg_atomic_uint64 backendFlushRequest;	/* max flush LSN of waiters */
+	ConditionVariable backendFlushCV;
 } XLogCtlData;
 
 /*
@@ -623,6 +637,15 @@ static int	UsableBytesInSegment;
  * See discussion above.
  */
 static XLogwrtResult LogwrtResult = {0, 0};
+
+/*
+ * True when an XLogWrite() performed by this process advanced the shared
+ * flushed position and backends waiting in WalBackendFlushAcquireOrWait()
+ * may need to be woken up.  XLogWrite() runs with WALWriteLock held, so the
+ * wakeup is deferred until the caller has released the lock; see
+ * WalBackendFlushProcessWakeup().
+ */
+static bool backendFlushWakeupPending = false;
 
 /*
  * Update local copy of shared XLogCtl->log{Write,Flush}Result
@@ -717,13 +740,10 @@ static void ReserveXLogInsertLocation(int size, XLogRecPtr *StartPos,
 static bool ReserveXLogSwitch(XLogRecPtr *StartPos, XLogRecPtr *EndPos,
 							  XLogRecPtr *PrevPtr);
 static XLogRecPtr WaitXLogInsertionsToFinish(XLogRecPtr upto);
-static bool WalBackendFlushersTryAcquire(void);
-static void WalBackendFlushersRelease(void);
-static XLogRecPtr WalBackendFlushRequestMax(XLogRecPtr record);
-static void WalBackendFlushRequestUpdate(struct WalBackendFlushShard *shard);
-static void WalBackendFlushWait(struct WalBackendFlushShard *shard, XLogRecPtr record);
-static void WalBackendFlushWakeWaiters(XLogRecPtr flushed_lsn);
-static void WalBackendFlushWakeWaiterForRetry(void);
+static bool WalBackendFlushTryAcquire(void);
+static bool WalBackendFlushAcquireOrWait(XLogRecPtr record);
+static void WalBackendFlushRelease(void);
+static void WalBackendFlushProcessWakeup(void);
 static char *GetXLogBuffer(XLogRecPtr ptr, TimeLineID tli);
 static XLogRecPtr XLogBytePosToRecPtr(uint64 bytepos);
 static XLogRecPtr XLogBytePosToEndRecPtr(uint64 bytepos);
@@ -2079,6 +2099,13 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 					WriteRqst.Flush = 0;
 					XLogWrite(WriteRqst, tli, false);
 					LWLockRelease(WALWriteLock);
+
+					/*
+					 * The flushed position advances here only when XLogWrite
+					 * had to finish a segment, so waking the flush-limit
+					 * waiters from this spot is rare.
+					 */
+					WalBackendFlushProcessWakeup();
 					pgWalUsage.wal_buffers_full++;
 					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_DONE();
 
@@ -2599,8 +2626,15 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	pg_atomic_write_u64(&XLogCtl->logWriteResult, LogwrtResult.Write);
 	pg_write_barrier();
 	pg_atomic_write_u64(&XLogCtl->logFlushResult, LogwrtResult.Flush);
+
+	/*
+	 * If we advanced the flushed position, remember to wake up backends
+	 * waiting in WalBackendFlushAcquireOrWait() once our caller has released
+	 * WALWriteLock; waking them here would lengthen the hold time of the most
+	 * contended WAL lock.
+	 */
 	if (oldFlush < LogwrtResult.Flush)
-		WalBackendFlushWakeWaiters(LogwrtResult.Flush);
+		backendFlushWakeupPending = true;
 
 #ifdef USE_ASSERT_CHECKING
 	{
@@ -2793,19 +2827,27 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 	LWLockRelease(ControlFileLock);
 }
 
+/*
+ * Try to acquire one of the wal_flush_backend_flushers slots.
+ *
+ * Returns true if the caller now holds a slot and must eventually call
+ * WalBackendFlushRelease().  Callers must have checked that the limit is
+ * enabled; it cannot change underneath us, see WalBackendFlushAcquireOrWait.
+ */
 static bool
-WalBackendFlushersTryAcquire(void)
+WalBackendFlushTryAcquire(void)
 {
+	int			limit = wal_flush_backend_flushers;
 	uint32		old_flushers;
 
-	Assert(wal_flush_backend_flushers > 0);
+	Assert(limit > 0);
 
 	old_flushers = pg_atomic_read_u32(&XLogCtl->backendFlushers);
 	for (;;)
 	{
 		uint32		expected;
 
-		if (old_flushers >= (uint32) wal_flush_backend_flushers)
+		if (old_flushers >= (uint32) limit)
 			return false;
 
 		expected = old_flushers;
@@ -2817,157 +2859,136 @@ WalBackendFlushersTryAcquire(void)
 	}
 }
 
+/*
+ * Release a slot acquired by WalBackendFlushTryAcquire() and hand it over
+ * to a waiter, if any.  ConditionVariableSignal() removes the process it
+ * wakes from the wait queue, so the wakeup cannot be swallowed by a process
+ * that is no longer interested; a woken process that leaves without taking
+ * the slot passes the signal on (see WalBackendFlushAcquireOrWait).
+ */
 static void
-WalBackendFlushersRelease(void)
+WalBackendFlushRelease(void)
 {
-	Assert(wal_flush_backend_flushers > 0);
 	pg_atomic_fetch_sub_u32(&XLogCtl->backendFlushers, 1);
-	WalBackendFlushWakeWaiterForRetry();
+
+	/*
+	 * The fetch_sub above is a full barrier, so if a concurrent waiter missed
+	 * us here (read backendFlushWaiters as zero), it is guaranteed to see the
+	 * freed slot when it retries the acquire after registering.
+	 */
+	if (pg_atomic_read_u32(&XLogCtl->backendFlushWaiters) > 0)
+		ConditionVariableSignal(&XLogCtl->backendFlushCV);
 }
 
-static void
-WalBackendFlushRequestUpdate(struct WalBackendFlushShard *shard)
+/*
+ * Wait until we acquire a WAL flusher slot, or until the wait becomes moot.
+ *
+ * Called by XLogFlush() when no slot was immediately available.  Returns
+ * true if a slot was acquired, false if 'record' was flushed by someone
+ * else in the meantime.
+ *
+ * Note that wal_flush_backend_flushers cannot change while we are in here:
+ * config reload happens only between statements, so each XLogFlush() call
+ * works with a consistent value, keeping acquire and release balanced.
+ *
+ * This runs inside a critical section, which is fine: the condition
+ * variable sleep path performs no memory allocation, and
+ * CHECK_FOR_INTERRUPTS() is a no-op while in a critical section.
+ */
+static bool
+WalBackendFlushAcquireOrWait(XLogRecPtr record)
 {
-	XLogRecPtr	requested = InvalidXLogRecPtr;
-	proclist_mutable_iter iter;
+	bool		acquired = false;
 
-	proclist_foreach_modify(iter, &shard->waiters,
-							backendFlushWaitLink)
+	/* Fast path: slot free, no need to register as a waiter. */
+	if (WalBackendFlushTryAcquire())
+		return true;
+
+	/*
+	 * Publish the LSN we need flushed, so that the current slot holders
+	 * extend their flush requests to cover it and we can piggyback on their
+	 * fsyncs.  Clamp the published value to the end of inserted WAL: an
+	 * invalid 'record' (e.g. coming from a corrupted page LSN) must not cause
+	 * every slot holder to request a flush past the end of generated WAL. The
+	 * caller still detects and reports the bad LSN itself, just like in the
+	 * unlimited case.
+	 *
+	 * The clamp must use the end-position conversion of the insert position,
+	 * matching what WaitXLogInsertionsToFinish() compares its argument
+	 * against.  The start-position variant (GetXLogInsertRecPtr) points past
+	 * the page header when the insert position sits exactly on a page
+	 * boundary, and a request published from there would trip the
+	 * flush-past-end-of-WAL complaint in the flushing backend.
+	 *
+	 * The maximum only ever advances; a stale-high value merely makes a
+	 * holder flush WAL that has been inserted anyway, which is exactly the
+	 * piggybacking XLogFlush() strives for.
+	 */
+	pg_atomic_monotonic_advance_u64(&XLogCtl->backendFlushRequest,
+									Min(record, GetXLogInsertEndRecPtr()));
+
+	/*
+	 * Register as a waiter before the final condition checks below.  The
+	 * fetch_add is a full barrier, pairing with the one in
+	 * WalBackendFlushRelease() and with the flushed-position update in
+	 * XLogWrite(): whoever misses our registration is guaranteed to be
+	 * visible to our rechecks, and vice versa, so no wakeup can be lost.
+	 */
+	pg_atomic_fetch_add_u32(&XLogCtl->backendFlushWaiters, 1);
+
+	INJECTION_POINT_CACHED("wal-backend-flush-wait", NULL);
+
+	ConditionVariablePrepareToSleep(&XLogCtl->backendFlushCV);
+	for (;;)
 	{
-		PGPROC	   *proc = GetPGProcByNumber(iter.cur);
+		/* Did someone else flush our record while we were waiting? */
+		RefreshXLogWriteResult(LogwrtResult);
+		if (record <= LogwrtResult.Flush)
+			break;
 
-		if (requested < proc->backendFlushWaitLSN)
-			requested = proc->backendFlushWaitLSN;
-	}
-
-	pg_atomic_write_u64(&shard->request, requested);
-}
-
-static XLogRecPtr
-WalBackendFlushRequestMax(XLogRecPtr record)
-{
-	XLogRecPtr	requested;
-
-	for (int i = 0; i < WAL_BACKEND_FLUSH_SHARDS; i++)
-	{
-		requested = pg_atomic_read_u64(&XLogCtl->backendFlushShards[i].request);
-		if (record < requested)
-			record = requested;
-	}
-	return record;
-}
-
-static void
-WalBackendFlushWait(struct WalBackendFlushShard *shard, XLogRecPtr record)
-{
-	Assert(MyProc != NULL);
-	Assert(MyProcNumber != INVALID_PROC_NUMBER);
-
-	ResetLatch(MyLatch);
-
-	SpinLockAcquire(&shard->mutex);
-	MyProc->backendFlushWaitLSN = record;
-	proclist_push_tail(&shard->waiters, MyProcNumber,
-					   backendFlushWaitLink);
-	if (pg_atomic_read_u64(&shard->request) < record)
-		pg_atomic_write_u64(&shard->request, record);
-	SpinLockRelease(&shard->mutex);
-
-	INJECTION_POINT("wal-backend-flush-wait", NULL);
-
-	RefreshXLogWriteResult(LogwrtResult);
-	if (record > LogwrtResult.Flush)
-		(void) WaitLatch(MyLatch,
-						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 10,
-						 WAIT_EVENT_WAL_SYNC);
-	ResetLatch(MyLatch);
-
-	SpinLockAcquire(&shard->mutex);
-	if (proclist_contains(&shard->waiters, MyProcNumber,
-						  backendFlushWaitLink))
-	{
-		proclist_delete(&shard->waiters, MyProcNumber,
-						backendFlushWaitLink);
-		WalBackendFlushRequestUpdate(shard);
-	}
-	MyProc->backendFlushWaitLSN = InvalidXLogRecPtr;
-	SpinLockRelease(&shard->mutex);
-}
-
-static void
-WalBackendFlushWakeWaiters(XLogRecPtr flushed_lsn)
-{
-	if (wal_flush_backend_flushers == 0)
-		return;
-
-	for (int shardno = 0; shardno < WAL_BACKEND_FLUSH_SHARDS; shardno++)
-	{
-		struct WalBackendFlushShard *shard =
-			&XLogCtl->backendFlushShards[shardno];
-
-		for (;;)
+		if (WalBackendFlushTryAcquire())
 		{
-			PGPROC	   *wakeups[64];
-			int			nwakeups = 0;
-			proclist_mutable_iter iter;
-
-			SpinLockAcquire(&shard->mutex);
-
-			proclist_foreach_modify(iter, &shard->waiters,
-									backendFlushWaitLink)
-			{
-				PGPROC	   *proc = GetPGProcByNumber(iter.cur);
-
-				if (proc->backendFlushWaitLSN > flushed_lsn)
-					continue;
-
-				wakeups[nwakeups++] = proc;
-				proclist_delete(&shard->waiters, iter.cur,
-								backendFlushWaitLink);
-				if (nwakeups == lengthof(wakeups))
-					break;
-			}
-
-			if (nwakeups > 0)
-				WalBackendFlushRequestUpdate(shard);
-
-			SpinLockRelease(&shard->mutex);
-
-			for (int i = 0; i < nwakeups; i++)
-			{
-				INJECTION_POINT("wal-backend-flush-wakeup", NULL);
-				SetLatch(&wakeups[i]->procLatch);
-			}
-
-			if (nwakeups < lengthof(wakeups))
-				break;
+			acquired = true;
+			break;
 		}
+
+		ConditionVariableSleep(&XLogCtl->backendFlushCV,
+							   WAIT_EVENT_WAL_FLUSH_LIMIT);
 	}
+
+	/*
+	 * If we consumed a slot-release signal but are not taking the slot, pass
+	 * the wakeup on so that the freed slot is not lost on a sleeping waiter.
+	 */
+	if (ConditionVariableCancelSleep() && !acquired)
+		ConditionVariableSignal(&XLogCtl->backendFlushCV);
+
+	pg_atomic_fetch_sub_u32(&XLogCtl->backendFlushWaiters, 1);
+
+	return acquired;
 }
 
+/*
+ * Wake up backends waiting for their WAL to be flushed, if an XLogWrite()
+ * performed by this process advanced the flushed position.
+ *
+ * Call this after releasing WALWriteLock; the wakeups (one SetLatch per
+ * waiter) are too expensive to run under it.
+ */
 static void
-WalBackendFlushWakeWaiterForRetry(void)
+WalBackendFlushProcessWakeup(void)
 {
-	PGPROC	   *wakeups[WAL_BACKEND_FLUSH_SHARDS];
-	int			nwakeups = 0;
-
-	if (wal_flush_backend_flushers == 0)
+	if (!backendFlushWakeupPending)
 		return;
+	backendFlushWakeupPending = false;
 
-	for (int shardno = 0; shardno < WAL_BACKEND_FLUSH_SHARDS; shardno++)
-	{
-		struct WalBackendFlushShard *shard =
-			&XLogCtl->backendFlushShards[shardno];
-
-		SpinLockAcquire(&shard->mutex);
-		if (!proclist_is_empty(&shard->waiters))
-			wakeups[nwakeups++] = GetPGProcByNumber(shard->waiters.head);
-		SpinLockRelease(&shard->mutex);
-	}
-
-	for (int i = 0; i < nwakeups; i++)
-		SetLatch(&wakeups[i]->procLatch);
+	/*
+	 * Waiters whose flush LSN is still not reached will re-check their
+	 * condition and go back to sleep; that is the same wake-all behavior the
+	 * WALWriteLock wait queue has always had.
+	 */
+	if (pg_atomic_read_u32(&XLogCtl->backendFlushWaiters) > 0)
+		ConditionVariableBroadcast(&XLogCtl->backendFlushCV);
 }
 
 /*
@@ -2982,8 +3003,7 @@ XLogFlush(XLogRecPtr record)
 	XLogRecPtr	WriteRqstPtr;
 	XLogwrtRqst WriteRqst;
 	TimeLineID	insertTLI = XLogCtl->InsertTimeLineID;
-	bool		backend_flush_limit_enabled;
-	struct WalBackendFlushShard *backend_flush_shard = NULL;
+	bool		backend_flusher_acquired = false;
 
 	/*
 	 * During REDO, we are reading not writing WAL.  Therefore, instead of
@@ -3010,16 +3030,23 @@ XLogFlush(XLogRecPtr record)
 			 LSN_FORMAT_ARGS(LogwrtResult.Flush));
 #endif
 
-	START_CRIT_SECTION();
-
-	backend_flush_limit_enabled =
-		wal_flush_backend_flushers > 0 && AmRegularBackendProcess();
-	if (backend_flush_limit_enabled)
+	/*
+	 * The injection points below run inside the critical section, where the
+	 * first use of an injection point is not allowed to allocate; load them
+	 * into the local cache beforehand.  Loading is itself only safe when no
+	 * critical section is active yet, and some callers (such as
+	 * RecordTransactionCommit()) already hold one here, so a test process
+	 * that must reach these points from such a caller has to pre-load them
+	 * with injection_points_load().
+	 */
+	if (wal_flush_backend_flushers > 0 && AmRegularBackendProcess() &&
+		CritSectionCount == 0)
 	{
-		Assert(MyProcNumber != INVALID_PROC_NUMBER);
-		backend_flush_shard =
-			&XLogCtl->backendFlushShards[MyProcNumber % WAL_BACKEND_FLUSH_SHARDS];
+		INJECTION_POINT_LOAD("wal-backend-flush-wait");
+		INJECTION_POINT_LOAD("wal-backend-flush-after-acquire");
 	}
+
+	START_CRIT_SECTION();
 
 	/*
 	 * Since fsync is usually a horribly expensive operation, we try to
@@ -3038,7 +3065,6 @@ XLogFlush(XLogRecPtr record)
 	 */
 	for (;;)
 	{
-		bool		backend_flusher_acquired = false;
 		XLogRecPtr	insertpos;
 
 		/* done already? */
@@ -3055,17 +3081,26 @@ XLogFlush(XLogRecPtr record)
 			WriteRqstPtr = XLogCtl->LogwrtRqst.Write;
 		SpinLockRelease(&XLogCtl->info_lck);
 
-		if (backend_flush_limit_enabled &&
-			!WalBackendFlushersTryAcquire())
+		/*
+		 * If the number of concurrent backend WAL flushers is limited,
+		 * acquire a flusher slot before proceeding, and keep it until we are
+		 * done: a slot holder that is merely waiting for WALWriteLock is
+		 * still one of the configured number of active flushers.  While
+		 * holding a slot, extend our request to also cover the WAL the queued
+		 * waiters need flushed, so they piggyback on our flush.
+		 */
+		if (!backend_flusher_acquired &&
+			wal_flush_backend_flushers > 0 && AmRegularBackendProcess())
 		{
-			WalBackendFlushWait(backend_flush_shard, record);
-			continue;
+			if (!WalBackendFlushAcquireOrWait(record))
+				continue;
+			backend_flusher_acquired = true;
+			INJECTION_POINT_CACHED("wal-backend-flush-after-acquire", NULL);
 		}
-		backend_flusher_acquired = backend_flush_limit_enabled;
 		if (backend_flusher_acquired)
-			INJECTION_POINT("wal-backend-flush-after-acquire", NULL);
-		if (backend_flush_limit_enabled)
-			WriteRqstPtr = WalBackendFlushRequestMax(WriteRqstPtr);
+			WriteRqstPtr = Max(WriteRqstPtr,
+							   pg_atomic_read_u64(&XLogCtl->backendFlushRequest));
+
 		insertpos = WaitXLogInsertionsToFinish(WriteRqstPtr);
 
 		/*
@@ -3077,9 +3112,6 @@ XLogFlush(XLogRecPtr record)
 		 */
 		if (!LWLockAcquireOrWait(WALWriteLock, LW_EXCLUSIVE))
 		{
-			if (backend_flusher_acquired)
-				WalBackendFlushersRelease();
-
 			/*
 			 * The lock is now free, but we didn't acquire it yet. Before we
 			 * do, loop back to check if someone else flushed the record for
@@ -3093,8 +3125,6 @@ XLogFlush(XLogRecPtr record)
 		if (record <= LogwrtResult.Flush)
 		{
 			LWLockRelease(WALWriteLock);
-			if (backend_flusher_acquired)
-				WalBackendFlushersRelease();
 			break;
 		}
 
@@ -3132,13 +3162,17 @@ XLogFlush(XLogRecPtr record)
 		XLogWrite(WriteRqst, insertTLI, false);
 
 		LWLockRelease(WALWriteLock);
-		if (backend_flusher_acquired)
-			WalBackendFlushersRelease();
 		/* done */
 		break;
 	}
 
+	if (backend_flusher_acquired)
+		WalBackendFlushRelease();
+
 	END_CRIT_SECTION();
+
+	/* wake up waiters now that we've released heavily contended locks */
+	WalBackendFlushProcessWakeup();
 
 	/* wake up walsenders now that we've released heavily contended locks */
 	WalSndWakeupProcessRequests(true, !RecoveryInProgress());
@@ -3314,6 +3348,9 @@ XLogBackgroundFlush(void)
 	LWLockRelease(WALWriteLock);
 
 	END_CRIT_SECTION();
+
+	/* wake up waiters now that we've released heavily contended locks */
+	WalBackendFlushProcessWakeup();
 
 	/* wake up walsenders now that we've released heavily contended locks */
 	WalSndWakeupProcessRequests(true, !RecoveryInProgress());
@@ -5292,14 +5329,9 @@ XLOGShmemInit(void)
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
 	pg_atomic_init_u32(&XLogCtl->backendFlushers, 0);
-	for (i = 0; i < WAL_BACKEND_FLUSH_SHARDS; i++)
-	{
-		struct WalBackendFlushShard *shard = &XLogCtl->backendFlushShards[i];
-
-		pg_atomic_init_u64(&shard->request, InvalidXLogRecPtr);
-		proclist_init(&shard->waiters);
-		SpinLockInit(&shard->mutex);
-	}
+	pg_atomic_init_u32(&XLogCtl->backendFlushWaiters, 0);
+	pg_atomic_init_u64(&XLogCtl->backendFlushRequest, InvalidXLogRecPtr);
+	ConditionVariableInit(&XLogCtl->backendFlushCV);
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
 }
 

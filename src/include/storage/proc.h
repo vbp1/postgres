@@ -242,10 +242,6 @@ struct PGPROC
 	/* Support for condition variables. */
 	proclist_node cvWaitLink;	/* position in CV wait list */
 
-	/* Support for limited backend WAL flush wait queue. */
-	proclist_node backendFlushWaitLink; /* position in WAL flush wait list */
-	XLogRecPtr	backendFlushWaitLSN;	/* WAL flush LSN this process needs */
-
 	/* Info about lock the process is currently waiting for, if any. */
 	/* waitLock and waitProcLock are NULL if not currently waiting. */
 	LOCK	   *waitLock;		/* Lock object we're sleeping on ... */

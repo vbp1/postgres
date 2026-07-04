@@ -163,6 +163,8 @@ XACT_GROUP_UPDATE	"Waiting for the group leader to update transaction status at 
 
 ABI_compatibility:
 
+WAL_FLUSH_LIMIT	"Waiting to become one of the limited number of concurrent WAL flushers, or for another process to flush the needed WAL."
+
 #
 # Wait Events - Timeout
 #

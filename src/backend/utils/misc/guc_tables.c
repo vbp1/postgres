@@ -3049,8 +3049,8 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"wal_flush_backend_flushers", PGC_POSTMASTER, WAL_SETTINGS,
-			gettext_noop("Sets the maximum number of backend processes that can flush WAL concurrently."),
+		{"wal_flush_backend_flushers", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Sets the maximum number of client backends that can flush WAL concurrently."),
 			gettext_noop("0 disables the limit.")
 		},
 		&wal_flush_backend_flushers,

@@ -489,7 +489,6 @@ InitProcess(void)
 		MyProc->statusFlags |= PROC_IS_AUTOVACUUM;
 	MyProc->lwWaiting = LW_WS_NOT_WAITING;
 	MyProc->lwWaitMode = 0;
-	MyProc->backendFlushWaitLSN = InvalidXLogRecPtr;
 	MyProc->waitLock = NULL;
 	MyProc->waitProcLock = NULL;
 	pg_atomic_write_u64(&MyProc->waitStart, 0);
