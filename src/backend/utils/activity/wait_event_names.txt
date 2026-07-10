@@ -116,6 +116,9 @@ CHECKPOINT_DELAY_COMPLETE	"Waiting for a backend that blocks a checkpoint from c
 CHECKPOINT_DELAY_START	"Waiting for a backend that blocks a checkpoint from starting."
 CHECKPOINT_DONE	"Waiting for a checkpoint to complete."
 CHECKPOINT_START	"Waiting for a checkpoint to start."
+DWB_BATCH_COVERAGE	"Waiting for writers of a double write buffer batch to publish their page images."
+DWB_BATCH_FSYNC	"Waiting for a double write buffer batch to reach durable storage."
+DWB_FREE_BATCH	"Waiting for a free double write buffer batch."
 EXECUTE_GATHER	"Waiting for activity from a child process while executing a <literal>Gather</literal> plan node."
 HASH_BATCH_ALLOCATE	"Waiting for an elected Parallel Hash participant to allocate a hash table."
 HASH_BATCH_ELECT	"Waiting to elect a Parallel Hash participant to allocate a hash table."
@@ -219,6 +222,12 @@ DATA_FILE_TRUNCATE	"Waiting for a relation data file to be truncated."
 DATA_FILE_WRITE	"Waiting for a write to a relation data file."
 DSM_ALLOCATE	"Waiting for a dynamic shared memory segment to be allocated."
 DSM_FILL_ZERO_WRITE	"Waiting to fill a dynamic shared memory backing file with zeroes."
+DWB_BATCH_SYNC	"Waiting for a double write buffer batch file to reach durable storage."
+DWB_BATCH_WRITE	"Waiting for a write to a double write buffer batch file."
+DWB_CONTROL_READ	"Waiting for a read of the double write buffer control file."
+DWB_CONTROL_SYNC	"Waiting for the double write buffer control file to reach durable storage."
+DWB_CONTROL_WRITE	"Waiting for a write to the double write buffer control file."
+DWB_RING_INIT	"Waiting for preallocation of the double write buffer ring files."
 LOCK_FILE_ADDTODATADIR_READ	"Waiting for a read while adding a line to the data directory lock file."
 LOCK_FILE_ADDTODATADIR_SYNC	"Waiting for data to reach durable storage while adding a line to the data directory lock file."
 LOCK_FILE_ADDTODATADIR_WRITE	"Waiting for a write while adding a line to the data directory lock file."
@@ -352,6 +361,7 @@ DSMRegistry	"Waiting to read or update the dynamic shared memory registry."
 InjectionPoint	"Waiting to read or update information related to injection points."
 SerialControl	"Waiting to read or update shared <filename>pg_serial</filename> state."
 AioWorkerSubmissionQueue	"Waiting to access AIO worker submission queue."
+DWBRingOpen	"Waiting to open a new double write buffer batch."
 
 #
 # END OF PREDEFINED LWLOCKS (DO NOT CHANGE THIS LINE)
@@ -402,6 +412,7 @@ SubtransSLRU	"Waiting to access the sub-transaction SLRU cache."
 XactSLRU	"Waiting to access the transaction status SLRU cache."
 ParallelVacuumDSA	"Waiting for parallel vacuum dynamic shared memory allocation."
 AioUringCompletion	"Waiting for another process to complete IO via io_uring."
+DWBPublish	"Waiting to publish a double write buffer batch's segment set."
 
 # No "ABI_compatibility" region here as WaitEventLWLock has its own C code.
 

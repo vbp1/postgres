@@ -39,6 +39,7 @@
 #include "replication/walsender.h"
 #include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
+#include "storage/dwb.h"
 #include "storage/dsm.h"
 #include "storage/dsm_registry.h"
 #include "storage/ipc.h"
@@ -114,6 +115,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, dsm_estimate_size());
 	size = add_size(size, DSMRegistryShmemSize());
 	size = add_size(size, BufferManagerShmemSize());
+	size = add_size(size, DWBShmemSize());
 	size = add_size(size, LockManagerShmemSize());
 	size = add_size(size, PredicateLockShmemSize());
 	size = add_size(size, ProcGlobalShmemSize());
@@ -293,6 +295,7 @@ CreateOrAttachShmemStructs(void)
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
 	BufferManagerShmemInit();
+	DWBShmemInit();
 
 	/*
 	 * Set up lock manager

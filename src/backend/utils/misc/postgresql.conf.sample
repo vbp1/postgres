@@ -247,6 +247,23 @@
 					#   fsync_writethrough
 					#   open_sync
 #full_page_writes = on			# recover from partial page writes
+#io_torn_pages_protection = full_pages	# off, full_pages, or double_writes
+					# (change requires restart)
+#dwb_num_batches = 64			# batches in the double write ring
+					# (change requires restart)
+#dwb_batch_pages = 64			# pages per batch
+					# (change requires restart)
+#dwb_max_segments = 4096		# segment hash capacity
+					# (change requires restart)
+#dwb_retire_workers = 1			# retire worker processes
+					# (change requires restart)
+#dwb_batch_timeout_ms = 10ms		# force-seal an open batch after this time
+#dwb_retire_interval_ms = 50ms		# retire worker cycle
+#dwb_writeback = on			# start kernel writeback after batch writes
+#dwb_slow_warn_ms = 5s			# throttle non-critical writers after this wait
+#dwb_slot_stuck_timeout_ms = 30s	# PANIC on stuck batch coverage
+#dwb_write_timeout_ms = 60s		# apply dwb_on_stall after this wait
+#dwb_on_stall = panic			# panic, error, or warn
 #wal_log_hints = off			# also do full page writes of non-critical updates
 					# (change requires restart)
 #wal_compression = off			# enables compression of full-page writes;

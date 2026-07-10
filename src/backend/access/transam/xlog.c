@@ -83,6 +83,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -5593,6 +5594,14 @@ StartupXLOG(void)
 	}
 	else
 		didCrash = false;
+
+	/*
+	 * Create or validate the double write buffer ring and durably bump its
+	 * generation before any of its slots can be written or applied.  The
+	 * apply-pass over the previous generation runs here, before WAL
+	 * recovery is initialized.
+	 */
+	DWBStartup();
 
 	/*
 	 * Prepare for WAL recovery if needed.

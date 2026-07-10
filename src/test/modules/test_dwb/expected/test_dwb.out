@@ -1,0 +1,38 @@
+CREATE EXTENSION test_dwb;
+-- ring is idle after startup
+SELECT test_dwb_states();
+                              test_dwb_states                               
+----------------------------------------------------------------------------
+ free=16 allocated=0 sealed=0 written=0 fsynced=0 data_written=0 retiring=0
+(1 row)
+
+-- a partial batch, sealed by force (ring: 16 batches x 16 pages)
+SELECT test_dwb_cycle(5);
+ test_dwb_cycle 
+----------------
+              1
+(1 row)
+
+-- overflow-sealed batches: 40 pages = 16 + 16 + 8 (tail force-sealed)
+SELECT test_dwb_cycle(40);
+ test_dwb_cycle 
+----------------
+              3
+(1 row)
+
+-- every surviving slot validates against meta_crc, generation and
+-- image_crc: eager retirement lets the cycles reuse batch file 0, so its
+-- final content is the 8-slot tail write, plus 16 slots in batch file 1
+SELECT test_dwb_ring_slots(true);
+ test_dwb_ring_slots 
+---------------------
+                  24
+(1 row)
+
+-- and the ring is fully retired again
+SELECT test_dwb_states();
+                              test_dwb_states                               
+----------------------------------------------------------------------------
+ free=16 allocated=0 sealed=0 written=0 fsynced=0 data_written=0 retiring=0
+(1 row)
+

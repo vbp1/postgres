@@ -1,0 +1,4 @@
+comment = 'Test code for the short-lived double write buffer'
+default_version = '1.0'
+module_pathname = '$libdir/test_dwb'
+relocatable = true

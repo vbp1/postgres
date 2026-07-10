@@ -78,6 +78,7 @@
 #include "replication/syncrep.h"
 #include "storage/aio.h"
 #include "storage/bufmgr.h"
+#include "storage/dwb.h"
 #include "storage/bufpage.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
@@ -359,6 +360,20 @@ static const struct config_enum_entry synchronous_commit_options[] = {
  * Although only "on", "off", "try" are documented, we accept all the likely
  * variants of "on" and "off".
  */
+static const struct config_enum_entry io_torn_pages_protection_options[] = {
+	{"off", DWB_PROTECT_OFF, false},
+	{"full_pages", DWB_PROTECT_FULL_PAGES, false},
+	{"double_writes", DWB_PROTECT_DOUBLE_WRITES, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry dwb_on_stall_options[] = {
+	{"warn", DWB_ON_STALL_WARN, false},
+	{"error", DWB_ON_STALL_ERROR, false},
+	{"panic", DWB_ON_STALL_PANIC, false},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry huge_pages_options[] = {
 	{"off", HUGE_PAGES_OFF, false},
 	{"on", HUGE_PAGES_ON, false},
@@ -1201,6 +1216,15 @@ struct config_bool ConfigureNamesBool[] =
 						 "is possible.")
 		},
 		&fullPageWrites,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_writeback", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Starts kernel writeback of data pages right after a double write buffer write."),
+			gettext_noop("Makes the retire fsync a cheap barrier instead of a full flush.")
+		},
+		&dwb_writeback,
 		true,
 		NULL, NULL, NULL
 	},
@@ -2170,6 +2194,92 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&XLogArchiveTimeout,
 		0, 0, INT_MAX / 2,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_num_batches", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Number of batches in the double write buffer ring."),
+			NULL
+		},
+		&dwb_num_batches,
+		64, 16, 1024,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_batch_pages", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Number of pages per double write buffer batch."),
+			NULL
+		},
+		&dwb_batch_pages,
+		64, 16, 256,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_max_segments", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Capacity of the double write buffer segment hash table."),
+			NULL
+		},
+		&dwb_max_segments,
+		4096, 1024, 1048576,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_retire_workers", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Number of double write buffer retire worker processes."),
+			NULL
+		},
+		&dwb_retire_workers,
+		1, 1, 32,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_batch_timeout_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Maximum time an open double write buffer batch may wait before being sealed."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_batch_timeout_ms,
+		10, 1, 1000,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_retire_interval_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Cycle time of each double write buffer retire worker."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_retire_interval_ms,
+		50, 5, 5000,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_slow_warn_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Double write buffer wait time after which throttling of non-critical writers begins."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_slow_warn_ms,
+		5000, 100, 60000,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_slot_stuck_timeout_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Time a double write buffer batch leader waits for slot coverage before PANIC."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_slot_stuck_timeout_ms,
+		30000, 1000, 600000,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_write_timeout_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Double write buffer wait time after which dwb_on_stall applies."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_write_timeout_ms,
+		60000, 1000, 600000,
 		NULL, NULL, NULL
 	},
 	{
@@ -5003,6 +5113,28 @@ struct config_string ConfigureNamesString[] =
 
 struct config_enum ConfigureNamesEnum[] =
 {
+	{
+		{"io_torn_pages_protection", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Selects the protection against torn (partially written) data pages."),
+			gettext_noop("\"full_pages\" writes full page images to WAL after a checkpoint, "
+						 "\"double_writes\" uses the double write buffer in pg_dwb, "
+						 "\"off\" disables protection.")
+		},
+		&io_torn_pages_protection,
+		DWB_PROTECT_FULL_PAGES, io_torn_pages_protection_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dwb_on_stall", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Action to take when a double write buffer wait exceeds dwb_write_timeout_ms."),
+			NULL
+		},
+		&dwb_on_stall,
+		DWB_ON_STALL_PANIC, dwb_on_stall_options,
+		NULL, NULL, NULL
+	},
+
 	{
 		{"backslash_quote", PGC_USERSET, COMPAT_OPTIONS_PREVIOUS,
 			gettext_noop("Sets whether \"\\'\" is allowed in string literals."),
