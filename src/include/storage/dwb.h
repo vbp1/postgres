@@ -273,6 +273,8 @@ extern void DWBReleaseSlot(const DWBSlotRef *ref);
 extern bool DWBForceSealOpenBatch(int wclass);
 extern int	DWBRetireAllSync(void);
 extern DWBatchState DWBGetBatchState(int batch_idx);
+/* internal; exported for test_dwb's stale-open regression test */
+extern void DWBOpenNewBatch(int wclass, uint32 old_idx);
 
 /* dwb_file.c */
 extern void DWBCreateRing(void);

@@ -123,8 +123,10 @@ DWBStagingRelease(int idx)
  * fetch_add against a reused batch either sees SEAL_BIT (and retries) or
  * lands on a valid slot of the new incarnation — never on a slot that a
  * concurrent reset can wipe.
+ *
+ * Non-static only for test_dwb's stale-open regression test.
  */
-static void
+void
 DWBOpenNewBatch(int wclass, uint32 old_idx)
 {
 	for (;;)
@@ -142,13 +144,30 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 
 		LWLockAcquire(DWBRingOpenLock, LW_EXCLUSIVE);
 
-		/* someone else already replaced the open batch: done */
-		if (pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]) != old_idx)
+		/*
+		 * Someone else already replaced the open batch: done.  Comparing
+		 * the index alone is not enough: the ring reuses indexes, so by the
+		 * time a slow opener gets here, old_idx may name a NEW live
+		 * incarnation of the same slot (sealed, retired, freed and reopened
+		 * behind our back), and replacing it would orphan that live batch
+		 * together with its staging buffer.  SEAL_BIT disambiguates the
+		 * incarnations: it is set from SEAL through FREE and cleared only
+		 * by the re-initialization below, under this same lock — so the
+		 * open batch needs replacing if and only if its SEAL_BIT is set.
+		 */
 		{
-			LWLockRelease(DWBRingOpenLock);
-			DWBStagingRelease(staging_idx);
-			ConditionVariableCancelSleep();
-			return;
+			uint32		cur = pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]);
+
+			if (cur != old_idx ||
+				(cur != DWB_INVALID_BATCH &&
+				 !(pg_atomic_read_u32(&DWBCtl->batches[cur].next_slot_idx) &
+				   DWB_SEAL_BIT)))
+			{
+				LWLockRelease(DWBRingOpenLock);
+				DWBStagingRelease(staging_idx);
+				ConditionVariableCancelSleep();
+				return;
+			}
 		}
 
 		for (int i = 0; i < dwb_num_batches; i++)

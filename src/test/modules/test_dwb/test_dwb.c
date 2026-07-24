@@ -338,3 +338,72 @@ test_dwb_retire(PG_FUNCTION_ARGS)
 	check_dwb_enabled();
 	PG_RETURN_INT32(DWBRetireAllSync());
 }
+
+/*
+ * Deterministic regression test for the stale-open ABA race: a writer that
+ * bounced off a sealed batch calls DWBOpenNewBatch only after the ring has
+ * reused the same index for a NEW live incarnation.  The replacement guard
+ * must recognize the reuse and leave the live batch alone; the buggy
+ * index-only comparison would repoint open_batch_idx and orphan it.
+ *
+ * Single-backend and timing-free: we replay the loser's exact interleaving
+ * instead of racing two sessions.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_open_stale);
+Datum
+test_dwb_open_stale(PG_FUNCTION_ARGS)
+{
+	uint32		stale_idx;
+	uint32		reopened_idx;
+	DWBSlotRef	ref;
+	BufferTag	tag;
+	RelFileLocator rlocator;
+	static char page[BLCKSZ];
+
+	check_dwb_enabled();
+
+	/*
+	 * Cycle once so the open batch goes through seal and retire:
+	 * open_batch_idx afterwards still names it, sealed (SEAL_BIT is held
+	 * through FREE) — exactly a bounced writer's stale view.
+	 */
+	(void) dwb_cycle_internal(1);
+	stale_idx = pg_atomic_read_u32(&DWBCtl->open_batch_idx[DWB_WCLASS_EVICTION]);
+
+	/*
+	 * Acquire one slot: the fetch_add bounces on SEAL_BIT and reopens the
+	 * lowest FREE index — the same index again, as a new live incarnation.
+	 */
+	rlocator.spcOid = DEFAULTTABLESPACE_OID;
+	rlocator.dbOid = 1;
+	rlocator.relNumber = 92000;
+	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
+	DWBAcquireSlot(&tag, &ref);
+	memset(page, 'S', BLCKSZ);
+	DWBPublishImage(&ref, page, (XLogRecPtr) 0x3000000);
+
+	reopened_idx = (uint32) ref.batch_idx;
+	if (reopened_idx != stale_idx)
+		ereport(ERROR,
+				(errmsg("stale-open scenario not reproduced: reopened %u, stale %u",
+						reopened_idx, stale_idx)));
+
+	/*
+	 * The ABA moment: a stale opener calls with old_idx naming the live
+	 * reopened incarnation.  The guard must not replace it.
+	 */
+	DWBOpenNewBatch(DWB_WCLASS_EVICTION, stale_idx);
+
+	if (pg_atomic_read_u32(&DWBCtl->open_batch_idx[DWB_WCLASS_EVICTION]) !=
+		reopened_idx)
+		ereport(ERROR,
+				(errmsg("stale open hijacked the live open batch")));
+
+	/* drain: seal, wait durable, release, retire */
+	(void) DWBForceSealOpenBatch(DWB_WCLASS_EVICTION);
+	DWBWaitBatchFsynced(&ref);
+	DWBReleaseSlot(&ref);
+	(void) DWBRetireAllSync();
+
+	PG_RETURN_VOID();
+}

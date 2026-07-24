@@ -130,6 +130,16 @@ like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
 	qr/free=16/, 'ring fully idle after the orphan hand-off');
 
+# --- stale open must not hijack a reopened index ------------------------
+
+my ($rc, $out, $err) =
+  $node->psql('postgres', 'SELECT test_dwb_open_stale()');
+is($rc, 0, 'stale open leaves the live reopened batch alone')
+  or diag($err);
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/free=16/, 'ring idle after the stale-open scenario');
+
 # --- geometry is fixed by the on-disk control file ---------------------
 
 $node->stop;
