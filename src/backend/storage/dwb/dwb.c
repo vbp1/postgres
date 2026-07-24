@@ -600,10 +600,15 @@ DWBLeaderWriteBatch(int batch_idx)
  */
 
 /*
- * Try to seal a batch if it is still an open, non-empty ALLOCATED one.
- * Every seal initiator goes through here: overflow writers, retire workers
- * acting on dwb_batch_timeout_ms, and writers whose DWBWaitBatchFsynced
- * timed out on a batch nobody else sealed.
+ * Try to seal a batch if it is still an open, non-empty ALLOCATED one; the
+ * guards make it safe to call speculatively against any state.  Entry point
+ * of the decentralized seal triggers: the lone-writer fast seal and the
+ * timeout seal in DWBWaitBatchFsynced, the no-worker-pool seal in
+ * DWBStagePageWrite, DWBForceSealOpenBatch, and the retire workers'
+ * force-seal on dwb_batch_timeout_ms.  The overflow writer in
+ * DWBAcquireSlot calls DWBSealBatch directly instead: it has just consumed
+ * the first slot index past the cap, so it already knows the batch is full
+ * and non-empty.
  */
 bool
 DWBTrySealBatch(int batch_idx)
@@ -701,6 +706,8 @@ DWBAcquireSlot(const BufferTag *tag, int wclass, bool use_resowner,
 			DWSegRef	seg;
 			bool		found = false;
 
+			/* becomes a HASH_BLOBS key at publication: no padding garbage */
+			memset(&seg, 0, sizeof(seg));
 			seg.rlocator = BufTagGetRelFileLocator(tag);
 			seg.forknum = BufTagGetForkNum(tag);
 			seg.segno = tag->blockNum / RELSEG_SIZE;
@@ -951,13 +958,16 @@ DWBFinishPageWrite(const DWBSlotRef *ref)
  * (the abort path never clears BM_DIRTY), so newer content still reaches
  * the disk through a later flush.
  *
- * This runs from the ResourceOwner release, BEFORE the buffer-IO cleanup:
- * BM_IO_IN_PROGRESS of the failed flush is still ours, so no concurrent
- * flush of the same page can be in flight and writing the (possibly stale)
- * batch copy cannot overwrite a newer image.  For the same reason the
- * relation cannot be dropped or truncated under us — both invalidate the
- * buffer first and that waits for our IO flag — so the ENOENT/short-file
- * exits are pure defense (and serve test refs pointing at fake relations).
+ * This runs for refs that were attached to a ResourceOwner, either from the
+ * owner's release (BEFORE the buffer-IO cleanup) or from the proc-exit
+ * backstop when abort cleanup was cut short (see DWBProcExit): in both
+ * cases BM_IO_IN_PROGRESS of the failed flush is still ours, so no
+ * concurrent flush of the same page can be in flight and writing the
+ * (possibly stale) batch copy cannot overwrite a newer image.  For the same
+ * reason the relation cannot be dropped or truncated under us — both
+ * invalidate the buffer first and that waits for our IO flag — so the
+ * ENOENT/short-file exits are pure defense (and serve test refs pointing at
+ * fake relations).
  *
  * Durability: our segment is in the batch's seg_set, and the seg_set is
  * published only after every ref (ours included) is gone, so retirement
@@ -1044,6 +1054,7 @@ DWBAbandonRef(DWBPendingRef *pref)
 	uint64		bit = UINT64CONST(1) << (ref.slot_idx % 64);
 	pg_atomic_uint64 *word =
 		&batch->slots_written_bitmap[ref.slot_idx / 64];
+	bool		had_owner = (pref->owner != NULL);
 
 	pref->owner = NULL;
 	pref->in_use = false;
@@ -1063,12 +1074,19 @@ DWBAbandonRef(DWBPendingRef *pref)
 		pg_atomic_fetch_or_u64(word, bit);
 		ConditionVariableBroadcast(&batch->cv_state);
 	}
-	else if (pg_atomic_read_u32(&batch->state) >= DWB_FSYNCED)
+	else if (had_owner &&
+			 pg_atomic_read_u32(&batch->state) >= DWB_FSYNCED)
 	{
 		/*
 		 * Copy published and the batch is durable, which means the writer
 		 * was at or past step 6: its smgrwrite may have failed halfway.
 		 * Make the data page whole again from the batch copy.
+		 *
+		 * Only for refs that were attached to a ResourceOwner: those are
+		 * real write-path refs, and their BM_IO_IN_PROGRESS is still held
+		 * here (on the proc-exit path too, see DWBProcExit).  An ownerless
+		 * (test) ref never had the buffer-IO interlock, so the repair write
+		 * would race a concurrent flush of the same page.
 		 */
 		DWBRewriteAbandonedSlot(&ref);
 	}
@@ -1095,12 +1113,23 @@ ResOwnerReleaseDWBRef(Datum res)
 }
 
 /*
- * Process-exit backstop for refs that no ResourceOwner released (test refs
- * acquired without an owner; anything a nonstandard exit path missed).  By
- * this time LWLockReleaseAll has already dropped any content locks (ipc.c)
- * and buffer-IO flags may be gone too, so unlike the ResourceOwner path
- * the abandoned-slot rewrite here is best effort against concurrent
- * flushes; the primary cleanup is the ResourceOwner one.
+ * Process-exit backstop for refs that no ResourceOwner released.
+ *
+ * An owned ref can only get here when abort cleanup was cut short before
+ * the ResourceOwner release phase (e.g. a FATAL thrown out of the abort
+ * path itself).  In that case the buffer-IO resource of the failed flush
+ * was not released either: it lives in the SAME owner and releases AFTER
+ * the DWB ref (ascending priority within the phase, RELEASE_PRIO_BUFFER_IOS
+ * - 10 before RELEASE_PRIO_BUFFER_IOS; on the success path
+ * DWBFinishPageWrite likewise precedes TerminateBufferIO).  So whenever an
+ * owned ref is still alive, BM_IO_IN_PROGRESS is still ours and the
+ * abandoned-slot repair is exactly as race-free as on the ResourceOwner
+ * path.  It is also the last chance to repair: a FATAL exit does not
+ * trigger crash recovery, so no apply-pass would ever fix a torn page.
+ *
+ * Ownerless refs are test refs (DWBAcquireSlot with use_resowner = false);
+ * they never had the interlock and DWBAbandonRef skips the repair write for
+ * them.
  */
 static void
 DWBProcExit(int code, Datum arg)

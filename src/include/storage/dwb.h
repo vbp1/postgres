@@ -65,11 +65,14 @@ extern PGDLLIMPORT int dwb_on_stall;
 #define DWBIsEnabled() (io_torn_pages_protection == DWB_PROTECT_DOUBLE_WRITES)
 
 /*
- * Compile-time capacity limits (GUC maxima).
+ * Compile-time capacity limits (GUC maxima).  Statically sized arrays
+ * (per-batch shmem arrays, the retire-side segment snapshot) rely on these,
+ * so the GUC bounds in guc_tables.c must use them, never bare literals.
  */
 #define DWB_BATCH_MAX_PAGES		256
 #define DWB_BATCH_MAX_SEGS		DWB_BATCH_MAX_PAGES
 #define DWB_BITMAP_WORDS		(DWB_BATCH_MAX_PAGES / 64)
+#define DWB_NUM_BATCHES_MAX		1024
 /* staging pool: 2 writer classes + 2 in-flight leader writes */
 #define DWB_STAGING_BUFFERS		4
 /* writer classes (3.6) */
@@ -177,12 +180,29 @@ typedef enum DWBatchState
 								 * DWSegmentHash OOM (3.5) */
 } DWBatchState;
 
+StaticAssertDecl(DWB_FREE < DWB_ALLOCATED &&
+				 DWB_ALLOCATED < DWB_SEALED &&
+				 DWB_SEALED < DWB_WRITTEN &&
+				 DWB_WRITTEN < DWB_FSYNCED &&
+				 DWB_FSYNCED < DWB_DATA_WRITTEN &&
+				 DWB_DATA_WRITTEN < DWB_RETIRING &&
+				 DWB_RETIRING < DWB_OOM_RETIRING,
+				 "DWBatchState numeric order is semantic (progress tests)");
+
 typedef struct DWSegRef
 {
 	RelFileLocator rlocator;
 	ForkNumber	forknum;
 	uint32		segno;
 } DWSegRef;
+
+/*
+ * DWSegRef is a HASH_BLOBS key: hashed and compared as raw bytes, so it must
+ * not contain padding (which field-wise construction would leave undefined).
+ */
+StaticAssertDecl(sizeof(DWSegRef) ==
+				 sizeof(RelFileLocator) + sizeof(ForkNumber) + sizeof(uint32),
+				 "DWSegRef has padding; unsafe as a HASH_BLOBS key");
 
 /*
  * Segment -> batch back-reference (3.5): one shmem hash entry per segment
@@ -249,7 +269,15 @@ typedef struct DWBatchCtl
 	int			staging_idx;	/* staging buffer; held from ALLOCATED until
 								 * the leader finishes the image pwrite */
 	XLogRecPtr	max_page_lsn;
-	uint64		batch_id;		/* monotonic, for ordering */
+	uint64		batch_id;		/* monotonic incarnation id.  Written only at
+								 * reopen, under DWBRingOpenLock; read under a
+								 * held ref (which pins the incarnation) or
+								 * racily by the retire side.  The ABA
+								 * re-check in DWBSegSnapEnd reads it under
+								 * publish_lock, but that lock does not
+								 * serialize against the reopen write: safety
+								 * comes from the idempotent bitmap re-check
+								 * plus id monotonicity (3.5). */
 	TimestampTz open_time;		/* FREE -> ALLOCATED instant; drives
 								 * force-SEAL via dwb_batch_timeout_ms */
 } DWBatchCtl;

@@ -15,6 +15,10 @@ CREATE FUNCTION test_dwb_ring_slots(current_only bool)
 	RETURNS int STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION test_dwb_ring_rel_slots(relnumber oid)
+	RETURNS int STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_dwb_states()
 	RETURNS text STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
@@ -23,7 +27,7 @@ CREATE FUNCTION test_dwb_leak(npages int, do_publish bool)
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE FUNCTION test_dwb_force_seal()
+CREATE FUNCTION test_dwb_force_seal(background bool DEFAULT false)
 	RETURNS bool STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
@@ -35,7 +39,7 @@ CREATE FUNCTION test_dwb_open_stale()
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE FUNCTION test_dwb_fill_ring()
+CREATE FUNCTION test_dwb_fill_ring(background bool DEFAULT false)
 	RETURNS int STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
@@ -45,4 +49,16 @@ CREATE FUNCTION test_dwb_abort_release(npages int, do_publish bool)
 
 CREATE FUNCTION test_dwb_abort_after_fsync()
 	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_torn_repair(relnumber oid, blkno int)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_checkpoint_pending(relnumber oid)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_fill_segments(nbatches int)
+	RETURNS int STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;

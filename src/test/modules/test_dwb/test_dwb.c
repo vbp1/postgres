@@ -20,10 +20,13 @@
 #include <unistd.h>
 
 #include "catalog/pg_tablespace_d.h"
+#include "common/relpath.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "storage/bufpage.h"
 #include "storage/dwb.h"
 #include "storage/fd.h"
+#include "storage/smgr.h"
 #include "utils/builtins.h"
 
 PG_MODULE_MAGIC;
@@ -132,20 +135,19 @@ test_dwb_stress(PG_FUNCTION_ARGS)
 /*
  * Validate the on-disk ring the way the apply-pass will: read every batch
  * file, check header, then count slots passing meta_crc (+ generation if
- * current_only) + flags + image_crc.
+ * current_only) + flags + image_crc.  With have_filter, count only slots
+ * whose tag belongs to the given relation (any generation) — used to prove
+ * that pages of a relation never entered the ring.
  */
-PG_FUNCTION_INFO_V1(test_dwb_ring_slots);
-Datum
-test_dwb_ring_slots(PG_FUNCTION_ARGS)
+static int
+count_ring_slots(bool current_only, bool have_filter, Oid relnumber)
 {
-	bool		current_only = PG_GETARG_BOOL(0);
 	DWBControlFileData control;
 	Size		meta_region;
 	DWSlotMeta *metas;
 	char	   *image;
 	int			valid = 0;
 
-	check_dwb_enabled();
 	if (!DWBReadControlFile(&control, false))
 		pg_unreachable();
 
@@ -226,6 +228,9 @@ test_dwb_ring_slots(PG_FUNCTION_ARGS)
 					continue;
 				if (current_only && meta->generation != control.generation)
 					continue;
+				if (have_filter &&
+					BufTagGetRelNumber(&meta->tag) != (RelFileNumber) relnumber)
+					continue;
 
 				errno = 0;
 				r = pg_pread(fd, image, BLCKSZ,
@@ -255,7 +260,28 @@ test_dwb_ring_slots(PG_FUNCTION_ARGS)
 
 	pfree(metas);
 	pfree(image);
-	PG_RETURN_INT32(valid);
+	return valid;
+}
+
+PG_FUNCTION_INFO_V1(test_dwb_ring_slots);
+Datum
+test_dwb_ring_slots(PG_FUNCTION_ARGS)
+{
+	bool		current_only = PG_GETARG_BOOL(0);
+
+	check_dwb_enabled();
+	PG_RETURN_INT32(count_ring_slots(current_only, false, InvalidOid));
+}
+
+/* slots of one relation, any generation: 0 = never entered the ring */
+PG_FUNCTION_INFO_V1(test_dwb_ring_rel_slots);
+Datum
+test_dwb_ring_rel_slots(PG_FUNCTION_ARGS)
+{
+	Oid			relnumber = PG_GETARG_OID(0);
+
+	check_dwb_enabled();
+	PG_RETURN_INT32(count_ring_slots(false, true, relnumber));
 }
 
 PG_FUNCTION_INFO_V1(test_dwb_states);
@@ -287,7 +313,10 @@ test_dwb_states(PG_FUNCTION_ARGS)
 /*
  * Acquire (and optionally publish) npages slots and return WITHOUT
  * releasing them: the refs stay pending, so closing the session exercises
- * DWBProcExit's poison (unpublished) or orphan (published) path.
+ * DWBProcExit.  Unpublished slots get poisoned; published ownerless refs
+ * just drop their batch ref (the repair write is reserved for
+ * ResourceOwner-attached refs), leaving the batch completable by a later
+ * seal.
  */
 PG_FUNCTION_INFO_V1(test_dwb_leak);
 Datum
@@ -324,16 +353,22 @@ test_dwb_leak(PG_FUNCTION_ARGS)
 }
 
 /*
- * Occupy the whole ring without blocking: acquire and publish slots until
- * no FREE batch remains and the open batch is full, keeping every ref (the
- * refs die with the session).  Sets up ring exhaustion for the
- * backpressure tests.  Meant for dwb_retire_workers = 0, where nothing
- * seals or retires behind our back.  Returns the number of slots taken.
+ * Occupy the ring without blocking: acquire and publish slots until no
+ * openable FREE batch remains and the open batch is full, keeping every ref
+ * (the refs die with the session).  Sets up ring exhaustion for the
+ * backpressure tests.  With background = true the slots are taken in the
+ * BACKGROUND writer class, which must stop opening batches once only
+ * DWB_EVICT_RESERVE FREE ones are left.  Meant for dwb_retire_workers = 0,
+ * where nothing seals or retires behind our back.  Returns the number of
+ * slots taken.
  */
 PG_FUNCTION_INFO_V1(test_dwb_fill_ring);
 Datum
 test_dwb_fill_ring(PG_FUNCTION_ARGS)
 {
+	bool		background = PG_GETARG_BOOL(0);
+	int			wclass = background ? DWB_WCLASS_BACKGROUND : DWB_WCLASS_EVICTION;
+	int			reserve = background ? DWB_EVICT_RESERVE : 0;
 	int			taken = 0;
 	static char page[BLCKSZ];
 
@@ -356,8 +391,8 @@ test_dwb_fill_ring(PG_FUNCTION_ARGS)
 		for (int i = 0; i < dwb_num_batches; i++)
 			if (DWBGetBatchState(i) == DWB_FREE)
 				nfree++;
-		open_idx = pg_atomic_read_u32(&DWBCtl->open_batch_idx[DWB_WCLASS_EVICTION]);
-		if (nfree == 0 &&
+		open_idx = pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]);
+		if (nfree <= reserve &&
 			(open_idx == DWB_INVALID_BATCH ||
 			 (pg_atomic_read_u32(&DWBCtl->batches[open_idx].next_slot_idx) &
 			  (DWB_SEAL_BIT | DWB_IDX_MASK)) >= (uint32) dwb_batch_pages))
@@ -365,10 +400,10 @@ test_dwb_fill_ring(PG_FUNCTION_ARGS)
 
 		rlocator.spcOid = DEFAULTTABLESPACE_OID;
 		rlocator.dbOid = 1;
-		rlocator.relNumber = 95000;
+		rlocator.relNumber = 95000 + (background ? 1000 : 0);
 		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) taken);
 
-		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
+		DWBAcquireSlot(&tag, wclass, false, &ref);
 		memset(page, 'X', BLCKSZ);
 		DWBPublishImage(&ref, page, (XLogRecPtr) 0x6000000 + taken);
 		taken++;
@@ -421,10 +456,11 @@ test_dwb_abort_release(PG_FUNCTION_ARGS)
 
 /*
  * Abort AFTER the batch is durable: acquire one slot with a ResourceOwner
- * attachment, publish, seal, wait for DWB_FSYNCED, then ERROR.  The abort
- * cleanup takes the abandoned-slot repair path; the fake relation makes it
- * exit through the dropped-relation branch, and the ref hand-off must
- * still finish the batch (publication, RETIRING).
+ * attachment, publish, seal, wait for DWB_FSYNCED, then ERROR.  This
+ * exercises the REF HAND-OFF of the abort path: the fake relation makes the
+ * repair exit through the dropped-relation branch, and the last-ref drop
+ * must still finish the batch (publication, RETIRING).  The repair write
+ * itself is exercised by test_dwb_torn_repair on a real relation.
  */
 PG_FUNCTION_INFO_V1(test_dwb_abort_after_fsync);
 Datum
@@ -454,12 +490,182 @@ test_dwb_abort_after_fsync(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();			/* unreachable */
 }
 
+/*
+ * Torn-page repair end to end on a REAL relation: read the current on-disk
+ * image of one block, stage it into the DWB with a ResourceOwner-attached
+ * ref, make the batch durable, then deliberately tear the block on disk and
+ * abort.  The ResourceOwner release must rewrite the block from the batch
+ * copy (DWBRewriteAbandonedSlot); the TAP test verifies the on-disk content
+ * after a restart, where a failed repair surfaces as a checksum error.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_torn_repair);
+Datum
+test_dwb_torn_repair(PG_FUNCTION_ARGS)
+{
+	Oid			relnumber = PG_GETARG_OID(0);
+	BlockNumber blkno = (BlockNumber) PG_GETARG_INT32(1);
+	BufferTag	tag;
+	DWBSlotRef	ref;
+	RelFileLocator rlocator;
+	RelPathStr	relpath;
+	static PGAlignedBlock image;
+	static char junk[BLCKSZ / 2];
+	int			fd;
+
+	check_dwb_enabled();
+
+	rlocator.spcOid = DEFAULTTABLESPACE_OID;
+	rlocator.dbOid = MyDatabaseId;
+	rlocator.relNumber = relnumber;
+	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, blkno);
+
+	relpath = relpathperm(rlocator, MAIN_FORKNUM);
+	fd = OpenTransientFile(relpath.str, O_RDWR | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", relpath.str)));
+	errno = 0;
+	if (pg_pread(fd, image.data, BLCKSZ, (off_t) blkno * BLCKSZ) != BLCKSZ)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read block %u of file \"%s\": %m",
+						blkno, relpath.str)));
+
+	/* stage the pristine image; the abort below must put it back */
+	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, true, &ref);
+	DWBPublishImage(&ref, image.data, PageGetLSN((Page) image.data));
+	if (!DWBTrySealBatch(ref.batch_idx))
+		ereport(ERROR, (errmsg("could not seal the batch under test")));
+	DWBWaitBatchFsynced(&ref);
+
+	/* simulate a torn smgrwrite: clobber the second half of the block */
+	memset(junk, 0x7F, sizeof(junk));
+	errno = 0;
+	if (pg_pwrite(fd, junk, sizeof(junk),
+				  (off_t) blkno * BLCKSZ + BLCKSZ / 2) != (ssize_t) sizeof(junk))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not tear block %u of file \"%s\": %m",
+						blkno, relpath.str)));
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", relpath.str)));
+
+	ereport(ERROR,
+			(errmsg("test_dwb: deliberate abort after tearing the data page")));
+	PG_RETURN_VOID();			/* unreachable */
+}
+
+/*
+ * Leave one batch RETIRING with a REAL segment in DWSegmentHash and a
+ * pending checkpointer sync request for that segment: stage one real block,
+ * make the batch durable, write the block through smgrwrite (which
+ * registers the sync request), and release the ref.  With
+ * dwb_retire_workers = 0 and no explicit test_dwb_retire() call, only the
+ * checkpointer's ProcessSyncRequests -- wrapped by
+ * DWBSegmentFsyncBegin/End -- can retire the batch: the TAP test asserts
+ * that a CHECKPOINT alone frees the ring.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_checkpoint_pending);
+Datum
+test_dwb_checkpoint_pending(PG_FUNCTION_ARGS)
+{
+	Oid			relnumber = PG_GETARG_OID(0);
+	BufferTag	tag;
+	DWBSlotRef	ref;
+	RelFileLocator rlocator;
+	SMgrRelation reln;
+	static PGAlignedBlock image;
+
+	check_dwb_enabled();
+
+	rlocator.spcOid = DEFAULTTABLESPACE_OID;
+	rlocator.dbOid = MyDatabaseId;
+	rlocator.relNumber = relnumber;
+	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
+
+	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	smgrread(reln, MAIN_FORKNUM, 0, image.data);
+
+	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
+	DWBPublishImage(&ref, image.data, PageGetLSN((Page) image.data));
+	if (!DWBTrySealBatch(ref.batch_idx))
+		ereport(ERROR, (errmsg("could not seal the batch under test")));
+	DWBWaitBatchFsynced(&ref);
+
+	/* the data-file write; registers the checkpointer sync request */
+	smgrwrite(reln, MAIN_FORKNUM, 0, image.data, false);
+
+	DWBReleaseSlot(&ref);		/* last ref: publication, RETIRING */
+	PG_RETURN_VOID();
+}
+
+/*
+ * Publish nbatches full batches whose slots all point at DISTINCT fake
+ * segments, so that RETIRING batches accumulate DWSegmentHash entries until
+ * the hash overflows and publication degrades to the synchronous OOM retire
+ * (WARNING "segment hash is full", DWB_OOM_RETIRING, batch freed by the
+ * publisher).  Meant for dwb_retire_workers = 0 so the RETIRING batches
+ * keep their entries pinned.  Returns the number of slots published.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_fill_segments);
+Datum
+test_dwb_fill_segments(PG_FUNCTION_ARGS)
+{
+	int			nbatches = PG_GETARG_INT32(0);
+	int			nsegs = 0;
+	static char page[BLCKSZ];
+	static uint32 next_relnumber = 200000;
+
+	check_dwb_enabled();
+	if (nbatches < 1 || nbatches > dwb_num_batches)
+		ereport(ERROR, (errmsg("nbatches out of range")));
+
+	for (int b = 0; b < nbatches; b++)
+	{
+		DWBSlotRef	refs[DWB_BATCH_MAX_PAGES];
+
+		CHECK_FOR_INTERRUPTS();
+
+		for (int i = 0; i < dwb_batch_pages; i++)
+		{
+			BufferTag	tag;
+			RelFileLocator rlocator;
+
+			rlocator.spcOid = DEFAULTTABLESPACE_OID;
+			rlocator.dbOid = 1;
+			rlocator.relNumber = next_relnumber++;
+			InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
+
+			DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &refs[i]);
+			/* the whole batch must be ours for the seal below to cover it */
+			if (refs[i].batch_idx != refs[0].batch_idx)
+				ereport(ERROR,
+						(errmsg("segment-fill batch split unexpectedly")));
+			memset(page, 'S', BLCKSZ);
+			DWBPublishImage(&refs[i], page, (XLogRecPtr) 0x7000000 + nsegs);
+			nsegs++;
+		}
+		if (!DWBTrySealBatch(refs[0].batch_idx))
+			ereport(ERROR, (errmsg("could not seal a segment-fill batch")));
+		DWBWaitBatchFsynced(&refs[0]);
+		for (int i = 0; i < dwb_batch_pages; i++)
+			DWBReleaseSlot(&refs[i]);
+	}
+	PG_RETURN_INT32(nsegs);
+}
+
 PG_FUNCTION_INFO_V1(test_dwb_force_seal);
 Datum
 test_dwb_force_seal(PG_FUNCTION_ARGS)
 {
+	bool		background = PG_GETARG_BOOL(0);
+
 	check_dwb_enabled();
-	PG_RETURN_BOOL(DWBForceSealOpenBatch(DWB_WCLASS_EVICTION));
+	PG_RETURN_BOOL(DWBForceSealOpenBatch(background ? DWB_WCLASS_BACKGROUND
+										 : DWB_WCLASS_EVICTION));
 }
 
 PG_FUNCTION_INFO_V1(test_dwb_retire);

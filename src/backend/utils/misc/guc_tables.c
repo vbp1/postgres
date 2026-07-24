@@ -2202,7 +2202,7 @@ struct config_int ConfigureNamesInt[] =
 			NULL
 		},
 		&dwb_num_batches,
-		64, 16, 1024,
+		64, 16, DWB_NUM_BATCHES_MAX,
 		NULL, NULL, NULL
 	},
 	{

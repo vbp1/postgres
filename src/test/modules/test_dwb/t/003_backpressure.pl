@@ -123,4 +123,39 @@ ok( $node->log_contains(
 is( $node->safe_psql('postgres', 'SELECT count(*) FROM dwb_dirty'),
 	'1000', 'data intact after crash recovery');
 
+# --- Stage A warning fires on the real clock ------------------------------
+
+# No injection point this time: shrink the real thresholds and let a victim
+# writer walk through Stage A (WARNING after dwb_slow_warn_ms) into Stage B
+# (ERROR after dwb_write_timeout_ms, dwb_on_stall = error).  The bgwriter
+# pause of Stage A has no SQL-visible probe and stays untested here.
+$node->append_conf(
+	'postgresql.conf', qq(
+dwb_slow_warn_ms = 100
+dwb_write_timeout_ms = 1000
+));
+$node->reload;
+
+$filler = $node->background_psql('postgres');
+$taken = $filler->query_safe('SELECT test_dwb_fill_ring()');
+cmp_ok($taken, '>', 0, 'ring exhausted for the slow-warn scenario');
+
+($rc, $out, $err) = $node->psql('postgres', 'SELECT test_dwb_cycle(1)');
+isnt($rc, 0, 'victim writer errors out on the real stall clock');
+like(
+	$err,
+	qr/double write buffer has no free batch after/,
+	'Stage A warning reached the writer');
+like(
+	$err,
+	qr/double write buffer retirement made no progress/,
+	'Stage B error reached the writer');
+
+$filler->quit;
+$node->poll_query_until('postgres',
+	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
+	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
+	  . "test_dwb_states() LIKE 'free=16 %' END END")
+  or die 'timed out waiting for the ring to drain after the slow-warn scenario';
+
 done_testing();

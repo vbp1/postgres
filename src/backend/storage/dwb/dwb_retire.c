@@ -70,7 +70,7 @@ typedef struct DWBSegSyncSnap
 	{
 		int			batch_idx;
 		uint64		batch_id;
-	}			pairs[1024];		/* dwb_num_batches max (GUC) */
+	}			pairs[DWB_NUM_BATCHES_MAX];
 } DWBSegSyncSnap;
 
 static DWBSegSyncSnap seg_sync_snap;
@@ -119,11 +119,19 @@ DWBNoteBatchFreed(void)
 /*
  * Fsync one segment for retirement purposes, tolerating a concurrently
  * dropped relation: the data-file writes of a dropped segment are moot, so
- * ENOENT counts as covered.  Any other failure follows the vanilla
- * data_sync_retry policy (PANIC by default).
+ * ENOENT counts as covered.  Returns true if the segment is covered (fsynced
+ * or dropped).
+ *
+ * A real fsync failure follows the vanilla data_sync_retry policy: PANIC by
+ * default, but with data_sync_retry = on the kernel is trusted to keep the
+ * dirty pages, so this must NOT throw -- the callers hold accounting state
+ * (the advisory fsync claim, the OOM batch state) that a longjmp would leak
+ * forever.  Instead it WARNs and returns false; the segment's back-reference
+ * bits stay set and a later fsyncer retries.  force_panic is for the one
+ * caller that has no later fsyncer to fall back on (DWBRetireBatchSyncOOM).
  */
-static void
-DWBRetireSyncSegment(const DWSegRef *seg)
+static bool
+DWBRetireSyncSegment(const DWSegRef *seg, bool force_panic)
 {
 	FileTag		tag = DWBFileTagFromSegRef(seg);
 	char		path[MAXPGPATH];
@@ -134,12 +142,14 @@ DWBRetireSyncSegment(const DWSegRef *seg)
 		{
 			elog(DEBUG1, "DWB: segment \"%s\" dropped during retire, skipping fsync",
 				 path);
-			return;
+			return true;
 		}
-		ereport(data_sync_elevel(ERROR),
+		ereport(force_panic ? PANIC : data_sync_elevel(WARNING),
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", path)));
+		return false;
 	}
+	return true;
 }
 
 /*
@@ -148,6 +158,12 @@ DWBRetireSyncSegment(const DWSegRef *seg)
  * the batch, so an undersized hash degrades throughput instead of wedging
  * the ring.  Runs with no locks held; the DWB_OOM_RETIRING state keeps
  * everyone else away from the batch.
+ *
+ * An fsync failure here is a PANIC even under data_sync_retry = on: nothing
+ * ever revisits a DWB_OOM_RETIRING batch (retire sweeps only collect
+ * DWB_RETIRING, and the hash bits were rolled back), so a soft failure would
+ * leak the batch until restart -- and this can run inside a ResourceOwner
+ * release callback, which must not fail (resowner.h).
  */
 static void
 DWBRetireBatchSyncOOM(DWBatchCtl *batch)
@@ -155,7 +171,7 @@ DWBRetireBatchSyncOOM(DWBatchCtl *batch)
 	uint32		expected;
 
 	for (uint32 i = 0; i < batch->n_segs; i++)
-		DWBRetireSyncSegment(&batch->seg_set[i]);
+		(void) DWBRetireSyncSegment(&batch->seg_set[i], true);
 
 	expected = DWB_OOM_RETIRING;
 	if (!pg_atomic_compare_exchange_u32(&batch->state, &expected, DWB_FREE))
@@ -179,6 +195,14 @@ DWBPublishBatchSegSet(int batch_idx)
 	uint32		published = 0;
 	bool		oom = false;
 	uint32		expected;
+
+	/*
+	 * A sealed non-empty batch always has at least one segment (every slot
+	 * reservation dedup-inserts its segment).  Publishing an empty seg_set
+	 * would move the batch to DWB_RETIRING with nothing to ever decrement it
+	 * to FREE.
+	 */
+	Assert(batch->n_segs > 0);
 
 	LWLockAcquire(&batch->publish_lock, LW_EXCLUSIVE);
 
@@ -284,8 +308,9 @@ DWBSegSnapBegin(const DWSegRef *seg)
 {
 	DWSegEntry *entry;
 
-	/* a leftover active snapshot means the previous fsync ERROR'ed out
-	 * between Begin and End: its bits were never cleared, just drop it */
+	/* overwriting a leftover snapshot (an fsync that errored out between
+	 * Begin and End) is a correct drop: its bits were never cleared and a
+	 * later fsyncer covers them; see also DWBSegmentFsyncBegin */
 	seg_sync_snap.active = true;
 	seg_sync_snap.seg = *seg;
 	seg_sync_snap.npairs = 0;
@@ -304,6 +329,7 @@ DWBSegSnapBegin(const DWSegRef *seg)
 				int			idx = (int) (w * 64) + bit;
 
 				word &= word - 1;
+				Assert(seg_sync_snap.npairs < (int) lengthof(seg_sync_snap.pairs));
 				seg_sync_snap.pairs[seg_sync_snap.npairs].batch_idx = idx;
 
 				/*
@@ -400,6 +426,18 @@ DWBSegmentFsyncBegin(const FileTag *ftag)
 {
 	DWSegRef	seg;
 
+	/*
+	 * Drop any leftover snapshot BEFORE deciding whether to take a new one.
+	 * If a previous fsync ERROR'ed out between Begin and End (possible in
+	 * the checkpointer with data_sync_retry = on, which survives the ERROR
+	 * and keeps this process-local state), the early return below would
+	 * otherwise leave the stale snapshot armed, and the End of the next
+	 * successful fsync of an unrelated non-MD tag would decrement the stale
+	 * segment's back-references -- freeing batches whose data-file fsync
+	 * never succeeded.
+	 */
+	seg_sync_snap.active = false;
+
 	if (!DWBIsEnabled() || ftag->handler != SYNC_HANDLER_MD)
 		return;
 
@@ -451,6 +489,7 @@ DWBRetireSegment(const DWSegRef *seg)
 {
 	DWSegEntry *entry;
 	bool		claimed = false;
+	bool		covered;
 	uint32		zero = 0;
 	int			freed;
 
@@ -464,9 +503,14 @@ DWBRetireSegment(const DWSegRef *seg)
 	if (!claimed)
 		return 0;
 
+	/*
+	 * DWBRetireSyncSegment does not throw on a soft (data_sync_retry = on)
+	 * fsync failure, so the claim reset below always runs; on covered =
+	 * false the snapshot is discarded and the bits stay for a retry.
+	 */
 	DWBSegSnapBegin(seg);
-	DWBRetireSyncSegment(seg);
-	freed = DWBSegSnapEnd(true);
+	covered = DWBRetireSyncSegment(seg, false);
+	freed = DWBSegSnapEnd(covered);
 
 	/*
 	 * Release the claim.  The entry may have been removed (and even
@@ -486,8 +530,10 @@ DWBRetireSegment(const DWSegRef *seg)
 /*
  * One retire sweep over all RETIRING batches, oldest first.  worker_id >= 0
  * restricts the sweep to that worker's segment partition; -1 sweeps
- * everything (self-help of a writer stuck on a full ring, and the second
- * retire point in ProcessSyncRequests-less paths).  Returns batches freed.
+ * everything: the self-help of a writer stuck on a full ring
+ * (DWBOpenNewBatch) and the synchronous retire in DWBFinishPageWrite when
+ * there is no worker pool (dwb_retire_workers = 0, single-user mode).
+ * Returns batches freed.
  */
 int
 DWBRetireAllSync(void)

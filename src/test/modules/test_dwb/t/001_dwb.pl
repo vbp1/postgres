@@ -159,8 +159,8 @@ is( $node->safe_psql('postgres', 'SELECT test_dwb_retire()'),
 	'1', 'batch of the aborted transaction retires');
 
 # An ERROR after the batch is durable: the abort cleanup goes through the
-# abandoned-slot repair (the fake relation exits via the dropped-relation
-# branch) and must still hand the batch over to retirement.
+# abandoned-slot ref hand-off (the fake relation exits via the
+# dropped-relation branch) and must still hand the batch over to retirement.
 ($rc, $out, $err) =
   $node->psql('postgres', 'SELECT test_dwb_abort_after_fsync()');
 isnt($rc, 0, 'deliberate abort after batch fsync reported');
@@ -169,6 +169,55 @@ is( $node->safe_psql('postgres', 'SELECT test_dwb_retire()'),
 like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
 	qr/free=16/, 'ring idle after the abort scenarios');
+
+# --- torn data page repaired from the batch copy on abort ----------------
+
+# A REAL relation this time: test_dwb_torn_repair stages the pristine
+# on-disk image of block 0 into the DWB, tears the block on disk, and
+# aborts.  The ResourceOwner release must rewrite the block from the
+# durable batch copy (DWBRewriteAbandonedSlot).  The restart proves the
+# repair reached the data file: the buffer cache is dropped, and with data
+# checksums a block left torn would make the read below fail.
+$node->safe_psql('postgres', q(
+	CREATE TABLE dwb_repair AS
+		SELECT g AS id, repeat('r', 64) AS pad FROM generate_series(1, 100) g;
+));
+$node->safe_psql('postgres', 'CHECKPOINT');
+my $filenode =
+  $node->safe_psql('postgres', "SELECT pg_relation_filenode('dwb_repair')");
+($rc, $out, $err) =
+  $node->psql('postgres', "SELECT test_dwb_torn_repair($filenode, 0)");
+isnt($rc, 0, 'deliberate abort after tearing the data page reported');
+like($err, qr/deliberate abort after tearing/, 'the tear scenario ran');
+is( $node->safe_psql('postgres', 'SELECT test_dwb_retire()'),
+	'1', 'batch of the torn-page scenario retires');
+$node->restart;
+is( $node->safe_psql('postgres', 'SELECT count(*) FROM dwb_repair'),
+	'100', 'torn block repaired from the batch copy (checksum-clean read)');
+
+# --- background writers leave the eviction reserve -----------------------
+
+# DWB_EVICT_RESERVE = Max(2, 16/8) = 2 on this geometry: a background-class
+# writer must stop opening batches once only the reserve is left, while an
+# eviction-class writer may take the ring down to zero.
+$bg = $node->background_psql('postgres');
+my $bg_taken = $bg->query_safe('SELECT test_dwb_fill_ring(true)');
+cmp_ok($bg_taken, '>', 0, 'background class filled the ring');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/free=2 /, 'background class stops at DWB_EVICT_RESERVE free batches');
+my $ev_taken = $bg->query_safe('SELECT test_dwb_fill_ring(false)');
+cmp_ok($ev_taken, '>', 0, 'eviction class still opens batches');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/free=0 /, 'eviction class may take the ring to zero');
+$bg->quit;
+$node->poll_query_until('postgres',
+	"SELECT CASE WHEN test_dwb_force_seal(false) IS NOT NULL THEN "
+	  . "CASE WHEN test_dwb_force_seal(true) IS NOT NULL THEN "
+	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
+	  . "test_dwb_states() LIKE 'free=16 %' END END END")
+  or die 'timed out waiting for the ring to drain after the reserve scenario';
 
 # --- stale open must not hijack a reopened index ------------------------
 

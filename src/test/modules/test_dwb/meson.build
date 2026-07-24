@@ -33,8 +33,14 @@ tests += {
     'runningcheck': false,
   },
   'tap': {
+    'env': {
+      'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
+    },
     'tests': [
-      't/001_dwb.pl'
+      't/001_dwb.pl',
+      't/002_flushbuffer.pl',
+      't/003_backpressure.pl',
+      't/004_retire_paths.pl',
     ],
   },
 }

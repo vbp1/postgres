@@ -4379,8 +4379,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * from there (full_page_writes replacement, see storage/dwb.h).  Only
 	 * BM_PERMANENT buffers need this: unlogged relations are reset from
 	 * their init fork after a crash, so their torn writes don't matter.
-	 * With data checksums required by the DWB, bufToWrite is always a
-	 * private copy, stable regardless of concurrent hint-bit updates.
+	 * Data checksums are required by the DWB, so for any page with content
+	 * bufToWrite is a private copy, stable regardless of concurrent
+	 * hint-bit updates; PageSetChecksumCopy returns the shared page only
+	 * when it is all-zero new, where there are no tuples for hint bits to
+	 * touch.
 	 */
 	if (DWBIsEnabled() && (buf_state & BM_PERMANENT) &&
 		!IsBootstrapProcessingMode())
