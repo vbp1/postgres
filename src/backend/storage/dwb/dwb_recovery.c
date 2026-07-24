@@ -54,8 +54,8 @@ DWBStartup(void)
 	{
 		/*
 		 * Geometry GUCs define the on-disk layout.  Re-creating the ring
-		 * under a changed geometry must not skip the apply-pass over the
-		 * old ring, so it is deferred to Stage 4; until then, refuse.
+		 * under a changed geometry must not skip the apply-pass over the old
+		 * ring, so it is deferred to Stage 4; until then, refuse.
 		 */
 		ereport(FATAL,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

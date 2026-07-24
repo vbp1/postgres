@@ -88,4 +88,57 @@ $node->poll_query_until('postgres',
   or die 'timed out waiting for the ring to drain after the hash overflow';
 pass('ring drained after the hash overflow');
 
+# --- a leftover fsync snapshot must not be consumed by a foreign End -----
+
+# test_dwb_stale_snapshot replays the checkpointer hazard: Begin for the
+# parked segment without the matching End (the state an fsync ERROR under
+# data_sync_retry = on leaves behind), then a successful Begin/End of an
+# unrelated non-MD entry.  The parked batch must still be RETIRING — a
+# consumed stale snapshot would have freed it without durability.
+$node->safe_psql('postgres', 'SELECT test_dwb_park(98000)');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/retiring=1/, 'batch parked for the stale-snapshot scenario');
+$node->safe_psql('postgres', 'SELECT test_dwb_stale_snapshot(98000)');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/retiring=1/, 'stale snapshot dropped, parked batch still RETIRING');
+$node->poll_query_until('postgres',
+	"SELECT CASE WHEN test_dwb_retire() >= 0 THEN "
+	  . "test_dwb_states() LIKE 'free=64 %' END")
+  or die 'timed out waiting for the stale-snapshot batch to drain';
+
+# --- a soft retire-fsync failure keeps the batch and releases the claim --
+
+# With data_sync_retry = on a failed segment fsync must not throw: the
+# batch stays RETIRING for a later retry and the advisory claim is
+# released.  A directory planted at the fake segment's path makes the
+# fsync fail deterministically (EISDIR); removing it lets the next sweep
+# cover the segment — which only works if the failed attempt released the
+# claim.
+$node->append_conf('postgresql.conf', 'data_sync_retry = on');
+$node->restart;
+
+my $segdir = $node->data_dir . '/base/1/99000';
+mkdir $segdir or die "mkdir $segdir: $!";
+
+$node->safe_psql('postgres', 'SELECT test_dwb_park(99000)');
+($rc, $out, $err) = $node->psql('postgres', 'SELECT test_dwb_retire()');
+is($rc, 0, 'retire sweep survives the failing segment fsync');
+is($out, '0', 'no batch freed while the segment fsync fails');
+like(
+	$err,
+	qr/could not fsync file/,
+	'soft fsync failure reported as a WARNING');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/retiring=1/, 'batch stays RETIRING after the soft fsync failure');
+
+rmdir $segdir or die "rmdir $segdir: $!";
+is( $node->safe_psql('postgres', 'SELECT test_dwb_retire()'),
+	'1', 'released claim lets the next sweep cover the segment');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/^free=64 /, 'ring drained after the soft-failure scenario');
+
 done_testing();

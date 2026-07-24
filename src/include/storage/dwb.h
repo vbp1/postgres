@@ -108,8 +108,8 @@ typedef struct DWBControlFileData
 	uint32		min_version;
 	uint32		num_batches;
 	uint32		batch_pages;
-	uint64		generation;		/* apply-pass horizon: bumped durably on
-								 * every start before the ring opens */
+	uint64		generation;		/* apply-pass horizon: bumped durably on every
+								 * start before the ring opens */
 	pg_crc32c	crc;			/* CRC of all preceding fields */
 } DWBControlFileData;
 
@@ -244,8 +244,8 @@ typedef struct DWBatchCtl
 {
 	pg_atomic_uint32 state;		/* DWBatchState */
 	pg_atomic_uint32 next_slot_idx; /* fetch_add on ALLOCATED */
-	pg_atomic_uint32 capped_slots;	/* fixed by SEAL; leader waits for
-									 * exactly this many bitmap bits */
+	pg_atomic_uint32 capped_slots;	/* fixed by SEAL; leader waits for exactly
+									 * this many bitmap bits */
 	pg_atomic_uint64 slots_written_bitmap[DWB_BITMAP_WORDS];
 	pg_atomic_uint32 ref_count; /* writers holding the batch from slot
 								 * reservation to smgrwrite done */
@@ -292,9 +292,9 @@ typedef struct DWCtl
 	uint64		ring_generation;	/* = control.generation after the startup
 									 * bump; constant until restart, stamped
 									 * into DWSlotMeta by the leader */
-	pg_atomic_uint64 freed_events;	/* monotonic count of batches that
-									 * reached FREE; backpressure waiters
-									 * treat a change as retire progress */
+	pg_atomic_uint64 freed_events;	/* monotonic count of batches that reached
+									 * FREE; backpressure waiters treat a
+									 * change as retire progress */
 	ConditionVariable cv_free_batch;	/* broadcast on retire */
 	ConditionVariable cv_retire_wake;	/* wakes retire workers */
 	slock_t		staging_lock;	/* protects staging_free bitmap */
@@ -334,6 +334,7 @@ extern void DWBReleaseSlot(const DWBSlotRef *ref);
 extern bool DWBForceSealOpenBatch(int wclass);
 extern bool DWBTrySealBatch(int batch_idx);
 extern DWBatchState DWBGetBatchState(int batch_idx);
+
 /* internal; exported for test_dwb's stale-open regression test */
 extern void DWBOpenNewBatch(int wclass, uint32 old_idx);
 

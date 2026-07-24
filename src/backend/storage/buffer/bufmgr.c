@@ -4375,15 +4375,14 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	/*
 	 * Double write buffer path: before the data-file write, make the copy
-	 * durable in pg_dwb/ so that a torn smgrwrite can always be repaired
-	 * from there (full_page_writes replacement, see storage/dwb.h).  Only
-	 * BM_PERMANENT buffers need this: unlogged relations are reset from
-	 * their init fork after a crash, so their torn writes don't matter.
-	 * Data checksums are required by the DWB, so for any page with content
-	 * bufToWrite is a private copy, stable regardless of concurrent
-	 * hint-bit updates; PageSetChecksumCopy returns the shared page only
-	 * when it is all-zero new, where there are no tuples for hint bits to
-	 * touch.
+	 * durable in pg_dwb/ so that a torn smgrwrite can always be repaired from
+	 * there (full_page_writes replacement, see storage/dwb.h).  Only
+	 * BM_PERMANENT buffers need this: unlogged relations are reset from their
+	 * init fork after a crash, so their torn writes don't matter. Data
+	 * checksums are required by the DWB, so for any page with content
+	 * bufToWrite is a private copy, stable regardless of concurrent hint-bit
+	 * updates; PageSetChecksumCopy returns the shared page only when it is
+	 * all-zero new, where there are no tuples for hint bits to touch.
 	 */
 	if (DWBIsEnabled() && (buf_state & BM_PERMANENT) &&
 		!IsBootstrapProcessingMode())
@@ -4427,8 +4426,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	{
 		/*
 		 * Step 6b: start kernel writeback of the page now so the segment
-		 * fsync that retires the batch becomes a cheap barrier instead of
-		 * a full flush.  Not durability — that comes from the fsync.
+		 * fsync that retires the batch becomes a cheap barrier instead of a
+		 * full flush.  Not durability — that comes from the fsync.
 		 */
 		if (dwb_writeback)
 			smgrwriteback(reln, BufTagGetForkNum(&buf->tag),

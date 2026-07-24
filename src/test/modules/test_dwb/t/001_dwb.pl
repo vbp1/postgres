@@ -142,6 +142,19 @@ like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
 	qr/free=16/, 'ring fully idle after the orphan hand-off');
 
+# A backend dies holding the LAST ref of an already-durable batch: the exit
+# backstop itself performs the FSYNCED -> RETIRING hand-off (seg_set
+# publication under LWLocks), which is only legal because it runs as a
+# before_shmem_exit callback while the PGPROC is still alive.
+$bg = $node->background_psql('postgres');
+$bg->query_safe('SELECT test_dwb_leak_fsynced()');
+$bg->quit;
+$node->poll_query_until('postgres',
+	"SELECT test_dwb_states() LIKE '%retiring=1%'")
+  or die 'timed out waiting for the exit-time publication';
+is( $node->safe_psql('postgres', 'SELECT test_dwb_retire()'),
+	'1', 'batch published from the exit backstop retires');
+
 # --- transaction abort releases refs (ResourceOwner path) ---------------
 
 # An ERROR with unpublished refs: the abort poisons the slots, and the
@@ -250,6 +263,31 @@ ok( $node->log_contains('was created with dwb_num_batches = 16 and dwb_batch_pag
 		$log_offset),
 	'batch_pages mismatch reported');
 $node->append_conf('postgresql.conf', 'dwb_batch_pages = 16');
+$node->start;
+$node->stop;
+
+# --- the retire worker pool must actually fit into the worker slots ------
+
+# The logical replication launcher takes a slot before the pool registers;
+# RegisterBackgroundWorker itself only LOGs on overflow, so the pool checks
+# the remaining capacity and refuses to start a silently smaller pool.
+$log_offset = -s $node->logfile;
+$node->append_conf(
+	'postgresql.conf', qq(
+max_worker_processes = 1
+dwb_retire_workers = 1
+));
+$ret = $node->start(fail_ok => 1);
+is($ret, 0, 'start refused when the pool does not fit into worker slots');
+ok( $node->log_contains(
+		'needs more "max_worker_processes" slots than remain free',
+		$log_offset),
+	'worker slot shortage reported');
+$node->append_conf(
+	'postgresql.conf', qq(
+max_worker_processes = 8
+dwb_retire_workers = 0
+));
 $node->start;
 $node->stop;
 

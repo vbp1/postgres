@@ -62,3 +62,15 @@ CREATE FUNCTION test_dwb_checkpoint_pending(relnumber oid)
 CREATE FUNCTION test_dwb_fill_segments(nbatches int)
 	RETURNS int STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_leak_fsynced()
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_park(relnumber oid)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_stale_snapshot(relnumber oid)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;

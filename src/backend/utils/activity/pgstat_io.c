@@ -129,14 +129,20 @@ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
 		INSTR_TIME_SET_CURRENT(io_time);
 		INSTR_TIME_SUBTRACT(io_time, start_time);
 
-		if (io_object != IOOBJECT_WAL)
+		/*
+		 * pg_stat_database's blk_read_time/blk_write_time count data-block IO
+		 * only: relation and temp-relation objects.  WAL and double write
+		 * buffer IO have their own accounting, and counting the DWB copy of a
+		 * page here would double the apparent block write time.
+		 */
+		if (io_object == IOOBJECT_RELATION || io_object == IOOBJECT_TEMP_RELATION)
 		{
 			if (io_op == IOOP_WRITE || io_op == IOOP_EXTEND)
 			{
 				pgstat_count_buffer_write_time(INSTR_TIME_GET_MICROSEC(io_time));
 				if (io_object == IOOBJECT_RELATION)
 					INSTR_TIME_ADD(pgBufferUsage.shared_blk_write_time, io_time);
-				else if (io_object == IOOBJECT_TEMP_RELATION)
+				else
 					INSTR_TIME_ADD(pgBufferUsage.local_blk_write_time, io_time);
 			}
 			else if (io_op == IOOP_READ)
@@ -144,7 +150,7 @@ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
 				pgstat_count_buffer_read_time(INSTR_TIME_GET_MICROSEC(io_time));
 				if (io_object == IOOBJECT_RELATION)
 					INSTR_TIME_ADD(pgBufferUsage.shared_blk_read_time, io_time);
-				else if (io_object == IOOBJECT_TEMP_RELATION)
+				else
 					INSTR_TIME_ADD(pgBufferUsage.local_blk_read_time, io_time);
 			}
 		}

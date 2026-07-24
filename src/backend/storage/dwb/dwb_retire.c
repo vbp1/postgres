@@ -308,9 +308,11 @@ DWBSegSnapBegin(const DWSegRef *seg)
 {
 	DWSegEntry *entry;
 
-	/* overwriting a leftover snapshot (an fsync that errored out between
+	/*
+	 * overwriting a leftover snapshot (an fsync that errored out between
 	 * Begin and End) is a correct drop: its bits were never cleared and a
-	 * later fsyncer covers them; see also DWBSegmentFsyncBegin */
+	 * later fsyncer covers them; see also DWBSegmentFsyncBegin
+	 */
 	seg_sync_snap.active = true;
 	seg_sync_snap.seg = *seg;
 	seg_sync_snap.npairs = 0;
@@ -333,9 +335,9 @@ DWBSegSnapBegin(const DWSegRef *seg)
 				seg_sync_snap.pairs[seg_sync_snap.npairs].batch_idx = idx;
 
 				/*
-				 * Racy read of a 64-bit batch_id outside the publish_lock:
-				 * a torn or stale value only makes the guarded re-check
-				 * below skip the decrement, never decrement a wrong batch.
+				 * Racy read of a 64-bit batch_id outside the publish_lock: a
+				 * torn or stale value only makes the guarded re-check below
+				 * skip the decrement, never decrement a wrong batch.
 				 */
 				seg_sync_snap.pairs[seg_sync_snap.npairs].batch_id =
 					DWBCtl->batches[idx].batch_id;
@@ -428,13 +430,13 @@ DWBSegmentFsyncBegin(const FileTag *ftag)
 
 	/*
 	 * Drop any leftover snapshot BEFORE deciding whether to take a new one.
-	 * If a previous fsync ERROR'ed out between Begin and End (possible in
-	 * the checkpointer with data_sync_retry = on, which survives the ERROR
-	 * and keeps this process-local state), the early return below would
-	 * otherwise leave the stale snapshot armed, and the End of the next
-	 * successful fsync of an unrelated non-MD tag would decrement the stale
-	 * segment's back-references -- freeing batches whose data-file fsync
-	 * never succeeded.
+	 * If a previous fsync ERROR'ed out between Begin and End (possible in the
+	 * checkpointer with data_sync_retry = on, which survives the ERROR and
+	 * keeps this process-local state), the early return below would otherwise
+	 * leave the stale snapshot armed, and the End of the next successful
+	 * fsync of an unrelated non-MD tag would decrement the stale segment's
+	 * back-references -- freeing batches whose data-file fsync never
+	 * succeeded.
 	 */
 	seg_sync_snap.active = false;
 
@@ -505,8 +507,8 @@ DWBRetireSegment(const DWSegRef *seg)
 
 	/*
 	 * DWBRetireSyncSegment does not throw on a soft (data_sync_retry = on)
-	 * fsync failure, so the claim reset below always runs; on covered =
-	 * false the snapshot is discarded and the bits stay for a retry.
+	 * fsync failure, so the claim reset below always runs; on covered = false
+	 * the snapshot is discarded and the bits stay for a retry.
 	 */
 	DWBSegSnapBegin(seg);
 	covered = DWBRetireSyncSegment(seg, false);
@@ -614,15 +616,24 @@ void
 DWBRetireWorkersRegister(void)
 {
 	BackgroundWorker bgw;
+	int			free_slots;
 
 	if (!DWBIsEnabled() || dwb_retire_workers == 0)
 		return;
 
-	if (dwb_retire_workers > max_worker_processes)
+	/*
+	 * RegisterBackgroundWorker only LOGs on overflow, so check the slots
+	 * actually left after the earlier internal registrations (the logical
+	 * replication launcher above all) and fail loudly: a silently missing
+	 * retire worker would ship a smaller pool than the operator configured.
+	 */
+	free_slots = max_worker_processes - GetNumRegisteredBackgroundWorkers();
+	if (dwb_retire_workers > free_slots)
 		ereport(FATAL,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("\"dwb_retire_workers\" (%d) must not exceed \"max_worker_processes\" (%d)",
-						dwb_retire_workers, max_worker_processes)));
+				 errmsg("\"dwb_retire_workers\" (%d) needs more \"max_worker_processes\" slots than remain free (%d)",
+						dwb_retire_workers, free_slots),
+				 errhint("Increase \"max_worker_processes\" or decrease \"dwb_retire_workers\".")));
 
 	for (int i = 0; i < dwb_retire_workers; i++)
 	{
@@ -685,10 +696,10 @@ DWBRetireWorkerMain(Datum main_arg)
 
 		/*
 		 * Force-SEAL pass: writers waiting on a half-filled batch seal it
-		 * themselves after the same timeout, so this only matters for
-		 * batches whose writers all went away before sealing.  open_time
-		 * is read unlocked; a torn read can only mis-time the seal, which
-		 * is always a valid action on a non-empty ALLOCATED batch.
+		 * themselves after the same timeout, so this only matters for batches
+		 * whose writers all went away before sealing.  open_time is read
+		 * unlocked; a torn read can only mis-time the seal, which is always a
+		 * valid action on a non-empty ALLOCATED batch.
 		 */
 		now = GetCurrentTimestamp();
 		timeout = dwb_retire_interval_ms;

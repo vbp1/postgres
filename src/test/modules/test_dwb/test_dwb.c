@@ -27,6 +27,7 @@
 #include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
+#include "storage/sync.h"
 #include "utils/builtins.h"
 
 PG_MODULE_MAGIC;
@@ -190,8 +191,8 @@ count_ring_slots(bool current_only, bool have_filter, Oid relnumber)
 
 			/*
 			 * A CRC-valid header with out-of-range n_slots cannot happen
-			 * under the startup geometry check; report the anomaly instead
-			 * of silently contributing zero slots.
+			 * under the startup geometry check; report the anomaly instead of
+			 * silently contributing zero slots.
 			 */
 			if (hdr.n_slots > control.batch_pages)
 			{
@@ -599,6 +600,111 @@ test_dwb_checkpoint_pending(PG_FUNCTION_ARGS)
 	smgrwrite(reln, MAIN_FORKNUM, 0, image.data, false);
 
 	DWBReleaseSlot(&ref);		/* last ref: publication, RETIRING */
+	PG_RETURN_VOID();
+}
+
+/*
+ * Acquire one ownerless ref, publish, seal and wait until the batch is
+ * durable, then return WITHOUT releasing: closing the session leaves the
+ * exit backstop holding the LAST ref of a DWB_FSYNCED batch, so the
+ * FSYNCED -> RETIRING hand-off (seg_set publication under publish_lock and
+ * DWBSegHashLock) runs inside the exit callback itself.  This is only
+ * legal from before_shmem_exit, while the PGPROC is still alive.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_leak_fsynced);
+Datum
+test_dwb_leak_fsynced(PG_FUNCTION_ARGS)
+{
+	BufferTag	tag;
+	DWBSlotRef	ref;
+	RelFileLocator rlocator;
+	static char page[BLCKSZ];
+
+	check_dwb_enabled();
+
+	rlocator.spcOid = DEFAULTTABLESPACE_OID;
+	rlocator.dbOid = 1;
+	rlocator.relNumber = 97000;
+	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
+
+	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
+	memset(page, 'E', BLCKSZ);
+	DWBPublishImage(&ref, page, (XLogRecPtr) 0x8000000);
+	if (!DWBTrySealBatch(ref.batch_idx))
+		ereport(ERROR, (errmsg("could not seal the batch under test")));
+	DWBWaitBatchFsynced(&ref);
+	PG_RETURN_VOID();
+}
+
+/*
+ * Park one batch in RETIRING on a single fake segment (relnumber, block 0,
+ * database oid 1): acquire, publish, seal, wait durable, release.  The
+ * batch stays RETIRING until something fsyncs the segment (the fake
+ * relation makes that an ENOENT = covered, unless the test planted a real
+ * obstacle at the segment path).
+ */
+PG_FUNCTION_INFO_V1(test_dwb_park);
+Datum
+test_dwb_park(PG_FUNCTION_ARGS)
+{
+	Oid			relnumber = PG_GETARG_OID(0);
+	BufferTag	tag;
+	DWBSlotRef	ref;
+	RelFileLocator rlocator;
+	static char page[BLCKSZ];
+
+	check_dwb_enabled();
+
+	rlocator.spcOid = DEFAULTTABLESPACE_OID;
+	rlocator.dbOid = 1;
+	rlocator.relNumber = relnumber;
+	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
+
+	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
+	memset(page, 'P', BLCKSZ);
+	DWBPublishImage(&ref, page, (XLogRecPtr) 0x9000000);
+	if (!DWBTrySealBatch(ref.batch_idx))
+		ereport(ERROR, (errmsg("could not seal the batch under test")));
+	DWBWaitBatchFsynced(&ref);
+	DWBReleaseSlot(&ref);		/* last ref: publication, RETIRING */
+	PG_RETURN_VOID();
+}
+
+/*
+ * Replay the checkpointer's stale-snapshot hazard against a parked batch:
+ * DWBSegmentFsyncBegin for the parked segment WITHOUT the matching End
+ * (exactly the state an fsync ERROR under data_sync_retry = on leaves
+ * behind), then a successful Begin/End of an unrelated non-MD sync entry.
+ * The leftover snapshot must be dropped, not consumed: the parked batch
+ * has to stay RETIRING.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_stale_snapshot);
+Datum
+test_dwb_stale_snapshot(PG_FUNCTION_ARGS)
+{
+	Oid			relnumber = PG_GETARG_OID(0);
+	FileTag		md_tag;
+	FileTag		clog_tag;
+
+	check_dwb_enabled();
+
+	memset(&md_tag, 0, sizeof(md_tag));
+	md_tag.handler = SYNC_HANDLER_MD;
+	md_tag.rlocator.spcOid = DEFAULTTABLESPACE_OID;
+	md_tag.rlocator.dbOid = 1;
+	md_tag.rlocator.relNumber = relnumber;
+	md_tag.forknum = MAIN_FORKNUM;
+	md_tag.segno = 0;
+
+	/* arm the snapshot; no End, as if the fsync threw an ERROR */
+	DWBSegmentFsyncBegin(&md_tag);
+
+	/* an unrelated non-MD entry syncs successfully */
+	memset(&clog_tag, 0, sizeof(clog_tag));
+	clog_tag.handler = SYNC_HANDLER_CLOG;
+	DWBSegmentFsyncBegin(&clog_tag);
+	(void) DWBSegmentFsyncEnd(true);
+
 	PG_RETURN_VOID();
 }
 

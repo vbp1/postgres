@@ -297,18 +297,34 @@ DWBPrepareBatchWrite(int batch_idx)
  * Read one slot's page image back from a batch file.  Used by the abort
  * cleanup of a published ref whose batch is already durable (>= FSYNCED):
  * the staged copy in shmem is gone by then, the batch file is the
- * authoritative source.  Failure is PANIC — the caller is about to repair a
- * possibly-torn data page and has no fallback.
+ * authoritative source.  Failure — the open included — is PANIC: the
+ * caller is about to repair a possibly-torn data page, has no fallback,
+ * and may be running from a ResourceOwner release callback.
+ *
+ * Deliberately avoids the VFD layer (BasicOpenFile + raw pg_pread): a
+ * release callback must not fail, and PathNameOpenFile can throw ERROR
+ * from its internal allocations.  BasicOpenFile allocates nothing and
+ * still recovers from EMFILE/ENFILE by closing LRU VFDs.
  */
 void
 DWBReadSlotImage(int batch_idx, int slot_idx, char *dst)
 {
-	File		file = DWBOpenBatchFile(batch_idx);
+	char		path[MAXPGPATH];
+	int			fd;
 	off_t		off = DWBMetaRegionSize(dwb_batch_pages) +
 		(off_t) slot_idx * BLCKSZ;
 	ssize_t		r;
 
-	r = FileRead(file, dst, BLCKSZ, off, WAIT_EVENT_DWB_BATCH_READ);
+	DWBBatchFilePath(path, batch_idx);
+	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+
+	pgstat_report_wait_start(WAIT_EVENT_DWB_BATCH_READ);
+	r = pg_pread(fd, dst, BLCKSZ, off);
+	pgstat_report_wait_end();
 	if (r != BLCKSZ)
 	{
 		if (r < 0)
@@ -321,6 +337,10 @@ DWBReadSlotImage(int batch_idx, int slot_idx, char *dst)
 				 errmsg("could not read slot %d of batch %d in \"%s\": read %zd of %d",
 						slot_idx, batch_idx, DWB_DIR, r, BLCKSZ)));
 	}
+	if (close(fd) != 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", path)));
 }
 
 /*
