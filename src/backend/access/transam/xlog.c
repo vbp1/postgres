@@ -688,6 +688,7 @@ static void UpdateLastRemovedPtr(char *filename);
 static void ValidateXLOGDirectoryStructure(void);
 static void CleanupBackupHistory(void);
 static void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force);
+static bool EffectiveFullPageWrites(void);
 static bool PerformRecoveryXLogAction(void);
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
@@ -5116,7 +5117,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	checkPoint.redo = wal_segment_size + SizeOfXLogLongPHD;
 	checkPoint.ThisTimeLineID = BootstrapTimeLineID;
 	checkPoint.PrevTimeLineID = BootstrapTimeLineID;
-	checkPoint.fullPageWrites = fullPageWrites;
+	checkPoint.fullPageWrites = EffectiveFullPageWrites();
 	checkPoint.wal_level = wal_level;
 	checkPoint.nextXid =
 		FullTransactionIdFromEpochAndXid(0, FirstNormalTransactionId);
@@ -8212,6 +8213,22 @@ XLogReportParameters(void)
 }
 
 /*
+ * Whether WAL records should carry full-page images.
+ *
+ * io_torn_pages_protection selects the torn-page protection mechanism: under
+ * "double_writes" the durable copy in pg_dwb/ replaces FPIs and under "off"
+ * the user has declared torn writes impossible, so both force this off; the
+ * legacy full_page_writes GUC keeps its meaning under "full_pages" only.
+ * Online backups still force page images regardless of this value, through
+ * the runningBackups term of doPageWrites (see XLogInsertRecord).
+ */
+static bool
+EffectiveFullPageWrites(void)
+{
+	return io_torn_pages_protection == DWB_PROTECT_FULL_PAGES && fullPageWrites;
+}
+
+/*
  * Update full_page_writes in shared memory, and write an
  * XLOG_FPW_CHANGE record if necessary.
  *
@@ -8222,6 +8239,7 @@ void
 UpdateFullPageWrites(void)
 {
 	XLogCtlInsert *Insert = &XLogCtl->Insert;
+	bool		newFullPageWrites = EffectiveFullPageWrites();
 	bool		recoveryInProgress;
 
 	/*
@@ -8231,7 +8249,7 @@ UpdateFullPageWrites(void)
 	 * because we assume that there is no concurrently running process which
 	 * can update it.
 	 */
-	if (fullPageWrites == Insert->fullPageWrites)
+	if (newFullPageWrites == Insert->fullPageWrites)
 		return;
 
 	/*
@@ -8250,7 +8268,7 @@ UpdateFullPageWrites(void)
 	 * setting it to false, first write the WAL record and then set the global
 	 * flag.
 	 */
-	if (fullPageWrites)
+	if (newFullPageWrites)
 	{
 		WALInsertLockAcquireExclusive();
 		Insert->fullPageWrites = true;
@@ -8264,12 +8282,12 @@ UpdateFullPageWrites(void)
 	if (XLogStandbyInfoActive() && !recoveryInProgress)
 	{
 		XLogBeginInsert();
-		XLogRegisterData(&fullPageWrites, sizeof(bool));
+		XLogRegisterData(&newFullPageWrites, sizeof(bool));
 
 		XLogInsert(RM_XLOG_ID, XLOG_FPW_CHANGE);
 	}
 
-	if (!fullPageWrites)
+	if (!newFullPageWrites)
 	{
 		WALInsertLockAcquireExclusive();
 		Insert->fullPageWrites = false;

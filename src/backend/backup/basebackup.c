@@ -41,6 +41,7 @@
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "storage/dsm_impl.h"
+#include "storage/dwb.h"
 #include "storage/ipc.h"
 #include "storage/reinit.h"
 #include "utils/builtins.h"
@@ -165,6 +166,14 @@ static const char *const excludeDirContents[] =
 
 	/* Contents removed on startup, see dsm_cleanup_for_mmap(). */
 	PG_DYNSHMEM_DIR,
+
+	/*
+	 * The double write buffer ring only repairs torn writes on the local
+	 * instance; restoring it elsewhere would let the apply-pass overwrite
+	 * pages with copies from the backup moment.  A restored cluster starts
+	 * with a fresh ring instead, see DWBStartup().
+	 */
+	DWB_DIR,
 
 	/* Contents removed on startup, see AsyncShmemInit(). */
 	"pg_notify",

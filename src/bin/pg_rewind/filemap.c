@@ -132,6 +132,14 @@ static const char *const excludeDirContents[] =
 	/* Contents removed on startup, see dsm_cleanup_for_mmap(). */
 	"pg_dynshmem",				/* defined as PG_DYNSHMEM_DIR */
 
+	/*
+	 * The double write buffer ring is local to an instance; copying the
+	 * source's ring over would hand the target foreign page copies.  The
+	 * target's own leftover ring is inert: the durable generation bump on
+	 * every start (see DWBStartup()) keeps its slots out of any apply-pass.
+	 */
+	"pg_dwb",					/* defined as DWB_DIR */
+
 	/* Contents removed on startup, see AsyncShmemInit(). */
 	"pg_notify",
 

@@ -65,6 +65,48 @@ like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
 	qr/^free=64 /, 'CHECKPOINT alone retired the parked batch');
 
+# --- a checkpoint tolerates a live ALLOCATED batch ------------------------
+
+# Checkpoints take no DWB barrier: an open batch whose timeout has not
+# fired stays ALLOCATED across a CHECKPOINT and is finished asynchronously.
+#
+# Warmup: a throwaway session runs the same statements once and a
+# CHECKPOINT flushes every catalog page its login dirtied (hint bits under
+# checksums), so the real holder below leaves no dirty buffer for the
+# checkpoint to feed through the DWB write path — which would seal the
+# open batch as a side effect.
+my $warm = $node->background_psql('postgres');
+$warm->query_safe('SELECT test_dwb_leak(1, true)');
+$warm->quit;
+$node->poll_query_until('postgres',
+	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
+	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
+	  . "test_dwb_states() LIKE 'free=64 %' END END")
+  or die 'timed out draining the warmup batch';
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->poll_query_until('postgres',
+	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
+	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
+	  . "test_dwb_states() LIKE 'free=64 %' END END")
+  or die 'timed out draining the warmup checkpoint traffic';
+
+my $holder = $node->background_psql('postgres');
+$holder->query_safe('SELECT test_dwb_leak(1, true)');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/allocated=1/, 'an open ALLOCATED batch is live before the checkpoint');
+$node->safe_psql('postgres', 'CHECKPOINT');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/allocated=1/, 'CHECKPOINT completed and left the open batch alone');
+$holder->quit;
+$node->poll_query_until('postgres',
+	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
+	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
+	  . "test_dwb_states() LIKE 'free=64 %' END END")
+  or die 'timed out waiting for the open batch to drain after the holder quit';
+pass('abandoned open batch drained');
+
 # --- segment hash overflow degrades to synchronous retire ----------------
 
 my $log_offset = -s $node->logfile;

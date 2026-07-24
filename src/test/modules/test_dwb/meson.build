@@ -41,6 +41,8 @@ tests += {
       't/002_flushbuffer.pl',
       't/003_backpressure.pl',
       't/004_retire_paths.pl',
+      't/005_standby.pl',
+      't/006_backup.pl',
     ],
   },
 }
