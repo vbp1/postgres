@@ -39,6 +39,7 @@
 #include "postgres.h"
 
 #include "common/hashfn.h"
+#include "common/int.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
 #include "postmaster/bgworker.h"
@@ -543,19 +544,28 @@ DWBRetireAllSync(void)
 	return DWBRetireSweep(-1);
 }
 
+typedef struct DWBRetiringBatch
+{
+	int			idx;
+	uint64		id;
+} DWBRetiringBatch;
+
+static int
+dwb_retiring_batch_cmp(const void *a, const void *b)
+{
+	return pg_cmp_u64(((const DWBRetiringBatch *) a)->id,
+					  ((const DWBRetiringBatch *) b)->id);
+}
+
 static int
 DWBRetireSweep(int worker_id)
 {
-	struct
-	{
-		int			idx;
-		uint64		id;
-	}		   *retiring;
+	DWBRetiringBatch *retiring;
 	int			nretiring = 0;
 	int			freed = 0;
 	DWSegRef   *segs;
 
-	retiring = palloc(dwb_num_batches * sizeof(*retiring));
+	retiring = palloc(dwb_num_batches * sizeof(DWBRetiringBatch));
 	segs = palloc(dwb_batch_pages * sizeof(DWSegRef));
 
 	for (int i = 0; i < dwb_num_batches; i++)
@@ -569,18 +579,8 @@ DWBRetireSweep(int worker_id)
 	}
 
 	/* oldest first: smaller batch_id was opened earlier */
-	for (int i = 0; i < nretiring; i++)
-		for (int j = i + 1; j < nretiring; j++)
-			if (retiring[j].id < retiring[i].id)
-			{
-				uint64		tid = retiring[i].id;
-				int			tidx = retiring[i].idx;
-
-				retiring[i].id = retiring[j].id;
-				retiring[i].idx = retiring[j].idx;
-				retiring[j].id = tid;
-				retiring[j].idx = tidx;
-			}
+	qsort(retiring, nretiring, sizeof(DWBRetiringBatch),
+		  dwb_retiring_batch_cmp);
 
 	for (int i = 0; i < nretiring; i++)
 	{

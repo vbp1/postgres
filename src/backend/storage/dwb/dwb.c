@@ -60,7 +60,6 @@ typedef struct DWBPendingRef
 } DWBPendingRef;
 
 static DWBPendingRef pendingRefs[2 * DWB_BATCH_MAX_PAGES];
-static int	nPendingRefs = 0;
 static bool cleanup_registered = false;
 
 /* leader-side meta assembly area, allocated before the seal is attempted */
@@ -642,10 +641,6 @@ DWBAcquireSlot(const BufferTag *tag, int wclass, bool use_resowner,
 	Assert(DWBIsEnabled());
 	Assert(wclass >= 0 && wclass < DWB_NUM_WCLASSES);
 
-	/* hard bound: overflowing the static array would corrupt memory */
-	if (nPendingRefs >= (int) lengthof(pendingRefs))
-		elog(ERROR, "too many pending double write buffer slot refs held by one backend");
-
 	for (int i = 0; i < (int) lengthof(pendingRefs); i++)
 	{
 		if (!pendingRefs[i].in_use)
@@ -654,7 +649,9 @@ DWBAcquireSlot(const BufferTag *tag, int wclass, bool use_resowner,
 			break;
 		}
 	}
-	Assert(pref != NULL);
+	/* hard bound: overflowing the static array would corrupt memory */
+	if (pref == NULL)
+		elog(ERROR, "too many pending double write buffer slot refs held by one backend");
 
 	/* no failure window between the reservation below and remembering it */
 	if (use_resowner)
@@ -747,7 +744,6 @@ DWBAcquireSlot(const BufferTag *tag, int wclass, bool use_resowner,
 		pref->ref = *ref;
 		pref->owner = use_resowner ? CurrentResourceOwner : NULL;
 		pref->in_use = true;
-		nPendingRefs++;
 		if (pref->owner)
 			ResourceOwnerRemember(pref->owner, PointerGetDatum(pref),
 								  &dwb_ref_resowner_desc);
@@ -859,7 +855,6 @@ DWBReleaseSlot(const DWBSlotRef *ref)
 									&dwb_ref_resowner_desc);
 			pref->owner = NULL;
 			pref->in_use = false;
-			nPendingRefs--;
 			break;
 		}
 	}
@@ -1077,7 +1072,6 @@ DWBAbandonRef(DWBPendingRef *pref)
 
 	pref->owner = NULL;
 	pref->in_use = false;
-	nPendingRefs--;
 
 	/* a held ref pins the batch, so its incarnation cannot have changed */
 	Assert(ref.batch_id == batch->batch_id);

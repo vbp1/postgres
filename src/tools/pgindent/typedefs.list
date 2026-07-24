@@ -604,6 +604,7 @@ DWBBatchHeader
 DWBControlFileData
 DWBOnStall
 DWBPendingRef
+DWBRetiringBatch
 DWBSegSyncSnap
 DWBSlotRef
 DWBStallState

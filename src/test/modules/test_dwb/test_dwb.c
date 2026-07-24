@@ -51,6 +51,62 @@ wait_and_release(DWBSlotRef *refs, int nrefs)
 	}
 }
 
+/* build a MAIN_FORKNUM page tag for (relnumber, blkno) in database dboid */
+static BufferTag
+make_tag(Oid dboid, Oid relnumber, BlockNumber blkno)
+{
+	BufferTag	tag;
+	RelFileLocator rlocator;
+
+	rlocator.spcOid = DEFAULTTABLESPACE_OID;
+	rlocator.dbOid = dboid;
+	rlocator.relNumber = relnumber;
+	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, blkno);
+	return tag;
+}
+
+/*
+ * Acquire one slot for the tag, publish the image, seal the batch and wait
+ * until it is durable: the shared prologue of the single-page scenarios.
+ */
+static void
+stage_one_page(const BufferTag *tag, const char *image, XLogRecPtr page_lsn,
+			   bool use_resowner, DWBSlotRef *ref)
+{
+	DWBAcquireSlot(tag, DWB_WCLASS_EVICTION, use_resowner, ref);
+	DWBPublishImage(ref, image, page_lsn);
+	if (!DWBTrySealBatch(ref->batch_idx))
+		ereport(ERROR, (errmsg("could not seal the batch under test")));
+	DWBWaitBatchFsynced(ref);
+}
+
+/*
+ * Acquire (and optionally publish) npages slots and return with the refs
+ * still pending: the shared body of the leak / abort-release scenarios.
+ */
+static void
+leak_refs(int npages, bool do_publish, bool use_resowner, Oid relnumber)
+{
+	static char page[BLCKSZ];
+
+	/* stay below the batch size so this backend never seals as leader */
+	if (npages < 1 || npages >= dwb_batch_pages)
+		ereport(ERROR, (errmsg("npages out of range")));
+
+	for (int i = 0; i < npages; i++)
+	{
+		BufferTag	tag = make_tag(1, relnumber, (BlockNumber) i);
+		DWBSlotRef	ref;
+
+		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, use_resowner, &ref);
+		if (do_publish)
+		{
+			memset(page, 'L', BLCKSZ);
+			DWBPublishImage(&ref, page, (XLogRecPtr) 0x2000000 + i);
+		}
+	}
+}
+
 /*
  * One full write cycle over npages synthetic pages: acquire, publish,
  * seal (by overflow or forced), wait durable, release, retire.
@@ -67,16 +123,10 @@ dwb_cycle_internal(int npages)
 
 	for (int i = 0; i < npages; i++)
 	{
-		BufferTag	tag;
+		BufferTag	tag = make_tag(1, 90000 + (i % 3), (BlockNumber) i);
 		DWBSlotRef	ref;
-		RelFileLocator rlocator;
 
 		CHECK_FOR_INTERRUPTS();
-
-		rlocator.spcOid = DEFAULTTABLESPACE_OID;
-		rlocator.dbOid = 1;
-		rlocator.relNumber = 90000 + (i % 3);
-		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) i);
 
 		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
 
@@ -325,31 +375,9 @@ test_dwb_leak(PG_FUNCTION_ARGS)
 {
 	int			npages = PG_GETARG_INT32(0);
 	bool		do_publish = PG_GETARG_BOOL(1);
-	static char page[BLCKSZ];
 
 	check_dwb_enabled();
-	/* stay below the batch size so this backend never seals as leader */
-	if (npages < 1 || npages >= dwb_batch_pages)
-		ereport(ERROR, (errmsg("npages out of range")));
-
-	for (int i = 0; i < npages; i++)
-	{
-		BufferTag	tag;
-		DWBSlotRef	ref;
-		RelFileLocator rlocator;
-
-		rlocator.spcOid = DEFAULTTABLESPACE_OID;
-		rlocator.dbOid = 1;
-		rlocator.relNumber = 91000;
-		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) i);
-
-		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
-		if (do_publish)
-		{
-			memset(page, 'L', BLCKSZ);
-			DWBPublishImage(&ref, page, (XLogRecPtr) 0x2000000 + i);
-		}
-	}
+	leak_refs(npages, do_publish, false, 91000);
 	PG_RETURN_VOID();
 }
 
@@ -381,7 +409,6 @@ test_dwb_fill_ring(PG_FUNCTION_ARGS)
 		uint32		open_idx;
 		BufferTag	tag;
 		DWBSlotRef	ref;
-		RelFileLocator rlocator;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -399,10 +426,7 @@ test_dwb_fill_ring(PG_FUNCTION_ARGS)
 			  (DWB_SEAL_BIT | DWB_IDX_MASK)) >= (uint32) dwb_batch_pages))
 			break;				/* one more acquire would block */
 
-		rlocator.spcOid = DEFAULTTABLESPACE_OID;
-		rlocator.dbOid = 1;
-		rlocator.relNumber = 95000 + (background ? 1000 : 0);
-		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) taken);
+		tag = make_tag(1, 95000 + (background ? 1000 : 0), (BlockNumber) taken);
 
 		DWBAcquireSlot(&tag, wclass, false, &ref);
 		memset(page, 'X', BLCKSZ);
@@ -426,30 +450,9 @@ test_dwb_abort_release(PG_FUNCTION_ARGS)
 {
 	int			npages = PG_GETARG_INT32(0);
 	bool		do_publish = PG_GETARG_BOOL(1);
-	static char page[BLCKSZ];
 
 	check_dwb_enabled();
-	if (npages < 1 || npages >= dwb_batch_pages)
-		ereport(ERROR, (errmsg("npages out of range")));
-
-	for (int i = 0; i < npages; i++)
-	{
-		BufferTag	tag;
-		DWBSlotRef	ref;
-		RelFileLocator rlocator;
-
-		rlocator.spcOid = DEFAULTTABLESPACE_OID;
-		rlocator.dbOid = 1;
-		rlocator.relNumber = 93000;
-		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) i);
-
-		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, true, &ref);
-		if (do_publish)
-		{
-			memset(page, 'R', BLCKSZ);
-			DWBPublishImage(&ref, page, (XLogRecPtr) 0x4000000 + i);
-		}
-	}
+	leak_refs(npages, do_publish, true, 93000);
 
 	ereport(ERROR, (errmsg("test_dwb: deliberate abort with pending refs")));
 	PG_RETURN_VOID();			/* unreachable */
@@ -467,25 +470,14 @@ PG_FUNCTION_INFO_V1(test_dwb_abort_after_fsync);
 Datum
 test_dwb_abort_after_fsync(PG_FUNCTION_ARGS)
 {
-	BufferTag	tag;
+	BufferTag	tag = make_tag(1, 94000, 0);
 	DWBSlotRef	ref;
-	RelFileLocator rlocator;
 	static char page[BLCKSZ];
 
 	check_dwb_enabled();
 
-	rlocator.spcOid = DEFAULTTABLESPACE_OID;
-	rlocator.dbOid = 1;
-	rlocator.relNumber = 94000;
-	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
-
-	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, true, &ref);
 	memset(page, 'F', BLCKSZ);
-	DWBPublishImage(&ref, page, (XLogRecPtr) 0x5000000);
-
-	if (!DWBTrySealBatch(ref.batch_idx))
-		ereport(ERROR, (errmsg("could not seal the batch under test")));
-	DWBWaitBatchFsynced(&ref);
+	stage_one_page(&tag, page, (XLogRecPtr) 0x5000000, true, &ref);
 
 	ereport(ERROR, (errmsg("test_dwb: deliberate abort after batch fsync")));
 	PG_RETURN_VOID();			/* unreachable */
@@ -505,9 +497,8 @@ test_dwb_torn_repair(PG_FUNCTION_ARGS)
 {
 	Oid			relnumber = PG_GETARG_OID(0);
 	BlockNumber blkno = (BlockNumber) PG_GETARG_INT32(1);
-	BufferTag	tag;
+	BufferTag	tag = make_tag(MyDatabaseId, relnumber, blkno);
 	DWBSlotRef	ref;
-	RelFileLocator rlocator;
 	RelPathStr	relpath;
 	static PGAlignedBlock image;
 	static char junk[BLCKSZ / 2];
@@ -515,12 +506,7 @@ test_dwb_torn_repair(PG_FUNCTION_ARGS)
 
 	check_dwb_enabled();
 
-	rlocator.spcOid = DEFAULTTABLESPACE_OID;
-	rlocator.dbOid = MyDatabaseId;
-	rlocator.relNumber = relnumber;
-	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, blkno);
-
-	relpath = relpathperm(rlocator, MAIN_FORKNUM);
+	relpath = relpathperm(BufTagGetRelFileLocator(&tag), MAIN_FORKNUM);
 	fd = OpenTransientFile(relpath.str, O_RDWR | PG_BINARY);
 	if (fd < 0)
 		ereport(ERROR,
@@ -534,11 +520,7 @@ test_dwb_torn_repair(PG_FUNCTION_ARGS)
 						blkno, relpath.str)));
 
 	/* stage the pristine image; the abort below must put it back */
-	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, true, &ref);
-	DWBPublishImage(&ref, image.data, PageGetLSN((Page) image.data));
-	if (!DWBTrySealBatch(ref.batch_idx))
-		ereport(ERROR, (errmsg("could not seal the batch under test")));
-	DWBWaitBatchFsynced(&ref);
+	stage_one_page(&tag, image.data, PageGetLSN((Page) image.data), true, &ref);
 
 	/* simulate a torn smgrwrite: clobber the second half of the block */
 	memset(junk, 0x7F, sizeof(junk));
@@ -574,27 +556,18 @@ Datum
 test_dwb_checkpoint_pending(PG_FUNCTION_ARGS)
 {
 	Oid			relnumber = PG_GETARG_OID(0);
-	BufferTag	tag;
+	BufferTag	tag = make_tag(MyDatabaseId, relnumber, 0);
 	DWBSlotRef	ref;
-	RelFileLocator rlocator;
 	SMgrRelation reln;
 	static PGAlignedBlock image;
 
 	check_dwb_enabled();
 
-	rlocator.spcOid = DEFAULTTABLESPACE_OID;
-	rlocator.dbOid = MyDatabaseId;
-	rlocator.relNumber = relnumber;
-	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
-
-	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	reln = smgropen(BufTagGetRelFileLocator(&tag), INVALID_PROC_NUMBER);
 	smgrread(reln, MAIN_FORKNUM, 0, image.data);
 
-	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
-	DWBPublishImage(&ref, image.data, PageGetLSN((Page) image.data));
-	if (!DWBTrySealBatch(ref.batch_idx))
-		ereport(ERROR, (errmsg("could not seal the batch under test")));
-	DWBWaitBatchFsynced(&ref);
+	stage_one_page(&tag, image.data, PageGetLSN((Page) image.data), false,
+				   &ref);
 
 	/* the data-file write; registers the checkpointer sync request */
 	smgrwrite(reln, MAIN_FORKNUM, 0, image.data, false);
@@ -615,24 +588,14 @@ PG_FUNCTION_INFO_V1(test_dwb_leak_fsynced);
 Datum
 test_dwb_leak_fsynced(PG_FUNCTION_ARGS)
 {
-	BufferTag	tag;
+	BufferTag	tag = make_tag(1, 97000, 0);
 	DWBSlotRef	ref;
-	RelFileLocator rlocator;
 	static char page[BLCKSZ];
 
 	check_dwb_enabled();
 
-	rlocator.spcOid = DEFAULTTABLESPACE_OID;
-	rlocator.dbOid = 1;
-	rlocator.relNumber = 97000;
-	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
-
-	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
 	memset(page, 'E', BLCKSZ);
-	DWBPublishImage(&ref, page, (XLogRecPtr) 0x8000000);
-	if (!DWBTrySealBatch(ref.batch_idx))
-		ereport(ERROR, (errmsg("could not seal the batch under test")));
-	DWBWaitBatchFsynced(&ref);
+	stage_one_page(&tag, page, (XLogRecPtr) 0x8000000, false, &ref);
 	PG_RETURN_VOID();
 }
 
@@ -648,24 +611,14 @@ Datum
 test_dwb_park(PG_FUNCTION_ARGS)
 {
 	Oid			relnumber = PG_GETARG_OID(0);
-	BufferTag	tag;
+	BufferTag	tag = make_tag(1, relnumber, 0);
 	DWBSlotRef	ref;
-	RelFileLocator rlocator;
 	static char page[BLCKSZ];
 
 	check_dwb_enabled();
 
-	rlocator.spcOid = DEFAULTTABLESPACE_OID;
-	rlocator.dbOid = 1;
-	rlocator.relNumber = relnumber;
-	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
-
-	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
 	memset(page, 'P', BLCKSZ);
-	DWBPublishImage(&ref, page, (XLogRecPtr) 0x9000000);
-	if (!DWBTrySealBatch(ref.batch_idx))
-		ereport(ERROR, (errmsg("could not seal the batch under test")));
-	DWBWaitBatchFsynced(&ref);
+	stage_one_page(&tag, page, (XLogRecPtr) 0x9000000, false, &ref);
 	DWBReleaseSlot(&ref);		/* last ref: publication, RETIRING */
 	PG_RETURN_VOID();
 }
@@ -737,13 +690,7 @@ test_dwb_fill_segments(PG_FUNCTION_ARGS)
 
 		for (int i = 0; i < dwb_batch_pages; i++)
 		{
-			BufferTag	tag;
-			RelFileLocator rlocator;
-
-			rlocator.spcOid = DEFAULTTABLESPACE_OID;
-			rlocator.dbOid = 1;
-			rlocator.relNumber = next_relnumber++;
-			InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
+			BufferTag	tag = make_tag(1, next_relnumber++, 0);
 
 			DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &refs[i]);
 			/* the whole batch must be ours for the seal below to cover it */
@@ -800,7 +747,6 @@ test_dwb_open_stale(PG_FUNCTION_ARGS)
 	uint32		reopened_idx;
 	DWBSlotRef	ref;
 	BufferTag	tag;
-	RelFileLocator rlocator;
 	static char page[BLCKSZ];
 
 	check_dwb_enabled();
@@ -817,10 +763,7 @@ test_dwb_open_stale(PG_FUNCTION_ARGS)
 	 * Acquire one slot: the fetch_add bounces on SEAL_BIT and reopens the
 	 * lowest FREE index — the same index again, as a new live incarnation.
 	 */
-	rlocator.spcOid = DEFAULTTABLESPACE_OID;
-	rlocator.dbOid = 1;
-	rlocator.relNumber = 92000;
-	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
+	tag = make_tag(1, 92000, 0);
 	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
 	memset(page, 'S', BLCKSZ);
 	DWBPublishImage(&ref, page, (XLogRecPtr) 0x3000000);
