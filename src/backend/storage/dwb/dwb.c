@@ -13,9 +13,8 @@
  * meta region, then fdatasync (the on-disk layout puts the meta region
  * first; see dwb.h) — and broadcasts DWB_FSYNCED.
  *
- * Stage 1 scope: the state machine is complete but not yet wired into
- * FlushBuffer; retirement is synchronous (DWBRetireAllSync) — the retire
- * worker pool and the segment back-reference hash arrive in Stage 2.
+ * FlushBuffer drives this through DWBStagePageWrite/DWBFinishPageWrite;
+ * retirement (segment fsyncs, the worker pool) lives in dwb_retire.c.
  *
  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -27,33 +26,82 @@
  */
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "common/relpath.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
 #include "storage/dwb.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 /*
- * Slot refs held by this backend, for cleanup on process exit.  A ref lives
- * from DWBAcquireSlot to DWBReleaseSlot.  Sized to two full batches because
- * a backend can hold refs on a sealed batch and on its successor at the
- * same time, releasing the former only after the switch.  (Stage 2
- * additionally attaches refs to the ResourceOwner so that a transaction
- * abort — e.g. an ERROR out of smgrwrite — releases them too.)
+ * Slot refs held by this backend.  A ref lives from DWBAcquireSlot to
+ * DWBReleaseSlot; the write path also attaches it to the current
+ * ResourceOwner, so that a transaction abort (e.g. an ERROR out of
+ * smgrwrite) releases it long before process exit.  Entries have stable
+ * addresses — the ResourceOwner remembers a pointer — so freeing is a flag,
+ * not compaction.  Sized to two full batches because a backend can hold
+ * refs on a sealed batch and on its successor at the same time.
  */
-static DWBSlotRef pendingRefs[2 * DWB_BATCH_MAX_PAGES];
+typedef struct DWBPendingRef
+{
+	DWBSlotRef	ref;
+	ResourceOwner owner;		/* owner the ref is registered with, or NULL */
+	bool		in_use;
+} DWBPendingRef;
+
+static DWBPendingRef pendingRefs[2 * DWB_BATCH_MAX_PAGES];
 static int	nPendingRefs = 0;
 static bool cleanup_registered = false;
 
 /* leader-side meta assembly area, allocated before the seal is attempted */
 static DWSlotMeta *leader_metas = NULL;
 
+/* Stage A pause of the bgwriter (see DWBWritesPaused) */
+static bool bgwriter_paused = false;
+static uint64 bgwriter_pause_snap = 0;
+
+/*
+ * Escalation clock of one wait for ring space.  The clock re-arms whenever
+ * freed_events moves: escalation fires only when retirement as a whole has
+ * made no progress for the full window, i.e. "broken", not "slow".
+ */
+typedef struct DWBStallState
+{
+	TimestampTz start;
+	uint64		freed_snap;
+	bool		warned;
+} DWBStallState;
+
 static void DWBProcExit(int code, Datum arg);
 static void DWBLeaderWriteBatch(int batch_idx);
+static bool DWBSealBatch(int batch_idx);
 static void DWBFinishBatchData(DWBatchCtl *batch);
+static void DWBAbandonRef(DWBPendingRef *pref);
+static void ResOwnerReleaseDWBRef(Datum res);
+
+/*
+ * Released BEFORE the buffer-IO cleanup (smaller priority runs first):
+ * DWBAbandonRef may repair the data page from the batch file, which is only
+ * race-free while BM_IO_IN_PROGRESS of the aborted flush is still ours.
+ */
+static const ResourceOwnerDesc dwb_ref_resowner_desc =
+{
+	.name = "double write buffer slot ref",
+	.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+	.release_priority = RELEASE_PRIO_BUFFER_IOS - 10,
+	.ReleaseResource = ResOwnerReleaseDWBRef,
+	.DebugPrint = NULL,
+};
 
 static inline char *
 DWBStagingSlotPtr(int staging_idx, int slot_idx)
@@ -64,6 +112,102 @@ DWBStagingSlotPtr(int staging_idx, int slot_idx)
 }
 
 /* ----------------------------------------------------------------
+ * backpressure (3.6)
+ * ----------------------------------------------------------------
+ */
+
+static void
+DWBStallInit(DWBStallState *st)
+{
+	st->start = GetCurrentTimestamp();
+	st->freed_snap = pg_atomic_read_u64(&DWBCtl->freed_events);
+	st->warned = false;
+}
+
+/*
+ * Escalate one iteration of a ring-space wait.  Stage A after
+ * dwb_slow_warn_ms: WARNING, and the bgwriter additionally pauses its own
+ * future flush rounds (DWBWritesPaused).  Stage B after
+ * dwb_write_timeout_ms without a single retired batch: dwb_on_stall, except
+ * that the checkpointer and the startup process always PANIC — an ERROR
+ * there would fail the checkpoint or recovery anyway, without the fresh
+ * start that crash recovery gives (the explicit safety policy of 3.6,
+ * consistent with data_sync_elevel for a checkpoint-phase fsync failure).
+ *
+ * The dwb-force-stall injection point makes the current wait escalate to
+ * Stage B immediately: the role policy and dwb_on_stall handling stay
+ * exactly the production code paths, only the clock is bypassed.
+ */
+static void
+DWBStallCheck(DWBStallState *st)
+{
+	uint64		freed = pg_atomic_read_u64(&DWBCtl->freed_events);
+	TimestampTz now = GetCurrentTimestamp();
+	long		waited;
+	bool		forced;
+
+	if (freed != st->freed_snap)
+	{
+		/* retirement made progress: re-arm */
+		st->freed_snap = freed;
+		st->start = now;
+		st->warned = false;
+		return;
+	}
+
+	waited = TimestampDifferenceMilliseconds(st->start, now);
+	forced = IS_INJECTION_POINT_ATTACHED("dwb-force-stall");
+
+	if (waited >= dwb_slow_warn_ms && !st->warned)
+	{
+		st->warned = true;
+		ereport(WARNING,
+				(errmsg("double write buffer has no free batch after %ld ms",
+						waited)));
+		if (MyBackendType == B_BG_WRITER)
+		{
+			bgwriter_paused = true;
+			bgwriter_pause_snap = freed;
+		}
+	}
+
+	if (waited >= dwb_write_timeout_ms || forced)
+	{
+		if (AmCheckpointerProcess() || AmStartupProcess() ||
+			CritSectionCount > 0 || dwb_on_stall == DWB_ON_STALL_PANIC)
+			ereport(PANIC,
+					(errmsg("double write buffer retirement made no progress within \"dwb_write_timeout_ms\""),
+					 errdetail("No batch was retired while a %s process waited for ring space.",
+							   GetBackendTypeDesc(MyBackendType))));
+		if (dwb_on_stall == DWB_ON_STALL_ERROR)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					 errmsg("double write buffer retirement made no progress within \"dwb_write_timeout_ms\"")));
+		/* DWB_ON_STALL_WARN: complain and keep waiting */
+		ereport(WARNING,
+				(errmsg("double write buffer retirement made no progress within \"dwb_write_timeout_ms\", still waiting")));
+		st->start = now;
+	}
+}
+
+/*
+ * Has a Stage A stall told the bgwriter to sit out its flush rounds?
+ * Clears itself as soon as any batch retires.
+ */
+bool
+DWBWritesPaused(void)
+{
+	if (!bgwriter_paused)
+		return false;
+	if (pg_atomic_read_u64(&DWBCtl->freed_events) != bgwriter_pause_snap)
+	{
+		bgwriter_paused = false;
+		return false;
+	}
+	return true;
+}
+
+/* ----------------------------------------------------------------
  * staging pool
  * ----------------------------------------------------------------
  */
@@ -71,7 +215,9 @@ static int
 DWBStagingAlloc(void)
 {
 	int			idx;
+	DWBStallState stall;
 
+	DWBStallInit(&stall);
 	for (;;)
 	{
 		idx = -1;
@@ -90,10 +236,11 @@ DWBStagingAlloc(void)
 		/*
 		 * A buffer frees once its leader finishes the image pwrite;
 		 * retirement broadcasts cv_free_batch too, so just re-check on
-		 * every wake-up.
+		 * every wake-up.  The timeout only paces the stall clock.
 		 */
-		ConditionVariableSleep(&DWBCtl->cv_free_batch,
-							   WAIT_EVENT_DWB_FREE_BATCH);
+		(void) ConditionVariableTimedSleep(&DWBCtl->cv_free_batch, 1000,
+										   WAIT_EVENT_DWB_FREE_BATCH);
+		DWBStallCheck(&stall);
 	}
 	ConditionVariableCancelSleep();
 	return idx;
@@ -129,9 +276,13 @@ DWBStagingRelease(int idx)
 void
 DWBOpenNewBatch(int wclass, uint32 old_idx)
 {
+	DWBStallState stall;
+
+	DWBStallInit(&stall);
 	for (;;)
 	{
 		int			free_idx = -1;
+		int			nfree = 0;
 		int			staging_idx;
 
 		/*
@@ -170,16 +321,32 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 			}
 		}
 
+		/*
+		 * Count FREE batches first: a background-class open must leave
+		 * DWB_EVICT_RESERVE of them for user evictions, so that a
+		 * checkpoint's BufferSync storm cannot eat the ring from under
+		 * latency-critical paths.  FREE->ALLOCATED happens only under
+		 * DWBRingOpenLock, and concurrent retirements only grow the count,
+		 * so the check cannot overestimate.
+		 */
 		for (int i = 0; i < dwb_num_batches; i++)
-		{
-			uint32		expected = DWB_FREE;
+			if (pg_atomic_read_u32(&DWBCtl->batches[i].state) == DWB_FREE)
+				nfree++;
 
-			if (pg_atomic_compare_exchange_u32(&DWBCtl->batches[i].state,
-											   &expected, DWB_ALLOCATED))
+		if (nfree > (wclass == DWB_WCLASS_BACKGROUND ? DWB_EVICT_RESERVE : 0))
+		{
+			for (int i = 0; i < dwb_num_batches; i++)
 			{
-				free_idx = i;
-				break;
+				uint32		expected = DWB_FREE;
+
+				if (pg_atomic_compare_exchange_u32(&DWBCtl->batches[i].state,
+												   &expected, DWB_ALLOCATED))
+				{
+					free_idx = i;
+					break;
+				}
 			}
+			Assert(free_idx >= 0);
 		}
 
 		if (free_idx >= 0)
@@ -191,7 +358,6 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 			pg_atomic_write_u32(&batch->capped_slots, 0);
 			pg_atomic_write_u32(&batch->ref_count, 0);
 			pg_atomic_write_u32(&batch->seg_pending_count, 0);
-			pg_atomic_write_u32(&batch->orphaned_refs_count, 0);
 			batch->n_segs = 0;
 			batch->max_page_lsn = InvalidXLogRecPtr;
 			batch->batch_id = pg_atomic_fetch_add_u64(&DWBCtl->next_batch_id, 1);
@@ -208,15 +374,29 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 			pg_atomic_write_u32(&DWBCtl->open_batch_idx[wclass], free_idx);
 			LWLockRelease(DWBRingOpenLock);
 			ConditionVariableCancelSleep();
+
+			/* let retire workers re-time the force-seal deadline */
+			ConditionVariableBroadcast(&DWBCtl->cv_retire_wake);
 			return;
 		}
 
 		LWLockRelease(DWBRingOpenLock);
 		DWBStagingRelease(staging_idx);
 
-		/* whole ring busy: wait for a retirement, then retry */
-		ConditionVariableSleep(&DWBCtl->cv_free_batch,
-							   WAIT_EVENT_DWB_FREE_BATCH);
+		/*
+		 * No usable FREE batch.  Help ourselves before waiting: sweep the
+		 * RETIRING batches synchronously.  Under normal operation the
+		 * worker pool keeps the ring ahead of the writers and this path is
+		 * rare; when it does run, the per-segment claim keeps us and the
+		 * workers from duplicating fsyncs.  This is also what keeps the
+		 * ring alive with dwb_retire_workers = 0 and in single-user mode.
+		 */
+		if (DWBRetireAllSync() > 0)
+			continue;
+
+		(void) ConditionVariableTimedSleep(&DWBCtl->cv_free_batch, 1000,
+										   WAIT_EVENT_DWB_FREE_BATCH);
+		DWBStallCheck(&stall);
 	}
 }
 
@@ -288,6 +468,7 @@ DWBSealBatch(int batch_idx)
 		DWBStagingRelease(batch->staging_idx);
 		batch->staging_idx = -1;
 		pg_atomic_write_u32(&batch->state, DWB_FREE);
+		pg_atomic_fetch_add_u64(&DWBCtl->freed_events, 1);
 		ConditionVariableBroadcast(&DWBCtl->cv_free_batch);
 		END_CRIT_SECTION();
 		return true;
@@ -419,19 +600,60 @@ DWBLeaderWriteBatch(int batch_idx)
  */
 
 /*
- * Reserve a slot in the open batch (Stage 1: single writer class), record
- * the page tag and the segment ref, and take a batch ref.
+ * Try to seal a batch if it is still an open, non-empty ALLOCATED one.
+ * Every seal initiator goes through here: overflow writers, retire workers
+ * acting on dwb_batch_timeout_ms, and writers whose DWBWaitBatchFsynced
+ * timed out on a batch nobody else sealed.
+ */
+bool
+DWBTrySealBatch(int batch_idx)
+{
+	DWBatchCtl *batch = &DWBCtl->batches[batch_idx];
+	uint32		nsi = pg_atomic_read_u32(&batch->next_slot_idx);
+
+	if (nsi & DWB_SEAL_BIT)
+		return false;			/* sealed already (or FREE: the bit is held
+								 * through FREE until reopen) */
+	if ((nsi & DWB_IDX_MASK) == 0)
+		return false;			/* empty: sealing buys nothing */
+	if (pg_atomic_read_u32(&batch->state) != DWB_ALLOCATED)
+		return false;
+	return DWBSealBatch(batch_idx);
+}
+
+/*
+ * Reserve a slot in the open batch of the given writer class, record the
+ * page tag and the segment ref, and take a batch ref.  With use_resowner
+ * the ref is also attached to CurrentResourceOwner, so a transaction abort
+ * releases it (the write path always does this; tests exercising proc-exit
+ * cleanup do not).
  */
 void
-DWBAcquireSlot(const BufferTag *tag, DWBSlotRef *ref)
+DWBAcquireSlot(const BufferTag *tag, int wclass, bool use_resowner,
+			   DWBSlotRef *ref)
 {
-	const int	wclass = DWB_WCLASS_EVICTION;
+	DWBPendingRef *pref = NULL;
 
 	Assert(DWBIsEnabled());
+	Assert(wclass >= 0 && wclass < DWB_NUM_WCLASSES);
 
 	/* hard bound: overflowing the static array would corrupt memory */
 	if (nPendingRefs >= (int) lengthof(pendingRefs))
 		elog(ERROR, "too many pending double write buffer slot refs held by one backend");
+
+	for (int i = 0; i < (int) lengthof(pendingRefs); i++)
+	{
+		if (!pendingRefs[i].in_use)
+		{
+			pref = &pendingRefs[i];
+			break;
+		}
+	}
+	Assert(pref != NULL);
+
+	/* no failure window between the reservation below and remembering it */
+	if (use_resowner)
+		ResourceOwnerEnlarge(CurrentResourceOwner);
 
 	if (!cleanup_registered)
 	{
@@ -508,7 +730,14 @@ DWBAcquireSlot(const BufferTag *tag, DWBSlotRef *ref)
 		ref->batch_idx = (int) idx;
 		ref->slot_idx = (int) slot;
 		ref->batch_id = batch->batch_id;
-		pendingRefs[nPendingRefs++] = *ref;
+
+		pref->ref = *ref;
+		pref->owner = use_resowner ? CurrentResourceOwner : NULL;
+		pref->in_use = true;
+		nPendingRefs++;
+		if (pref->owner)
+			ResourceOwnerRemember(pref->owner, PointerGetDatum(pref),
+								  &dwb_ref_resowner_desc);
 		return;
 	}
 }
@@ -539,6 +768,12 @@ DWBPublishImage(const DWBSlotRef *ref, const char *image, XLogRecPtr page_lsn)
 /*
  * Wait until the batch's DWB copy is durable.  The caller holds a batch
  * ref, so the batch cannot be retired or reused under us.
+ *
+ * A batch that nobody seals would leave its writers waiting forever, so
+ * after dwb_batch_timeout_ms of waiting on a still-open batch the waiter
+ * seals it itself.  The retire workers force-seal on the same timeout;
+ * this decentralized backstop keeps the write path independent of the
+ * worker pool (dwb_retire_workers = 0, single-user mode, a stuck worker).
  */
 void
 DWBWaitBatchFsynced(const DWBSlotRef *ref)
@@ -547,17 +782,34 @@ DWBWaitBatchFsynced(const DWBSlotRef *ref)
 
 	Assert(ref->batch_id == batch->batch_id);
 
+	/*
+	 * A lone writer has nobody to batch with: sequential flush streams
+	 * (recovery, a backend evicting page after page, BufferSync) reach
+	 * this wait one page at a time, and paying dwb_batch_timeout_ms per
+	 * page would dominate the stream.  If our ref is the only one on a
+	 * still-open batch, seal right away; under concurrency ref_count > 1
+	 * keeps the rendezvous window open for the timeout.  A racing second
+	 * writer merely bounces to the next batch — sealing is valid at any
+	 * moment.
+	 */
+	if (pg_atomic_read_u32(&batch->ref_count) == 1)
+		(void) DWBTrySealBatch(ref->batch_idx);
+
 	ConditionVariablePrepareToSleep(&batch->cv_state);
 	while (pg_atomic_read_u32(&batch->state) < DWB_FSYNCED)
-		ConditionVariableSleep(&batch->cv_state, WAIT_EVENT_DWB_BATCH_FSYNC);
+	{
+		if (ConditionVariableTimedSleep(&batch->cv_state,
+										dwb_batch_timeout_ms,
+										WAIT_EVENT_DWB_BATCH_FSYNC))
+			(void) DWBTrySealBatch(ref->batch_idx);
+	}
 	ConditionVariableCancelSleep();
 }
 
 /*
  * Step 7 of the write path: the last ref hands the batch over to
- * retirement (FSYNCED -> DATA_WRITTEN -> RETIRING).  (Stage 2 publishes
- * the segment set into DWSegmentHash here; Stage 1 retirement is
- * DWBRetireAllSync.)
+ * retirement — FSYNCED -> DATA_WRITTEN, then the seg_set publication into
+ * DWSegmentHash and the RETIRING transition (dwb_retire.c).
  */
 static void
 DWBFinishBatchData(DWBatchCtl *batch)
@@ -568,14 +820,7 @@ DWBFinishBatchData(DWBatchCtl *batch)
 										DWB_DATA_WRITTEN))
 		elog(PANIC, "DWB batch data-written in unexpected state %u", expected);
 
-	pg_atomic_write_u32(&batch->seg_pending_count, batch->n_segs);
-	pg_write_barrier();
-
-	expected = DWB_DATA_WRITTEN;
-	if (!pg_atomic_compare_exchange_u32(&batch->state, &expected,
-										DWB_RETIRING))
-		elog(PANIC, "DWB batch retiring in unexpected state %u", expected);
-	ConditionVariableSignal(&DWBCtl->cv_retire_wake);
+	DWBPublishBatchSegSet((int) (batch - DWBCtl->batches));
 }
 
 /*
@@ -589,12 +834,20 @@ DWBReleaseSlot(const DWBSlotRef *ref)
 
 	Assert(ref->batch_id == batch->batch_id);
 
-	for (int i = 0; i < nPendingRefs; i++)
+	for (int i = 0; i < (int) lengthof(pendingRefs); i++)
 	{
-		if (pendingRefs[i].batch_idx == ref->batch_idx &&
-			pendingRefs[i].slot_idx == ref->slot_idx)
+		DWBPendingRef *pref = &pendingRefs[i];
+
+		if (pref->in_use &&
+			pref->ref.batch_idx == ref->batch_idx &&
+			pref->ref.slot_idx == ref->slot_idx)
 		{
-			pendingRefs[i] = pendingRefs[--nPendingRefs];
+			if (pref->owner != NULL)
+				ResourceOwnerForget(pref->owner, PointerGetDatum(pref),
+									&dwb_ref_resowner_desc);
+			pref->owner = NULL;
+			pref->in_use = false;
+			nPendingRefs--;
 			break;
 		}
 	}
@@ -604,9 +857,8 @@ DWBReleaseSlot(const DWBSlotRef *ref)
 }
 
 /*
- * Force-seal the currently open batch of a writer class (used by tests
- * now; the retire worker's dwb_batch_timeout_ms path in Stage 2).
- * Returns true if a batch was sealed by us.
+ * Force-seal the currently open batch of a writer class.  Returns true if
+ * a batch was sealed by us.
  */
 bool
 DWBForceSealOpenBatch(int wclass)
@@ -615,42 +867,7 @@ DWBForceSealOpenBatch(int wclass)
 
 	if (idx == DWB_INVALID_BATCH)
 		return false;
-	if (pg_atomic_read_u32(&DWBCtl->batches[idx].next_slot_idx) == 0)
-		return false;			/* empty batch: nothing to seal */
-	return DWBSealBatch((int) idx);
-}
-
-/*
- * Synchronously retire every RETIRING batch.  Stage 1: batch images are
- * already durable in the ring and the test pages have no real relation
- * segments to fsync, so retirement is pure state bookkeeping.  Stage 2
- * replaces this with segment fsyncs by the retire worker pool and
- * ProcessSyncRequests.
- */
-int
-DWBRetireAllSync(void)
-{
-	int			retired = 0;
-
-	for (int i = 0; i < dwb_num_batches; i++)
-	{
-		DWBatchCtl *batch = &DWBCtl->batches[i];
-		uint32		expected = DWB_RETIRING;
-
-		if (pg_atomic_read_u32(&batch->state) != DWB_RETIRING)
-			continue;
-
-		/* Stage 2: smgrimmedsync of each seg_set entry goes here */
-
-		pg_atomic_write_u32(&batch->seg_pending_count, 0);
-		if (pg_atomic_compare_exchange_u32(&batch->state, &expected,
-										   DWB_FREE))
-		{
-			retired++;
-			ConditionVariableBroadcast(&DWBCtl->cv_free_batch);
-		}
-	}
-	return retired;
+	return DWBTrySealBatch((int) idx);
 }
 
 DWBatchState
@@ -660,54 +877,237 @@ DWBGetBatchState(int batch_idx)
 }
 
 /* ----------------------------------------------------------------
- * process exit cleanup
+ * FlushBuffer entry points
  * ----------------------------------------------------------------
  */
 
 /*
- * Runs strictly on shmem DWB state: by the time on_proc_exit callbacks run,
- * LWLockReleaseAll has already dropped any content locks (ipc.c) and the
- * private page copy died with the process, so the staged copy in the batch
- * is the authoritative source for our slots.
+ * The checkpointer's BufferSync and the bgwriter's flush rounds form the
+ * background stream; everything else — ordinary backend evictions above
+ * all — is the latency-critical class with first claim on FREE batches.
+ */
+static int
+DWBWriterClass(void)
+{
+	if (MyBackendType == B_CHECKPOINTER || MyBackendType == B_BG_WRITER)
+		return DWB_WCLASS_BACKGROUND;
+	return DWB_WCLASS_EVICTION;
+}
+
+/*
+ * Steps 3-5 of the write path (3.4): reserve a slot in this writer class's
+ * open batch, publish the private page copy, and wait until the batch copy
+ * is durable in pg_dwb/.  On return the caller may write the same copy to
+ * the data file.  The caller must already have flushed WAL up to page_lsn.
+ */
+void
+DWBStagePageWrite(const BufferTag *tag, const char *image,
+				  XLogRecPtr page_lsn, DWBSlotRef *ref)
+{
+	Assert(DWBCtl->ring_generation > 0);
+
+	DWBAcquireSlot(tag, DWBWriterClass(), true, ref);
+	DWBPublishImage(ref, image, page_lsn);
+
+	/*
+	 * With no worker pool (dwb_retire_workers = 0, single-user mode) a
+	 * lonely batch would only seal via the wait timeout below; seal it
+	 * right away instead of paying dwb_batch_timeout_ms per page.
+	 */
+	if (dwb_retire_workers == 0 || !IsUnderPostmaster)
+		(void) DWBTrySealBatch(ref->batch_idx);
+
+	DWBWaitBatchFsynced(ref);
+
+	INJECTION_POINT("dwb-after-batch-fsynced", NULL);
+}
+
+/*
+ * Step 7: release the ref after smgrwrite returned.  Without a worker
+ * pool, also retire synchronously so the ring keeps circulating (and, in
+ * the TAP tests, returns to all-FREE after every flush).
+ */
+void
+DWBFinishPageWrite(const DWBSlotRef *ref)
+{
+	DWBReleaseSlot(ref);
+
+	if (dwb_retire_workers == 0 || !IsUnderPostmaster)
+		(void) DWBRetireAllSync();
+}
+
+/* ----------------------------------------------------------------
+ * abort / process exit cleanup
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Repair the data page of an abandoned ref from the batch file.
+ *
+ * If the writer died out of a failed smgrwrite (step 6), the data page may
+ * be torn on disk while the batch — and with it the only whole copy — is
+ * about to retire and recycle.  Overwriting the page with the durable batch
+ * copy makes the disk page whole again; the shared buffer is still dirty
+ * (the abort path never clears BM_DIRTY), so newer content still reaches
+ * the disk through a later flush.
+ *
+ * This runs from the ResourceOwner release, BEFORE the buffer-IO cleanup:
+ * BM_IO_IN_PROGRESS of the failed flush is still ours, so no concurrent
+ * flush of the same page can be in flight and writing the (possibly stale)
+ * batch copy cannot overwrite a newer image.  For the same reason the
+ * relation cannot be dropped or truncated under us — both invalidate the
+ * buffer first and that waits for our IO flag — so the ENOENT/short-file
+ * exits are pure defense (and serve test refs pointing at fake relations).
+ *
+ * Durability: our segment is in the batch's seg_set, and the seg_set is
+ * published only after every ref (ours included) is gone, so retirement
+ * fsyncs this segment strictly after this write.
+ */
+static void
+DWBRewriteAbandonedSlot(const DWBSlotRef *ref)
+{
+	DWBatchCtl *batch = &DWBCtl->batches[ref->batch_idx];
+	BufferTag	tag = batch->pages[ref->slot_idx];
+	uint32		segno = tag.blockNum / ((BlockNumber) RELSEG_SIZE);
+	PGAlignedBlock image;
+	RelPathStr	relpath;
+	char		path[MAXPGPATH];
+	int			fd;
+	struct stat st;
+	off_t		off;
+	ssize_t		written;
+
+	DWBReadSlotImage(ref->batch_idx, ref->slot_idx, image.data);
+
+	relpath = relpathperm(BufTagGetRelFileLocator(&tag),
+						  BufTagGetForkNum(&tag));
+	if (segno == 0)
+		snprintf(path, MAXPGPATH, "%s", relpath.str);
+	else
+		snprintf(path, MAXPGPATH, "%s.%u", relpath.str, segno);
+
+	fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
+	if (fd < 0)
+	{
+		if (errno == ENOENT)
+			return;				/* relation dropped: the write is moot */
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\" to repair an abandoned double write buffer slot: %m",
+						path)));
+	}
+
+	off = (off_t) (tag.blockNum % ((BlockNumber) RELSEG_SIZE)) * BLCKSZ;
+	if (fstat(fd, &st) < 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not stat file \"%s\": %m", path)));
+	if (off + BLCKSZ > st.st_size)
+	{
+		/* segment truncated: the write is moot */
+		CloseTransientFile(fd);
+		return;
+	}
+
+	errno = 0;
+	written = pg_pwrite(fd, image.data, BLCKSZ, off);
+	if (written != BLCKSZ)
+	{
+		if (errno == 0)
+			errno = ENOSPC;
+		/* the page may now be torn with its DWB copy about to recycle */
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not repair block %u of file \"%s\" from the double write buffer: %m",
+						tag.blockNum, path)));
+	}
+
+	if (CloseTransientFile(fd) != 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", path)));
+}
+
+/*
+ * Release a ref whose owner is going away without the normal
+ * DWBReleaseSlot: transaction abort (ResourceOwner) or process exit.  No
+ * ResourceOwnerForget here — the ResourceOwner path removes the resource
+ * implicitly, and at process exit the owner dies with the process.  Works
+ * strictly on shmem DWB state plus the batch file — the private page copy
+ * of the writer is gone.
+ */
+static void
+DWBAbandonRef(DWBPendingRef *pref)
+{
+	DWBSlotRef	ref = pref->ref;
+	DWBatchCtl *batch = &DWBCtl->batches[ref.batch_idx];
+	uint64		bit = UINT64CONST(1) << (ref.slot_idx % 64);
+	pg_atomic_uint64 *word =
+		&batch->slots_written_bitmap[ref.slot_idx / 64];
+
+	pref->owner = NULL;
+	pref->in_use = false;
+	nPendingRefs--;
+
+	/* a held ref pins the batch, so its incarnation cannot have changed */
+	Assert(ref.batch_id == batch->batch_id);
+
+	if (!(pg_atomic_read_u64(word) & bit))
+	{
+		/*
+		 * Copy never published: poison the slot so the seal-waiter wakes
+		 * up and recovery ignores it.
+		 */
+		batch->slot_flags[ref.slot_idx] |= DWB_SLOT_ABORTED;
+		pg_write_barrier();
+		pg_atomic_fetch_or_u64(word, bit);
+		ConditionVariableBroadcast(&batch->cv_state);
+	}
+	else if (pg_atomic_read_u32(&batch->state) >= DWB_FSYNCED)
+	{
+		/*
+		 * Copy published and the batch is durable, which means the writer
+		 * was at or past step 6: its smgrwrite may have failed halfway.
+		 * Make the data page whole again from the batch copy.
+		 */
+		DWBRewriteAbandonedSlot(&ref);
+	}
+
+	/*
+	 * The last ref finishes the batch only once it is FSYNCED.  A sealed
+	 * batch cannot lose its last ref earlier — the leader holds its own
+	 * pin from SEAL to FSYNCED (see DWBSealBatch) — so reaching zero refs
+	 * in an earlier state means the batch is not sealed yet: it stays open
+	 * and a later seal completes it normally.
+	 */
+	if (pg_atomic_fetch_sub_u32(&batch->ref_count, 1) == 1 &&
+		pg_atomic_read_u32(&batch->state) == DWB_FSYNCED)
+		DWBFinishBatchData(batch);
+}
+
+/*
+ * ResourceOwner release of one ref: the abort path of the write path.
+ */
+static void
+ResOwnerReleaseDWBRef(Datum res)
+{
+	DWBAbandonRef((DWBPendingRef *) DatumGetPointer(res));
+}
+
+/*
+ * Process-exit backstop for refs that no ResourceOwner released (test refs
+ * acquired without an owner; anything a nonstandard exit path missed).  By
+ * this time LWLockReleaseAll has already dropped any content locks (ipc.c)
+ * and buffer-IO flags may be gone too, so unlike the ResourceOwner path
+ * the abandoned-slot rewrite here is best effort against concurrent
+ * flushes; the primary cleanup is the ResourceOwner one.
  */
 static void
 DWBProcExit(int code, Datum arg)
 {
-	while (nPendingRefs > 0)
+	for (int i = 0; i < (int) lengthof(pendingRefs); i++)
 	{
-		DWBSlotRef	ref = pendingRefs[--nPendingRefs];
-		DWBatchCtl *batch = &DWBCtl->batches[ref.batch_idx];
-		uint64		bit = UINT64CONST(1) << (ref.slot_idx % 64);
-		pg_atomic_uint64 *word =
-			&batch->slots_written_bitmap[ref.slot_idx / 64];
-
-		if (!(pg_atomic_read_u64(word) & bit))
-		{
-			/* copy never published: poison the slot so the seal-waiter
-			 * wakes up and recovery ignores it */
-			batch->slot_flags[ref.slot_idx] |= DWB_SLOT_ABORTED;
-			pg_write_barrier();
-			pg_atomic_fetch_or_u64(word, bit);
-			ConditionVariableBroadcast(&batch->cv_state);
-		}
-		else
-		{
-			/* copy published but smgrwrite may not have happened: hand the
-			 * write over to the retire worker (Stage 2 completes orphans) */
-			uint32		n = pg_atomic_fetch_add_u32(&batch->orphaned_refs_count, 1);
-
-			batch->orphan_tags[n] = batch->pages[ref.slot_idx];
-		}
-
-		/*
-		 * The last ref finishes the batch only once it is FSYNCED.  A
-		 * sealed batch cannot lose its last ref earlier — the leader holds
-		 * its own pin from SEAL to FSYNCED (see DWBSealBatch) — so reaching
-		 * zero refs in an earlier state means the batch is not sealed yet:
-		 * it stays open and a later seal completes it normally.
-		 */
-		if (pg_atomic_fetch_sub_u32(&batch->ref_count, 1) == 1 &&
-			pg_atomic_read_u32(&batch->state) == DWB_FSYNCED)
-			DWBFinishBatchData(batch);
+		if (pendingRefs[i].in_use)
+			DWBAbandonRef(&pendingRefs[i]);
 	}
 }

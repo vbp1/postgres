@@ -2226,10 +2226,12 @@ struct config_int ConfigureNamesInt[] =
 	{
 		{"dwb_retire_workers", PGC_POSTMASTER, WAL_SETTINGS,
 			gettext_noop("Number of double write buffer retire worker processes."),
-			NULL
+			gettext_noop("The workers consume \"max_worker_processes\" slots. "
+						 "0 disables the pool and makes writers retire batches "
+						 "synchronously; meant for testing only.")
 		},
 		&dwb_retire_workers,
-		1, 1, 32,
+		1, 0, 32,
 		NULL, NULL, NULL
 	},
 	{

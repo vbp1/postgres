@@ -23,6 +23,8 @@
 
 #include "common/file_utils.h"
 #include "miscadmin.h"
+#include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "storage/dwb.h"
 #include "storage/fd.h"
 #include "utils/memutils.h"
@@ -292,6 +294,36 @@ DWBPrepareBatchWrite(int batch_idx)
 }
 
 /*
+ * Read one slot's page image back from a batch file.  Used by the abort
+ * cleanup of a published ref whose batch is already durable (>= FSYNCED):
+ * the staged copy in shmem is gone by then, the batch file is the
+ * authoritative source.  Failure is PANIC — the caller is about to repair a
+ * possibly-torn data page and has no fallback.
+ */
+void
+DWBReadSlotImage(int batch_idx, int slot_idx, char *dst)
+{
+	File		file = DWBOpenBatchFile(batch_idx);
+	off_t		off = DWBMetaRegionSize(dwb_batch_pages) +
+		(off_t) slot_idx * BLCKSZ;
+	ssize_t		r;
+
+	r = FileRead(file, dst, BLCKSZ, off, WAIT_EVENT_DWB_BATCH_READ);
+	if (r != BLCKSZ)
+	{
+		if (r < 0)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not read slot %d of batch %d in \"%s\": %m",
+							slot_idx, batch_idx, DWB_DIR)));
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not read slot %d of batch %d in \"%s\": read %zd of %d",
+						slot_idx, batch_idx, DWB_DIR, r, BLCKSZ)));
+	}
+}
+
+/*
  * Leader write of one batch: (a) one contiguous pwrite of the image stream
  * from staging, (b) one pwrite of the meta region, (c) fdatasync.  Exactly
  * this order: a crash while reusing a slot must never leave valid-looking
@@ -311,9 +343,12 @@ DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 	Size		image_bytes = (Size) hdr->n_slots * BLCKSZ;
 	ssize_t		nwritten;
 	int			fd;
+	instr_time	io_start;
 
 	/* DWBPrepareBatchWrite has run */
 	Assert(meta_buf != NULL);
+
+	io_start = pgstat_prepare_io_time(track_io_timing);
 
 	nwritten = FileWrite(file, images, image_bytes, meta_region,
 						 WAIT_EVENT_DWB_BATCH_WRITE);
@@ -336,10 +371,14 @@ DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 				 errmsg("could not write batch %d of \"%s\": %m",
 						batch_idx, DWB_DIR)));
 
+	pgstat_count_io_op_time(IOOBJECT_DWB, IOCONTEXT_NORMAL, IOOP_WRITE,
+							io_start, 1, image_bytes + meta_region);
+
 	/*
 	 * fdatasync suffices: the file was fully preallocated at ring creation,
 	 * its size and block layout never change (WAL-segment contract).
 	 */
+	io_start = pgstat_prepare_io_time(track_io_timing);
 	pgstat_report_wait_start(WAIT_EVENT_DWB_BATCH_SYNC);
 	fd = FileGetRawDesc(file);
 	if (fd < 0 || pg_fdatasync(fd) != 0)
@@ -348,4 +387,6 @@ DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 				 errmsg("could not fsync batch %d of \"%s\": %m",
 						batch_idx, DWB_DIR)));
 	pgstat_report_wait_end();
+	pgstat_count_io_op_time(IOOBJECT_DWB, IOCONTEXT_NORMAL, IOOP_FSYNC,
+							io_start, 1, 0);
 }

@@ -3,9 +3,9 @@
  * test_dwb.c
  *		Test module for the short-lived double write buffer.
  *
- * Drives the DWB batch state machine directly (Stage 1: FlushBuffer is not
- * wired in yet) with synthetic page tags and images, and validates the
- * on-disk ring format independently of the server-side write path.
+ * Drives the DWB batch state machine directly with synthetic page tags and
+ * images — independently of the FlushBuffer integration — and validates
+ * the on-disk ring format independently of the server-side write path.
  *
  * Copyright (c) 2025, PostgreSQL Global Development Group
  *
@@ -74,7 +74,7 @@ dwb_cycle_internal(int npages)
 		rlocator.relNumber = 90000 + (i % 3);
 		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) i);
 
-		DWBAcquireSlot(&tag, &ref);
+		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
 
 		/*
 		 * A batch switch means the previous batch overflowed and was sealed
@@ -313,7 +313,7 @@ test_dwb_leak(PG_FUNCTION_ARGS)
 		rlocator.relNumber = 91000;
 		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) i);
 
-		DWBAcquireSlot(&tag, &ref);
+		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
 		if (do_publish)
 		{
 			memset(page, 'L', BLCKSZ);
@@ -321,6 +321,137 @@ test_dwb_leak(PG_FUNCTION_ARGS)
 		}
 	}
 	PG_RETURN_VOID();
+}
+
+/*
+ * Occupy the whole ring without blocking: acquire and publish slots until
+ * no FREE batch remains and the open batch is full, keeping every ref (the
+ * refs die with the session).  Sets up ring exhaustion for the
+ * backpressure tests.  Meant for dwb_retire_workers = 0, where nothing
+ * seals or retires behind our back.  Returns the number of slots taken.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_fill_ring);
+Datum
+test_dwb_fill_ring(PG_FUNCTION_ARGS)
+{
+	int			taken = 0;
+	static char page[BLCKSZ];
+
+	check_dwb_enabled();
+
+	for (;;)
+	{
+		int			nfree = 0;
+		uint32		open_idx;
+		BufferTag	tag;
+		DWBSlotRef	ref;
+		RelFileLocator rlocator;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* hard bound of the backend-local ref array */
+		if (taken >= 2 * DWB_BATCH_MAX_PAGES - 1)
+			break;
+
+		for (int i = 0; i < dwb_num_batches; i++)
+			if (DWBGetBatchState(i) == DWB_FREE)
+				nfree++;
+		open_idx = pg_atomic_read_u32(&DWBCtl->open_batch_idx[DWB_WCLASS_EVICTION]);
+		if (nfree == 0 &&
+			(open_idx == DWB_INVALID_BATCH ||
+			 (pg_atomic_read_u32(&DWBCtl->batches[open_idx].next_slot_idx) &
+			  (DWB_SEAL_BIT | DWB_IDX_MASK)) >= (uint32) dwb_batch_pages))
+			break;				/* one more acquire would block */
+
+		rlocator.spcOid = DEFAULTTABLESPACE_OID;
+		rlocator.dbOid = 1;
+		rlocator.relNumber = 95000;
+		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) taken);
+
+		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
+		memset(page, 'X', BLCKSZ);
+		DWBPublishImage(&ref, page, (XLogRecPtr) 0x6000000 + taken);
+		taken++;
+	}
+
+	PG_RETURN_INT32(taken);
+}
+
+/*
+ * Acquire (and optionally publish) npages slots WITH a ResourceOwner
+ * attachment, then raise an ERROR: the transaction abort must release the
+ * refs (poisoning unpublished slots), leaving the batch completable by a
+ * later seal.  Exercises the abort path of the write path without a
+ * process exit.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_abort_release);
+Datum
+test_dwb_abort_release(PG_FUNCTION_ARGS)
+{
+	int			npages = PG_GETARG_INT32(0);
+	bool		do_publish = PG_GETARG_BOOL(1);
+	static char page[BLCKSZ];
+
+	check_dwb_enabled();
+	if (npages < 1 || npages >= dwb_batch_pages)
+		ereport(ERROR, (errmsg("npages out of range")));
+
+	for (int i = 0; i < npages; i++)
+	{
+		BufferTag	tag;
+		DWBSlotRef	ref;
+		RelFileLocator rlocator;
+
+		rlocator.spcOid = DEFAULTTABLESPACE_OID;
+		rlocator.dbOid = 1;
+		rlocator.relNumber = 93000;
+		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) i);
+
+		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, true, &ref);
+		if (do_publish)
+		{
+			memset(page, 'R', BLCKSZ);
+			DWBPublishImage(&ref, page, (XLogRecPtr) 0x4000000 + i);
+		}
+	}
+
+	ereport(ERROR, (errmsg("test_dwb: deliberate abort with pending refs")));
+	PG_RETURN_VOID();			/* unreachable */
+}
+
+/*
+ * Abort AFTER the batch is durable: acquire one slot with a ResourceOwner
+ * attachment, publish, seal, wait for DWB_FSYNCED, then ERROR.  The abort
+ * cleanup takes the abandoned-slot repair path; the fake relation makes it
+ * exit through the dropped-relation branch, and the ref hand-off must
+ * still finish the batch (publication, RETIRING).
+ */
+PG_FUNCTION_INFO_V1(test_dwb_abort_after_fsync);
+Datum
+test_dwb_abort_after_fsync(PG_FUNCTION_ARGS)
+{
+	BufferTag	tag;
+	DWBSlotRef	ref;
+	RelFileLocator rlocator;
+	static char page[BLCKSZ];
+
+	check_dwb_enabled();
+
+	rlocator.spcOid = DEFAULTTABLESPACE_OID;
+	rlocator.dbOid = 1;
+	rlocator.relNumber = 94000;
+	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
+
+	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, true, &ref);
+	memset(page, 'F', BLCKSZ);
+	DWBPublishImage(&ref, page, (XLogRecPtr) 0x5000000);
+
+	if (!DWBTrySealBatch(ref.batch_idx))
+		ereport(ERROR, (errmsg("could not seal the batch under test")));
+	DWBWaitBatchFsynced(&ref);
+
+	ereport(ERROR, (errmsg("test_dwb: deliberate abort after batch fsync")));
+	PG_RETURN_VOID();			/* unreachable */
 }
 
 PG_FUNCTION_INFO_V1(test_dwb_force_seal);
@@ -378,7 +509,7 @@ test_dwb_open_stale(PG_FUNCTION_ARGS)
 	rlocator.dbOid = 1;
 	rlocator.relNumber = 92000;
 	InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, 0);
-	DWBAcquireSlot(&tag, &ref);
+	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
 	memset(page, 'S', BLCKSZ);
 	DWBPublishImage(&ref, page, (XLogRecPtr) 0x3000000);
 

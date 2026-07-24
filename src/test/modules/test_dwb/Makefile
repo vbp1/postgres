@@ -11,6 +11,10 @@ TAP_TESTS = 1
 EXTENSION = test_dwb
 DATA = test_dwb--1.0.sql
 
+# 003_backpressure.pl uses the injection_points extension
+EXTRA_INSTALL = src/test/modules/injection_points
+export enable_injection_points
+
 REGRESS_OPTS = --temp-config $(top_srcdir)/src/test/modules/test_dwb/test_dwb.conf
 REGRESS = test_dwb
 # Disabled because these tests require io_torn_pages_protection=double_writes,

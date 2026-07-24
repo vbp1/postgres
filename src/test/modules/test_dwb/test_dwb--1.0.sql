@@ -34,3 +34,15 @@ CREATE FUNCTION test_dwb_retire()
 CREATE FUNCTION test_dwb_open_stale()
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_fill_ring()
+	RETURNS int STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_abort_release(npages int, do_publish bool)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_abort_after_fsync()
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;

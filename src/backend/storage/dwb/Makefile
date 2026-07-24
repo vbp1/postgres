@@ -16,6 +16,7 @@ OBJS = \
 	dwb.o \
 	dwb_ctl.o \
 	dwb_file.o \
-	dwb_recovery.o
+	dwb_recovery.o \
+	dwb_retire.o
 
 include $(top_srcdir)/src/backend/common.mk

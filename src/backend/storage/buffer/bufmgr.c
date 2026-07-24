@@ -54,6 +54,7 @@
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -4299,6 +4300,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	Block		bufBlock;
 	char	   *bufToWrite;
 	uint32		buf_state;
+	DWBSlotRef	dwbref;
 
 	/*
 	 * Try to start an I/O operation.  If StartBufferIO returns false, then
@@ -4371,6 +4373,21 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 */
 	bufToWrite = PageSetChecksumCopy((Page) bufBlock, buf->tag.blockNum);
 
+	/*
+	 * Double write buffer path: before the data-file write, make the copy
+	 * durable in pg_dwb/ so that a torn smgrwrite can always be repaired
+	 * from there (full_page_writes replacement, see storage/dwb.h).  Only
+	 * BM_PERMANENT buffers need this: unlogged relations are reset from
+	 * their init fork after a crash, so their torn writes don't matter.
+	 * With data checksums required by the DWB, bufToWrite is always a
+	 * private copy, stable regardless of concurrent hint-bit updates.
+	 */
+	if (DWBIsEnabled() && (buf_state & BM_PERMANENT) &&
+		!IsBootstrapProcessingMode())
+		DWBStagePageWrite(&buf->tag, bufToWrite, recptr, &dwbref);
+	else
+		dwbref.batch_idx = -1;
+
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 	/*
@@ -4402,6 +4419,19 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 */
 	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
 							IOOP_WRITE, io_start, 1, BLCKSZ);
+
+	if (dwbref.batch_idx >= 0)
+	{
+		/*
+		 * Step 6b: start kernel writeback of the page now so the segment
+		 * fsync that retires the batch becomes a cheap barrier instead of
+		 * a full flush.  Not durability — that comes from the fsync.
+		 */
+		if (dwb_writeback)
+			smgrwriteback(reln, BufTagGetForkNum(&buf->tag),
+						  buf->tag.blockNum, 1);
+		DWBFinishPageWrite(&dwbref);
+	}
 
 	pgBufferUsage.shared_blks_written++;
 

@@ -268,6 +268,8 @@ pgstat_get_io_object_name(IOObject io_object)
 			return "temp relation";
 		case IOOBJECT_WAL:
 			return "wal";
+		case IOOBJECT_DWB:
+			return "dwb";
 	}
 
 	elog(ERROR, "unrecognized IOObject value: %d", io_object);
@@ -419,6 +421,12 @@ pgstat_tracks_io_object(BackendType bktype, IOObject io_object,
 		return false;
 
 	/*
+	 * IO on the double write buffer ring only occurs in IOCONTEXT_NORMAL.
+	 */
+	if (io_object == IOOBJECT_DWB && io_context != IOCONTEXT_NORMAL)
+		return false;
+
+	/*
 	 * In core Postgres, only regular backends and WAL Sender processes
 	 * executing queries will use local buffers and operate on temporary
 	 * relations. Parallel workers will not use local buffers (see
@@ -514,6 +522,13 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 	 */
 	if (io_object == IOOBJECT_TEMP_RELATION &&
 		(io_op == IOOP_FSYNC || io_op == IOOP_WRITEBACK))
+		return false;
+
+	/*
+	 * The double write buffer ring only sees batch writes and fdatasyncs.
+	 */
+	if (io_object == IOOBJECT_DWB &&
+		!(io_op == IOOP_WRITE || io_op == IOOP_FSYNC))
 		return false;
 
 	/*

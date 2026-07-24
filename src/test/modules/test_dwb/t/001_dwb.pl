@@ -12,11 +12,18 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('dwb');
 $node->init;
+# dwb_retire_workers = 0 keeps batch sealing and retirement fully under the
+# test's control (writers retire synchronously); the quiescing settings keep
+# background flushes from opening batches between the state assertions.
 $node->append_conf(
 	'postgresql.conf', qq(
 io_torn_pages_protection = double_writes
 dwb_num_batches = 16
 dwb_batch_pages = 16
+dwb_retire_workers = 0
+bgwriter_lru_maxpages = 0
+checkpoint_timeout = 1h
+autovacuum = off
 ));
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION test_dwb');
@@ -80,13 +87,18 @@ cmp_ok($valid, '<=', 16 * 16, 'slot count bounded by the ring capacity');
 
 # --- restart bumps the durable generation ------------------------------
 
+# The shutdown checkpoint itself streams pages through the ring, so exact
+# slot counts cannot survive a restart; the invariants that must hold are
+# that CRC-valid slots exist and that none of them belongs to the new
+# generation.
 my $stale = $node->safe_psql('postgres', 'SELECT test_dwb_ring_slots(false)');
 cmp_ok($stale, '>', 0, 'ring holds slots before the restart check');
 $node->restart;
 is( $node->safe_psql('postgres', 'SELECT test_dwb_ring_slots(true)'),
 	'0', 'no slot belongs to the new generation after restart');
-is( $node->safe_psql('postgres', 'SELECT test_dwb_ring_slots(false)'),
-	$stale, 'stale slots still CRC-valid, only the generation gates them');
+cmp_ok(
+	$node->safe_psql('postgres', 'SELECT test_dwb_ring_slots(false)'),
+	'>', 0, 'stale slots still CRC-valid, only the generation gates them');
 
 # --- process exit cleanup ----------------------------------------------
 
@@ -130,9 +142,37 @@ like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
 	qr/free=16/, 'ring fully idle after the orphan hand-off');
 
+# --- transaction abort releases refs (ResourceOwner path) ---------------
+
+# An ERROR with unpublished refs: the abort poisons the slots, and the
+# batch seals and completes later exactly like the dead-backend case —
+# without a process exit.
+my ($rc, $out, $err) =
+  $node->psql('postgres', 'SELECT test_dwb_abort_release(3, false)');
+isnt($rc, 0, 'deliberate abort with pending refs reported');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/allocated=1/, 'batch of the aborted transaction stays open');
+is( $node->safe_psql('postgres', 'SELECT test_dwb_force_seal()'),
+	't', 'batch of the aborted transaction seals');
+is( $node->safe_psql('postgres', 'SELECT test_dwb_retire()'),
+	'1', 'batch of the aborted transaction retires');
+
+# An ERROR after the batch is durable: the abort cleanup goes through the
+# abandoned-slot repair (the fake relation exits via the dropped-relation
+# branch) and must still hand the batch over to retirement.
+($rc, $out, $err) =
+  $node->psql('postgres', 'SELECT test_dwb_abort_after_fsync()');
+isnt($rc, 0, 'deliberate abort after batch fsync reported');
+is( $node->safe_psql('postgres', 'SELECT test_dwb_retire()'),
+	'1', 'batch of the post-fsync abort retires');
+like(
+	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/free=16/, 'ring idle after the abort scenarios');
+
 # --- stale open must not hijack a reopened index ------------------------
 
-my ($rc, $out, $err) =
+($rc, $out, $err) =
   $node->psql('postgres', 'SELECT test_dwb_open_stale()');
 is($rc, 0, 'stale open leaves the live reopened batch alone')
   or diag($err);

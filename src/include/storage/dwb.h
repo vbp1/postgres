@@ -29,6 +29,7 @@
 #include "storage/lwlock.h"
 #include "storage/relfilelocator.h"
 #include "storage/s_lock.h"
+#include "utils/hsearch.h"
 #include "utils/timestamp.h"
 
 /* GUC: io_torn_pages_protection */
@@ -71,7 +72,7 @@ extern PGDLLIMPORT int dwb_on_stall;
 #define DWB_BITMAP_WORDS		(DWB_BATCH_MAX_PAGES / 64)
 /* staging pool: 2 writer classes + 2 in-flight leader writes */
 #define DWB_STAGING_BUFFERS		4
-/* writer classes (3.6); Stage 1 uses only DWB_WCLASS_EVICTION */
+/* writer classes (3.6) */
 #define DWB_NUM_WCLASSES		2
 #define DWB_WCLASS_EVICTION		0
 #define DWB_WCLASS_BACKGROUND	1
@@ -172,8 +173,8 @@ typedef enum DWBatchState
 	DWB_FSYNCED,				/* batch durable; writers do smgrwrite */
 	DWB_DATA_WRITTEN,			/* all smgrwrite + sync requests done */
 	DWB_RETIRING,				/* waiting for fsync of seg_set segments */
-	DWB_OOM_RETIRING,			/* publisher retires synchronously (Stage 2,
-								 * 3.5) */
+	DWB_OOM_RETIRING,			/* publisher retires synchronously after a
+								 * DWSegmentHash OOM (3.5) */
 } DWBatchState;
 
 typedef struct DWSegRef
@@ -182,6 +183,36 @@ typedef struct DWSegRef
 	ForkNumber	forknum;
 	uint32		segno;
 } DWSegRef;
+
+/*
+ * Segment -> batch back-reference (3.5): one shmem hash entry per segment
+ * that at least one RETIRING batch still needs fsynced.  The bitmap is
+ * indexed by ring batch index; a bit is set exactly once per batch life, at
+ * the DATA_WRITTEN -> RETIRING transition, and cleared by the fsyncer that
+ * covered it.  Batch index reuse is disambiguated by snapshotting batch_id
+ * before the fsync and re-checking it under the batch's publish_lock before
+ * decrementing (the ABA guard of 3.5).
+ *
+ * The entry size depends on dwb_num_batches, so the bitmap is a flexible
+ * array of DWBSegBitmapWords() words; hash lookups/inserts/removals are
+ * serialized by DWBSegHashLock.  fsync_in_progress is a best-effort claim
+ * that lets concurrent fsyncers skip a segment somebody is already syncing;
+ * races on it are benign because the bit-clear + decrement is idempotent.
+ */
+typedef struct DWSegEntry
+{
+	DWSegRef	key;
+	pg_atomic_uint32 fsync_in_progress;
+	pg_atomic_uint64 batch_bitmap[FLEXIBLE_ARRAY_MEMBER];
+} DWSegEntry;
+
+#define DWBSegBitmapWords() (((uint32) dwb_num_batches + 63) / 64)
+
+/*
+ * FREE batches held back from background-class opens so that a checkpoint's
+ * BufferSync storm can never eat the whole ring from under user evictions.
+ */
+#define DWB_EVICT_RESERVE		Max(2, dwb_num_batches / 8)
 
 /*
  * next_slot_idx encoding: 31-bit index + seal sentinel bit.
@@ -199,18 +230,13 @@ typedef struct DWBatchCtl
 	pg_atomic_uint32 ref_count; /* writers holding the batch from slot
 								 * reservation to smgrwrite done */
 	pg_atomic_uint32 seg_pending_count; /* seg_set entries not yet fsynced;
-										 * Stage 1 sets and clears it
-										 * wholesale, Stage 2 decrements it
-										 * per fsynced segment */
-	pg_atomic_uint32 orphaned_refs_count;	/* refs whose writer aborted after
-											 * publishing the copy but before
-											 * smgrwrite; a retire worker
-											 * finishes their writes (Stage 2;
-											 * Stage 1 only records them) */
-	LWLock		publish_lock;	/* protects n_segs/seg_set (dedup insert);
-								 * Stage 2 also serializes seg_set
-								 * publication and the seg_pending_count
-								 * decrement (3.5) */
+										 * decremented once per covered
+										 * segment, the decrement to zero
+										 * frees the batch */
+	LWLock		publish_lock;	/* protects n_segs/seg_set (dedup insert),
+								 * serializes seg_set publication into
+								 * DWSegmentHash and the batch_id-guarded
+								 * seg_pending_count decrement (3.5) */
 	ConditionVariable cv_state; /* broadcast on state change */
 	uint32		n_segs;
 	DWSegRef	seg_set[DWB_BATCH_MAX_SEGS];
@@ -222,7 +248,6 @@ typedef struct DWBatchCtl
 													 * DWSlotMeta.flags */
 	int			staging_idx;	/* staging buffer; held from ALLOCATED until
 								 * the leader finishes the image pwrite */
-	BufferTag	orphan_tags[DWB_BATCH_MAX_PAGES];
 	XLogRecPtr	max_page_lsn;
 	uint64		batch_id;		/* monotonic, for ordering */
 	TimestampTz open_time;		/* FREE -> ALLOCATED instant; drives
@@ -239,9 +264,11 @@ typedef struct DWCtl
 	uint64		ring_generation;	/* = control.generation after the startup
 									 * bump; constant until restart, stamped
 									 * into DWSlotMeta by the leader */
+	pg_atomic_uint64 freed_events;	/* monotonic count of batches that
+									 * reached FREE; backpressure waiters
+									 * treat a change as retire progress */
 	ConditionVariable cv_free_batch;	/* broadcast on retire */
-	ConditionVariable cv_retire_wake;	/* wakes retire workers (Stage 2; no
-										 * waiters yet) */
+	ConditionVariable cv_retire_wake;	/* wakes retire workers */
 	slock_t		staging_lock;	/* protects staging_free bitmap */
 	uint32		staging_free;	/* bitmap of free staging buffers */
 	DWBatchCtl	batches[FLEXIBLE_ARRAY_MEMBER]; /* dwb_num_batches entries */
@@ -259,22 +286,37 @@ typedef struct DWBSlotRef
 
 extern PGDLLIMPORT DWCtl *DWBCtl;
 extern PGDLLIMPORT char *DWBStagingBase;
+extern PGDLLIMPORT HTAB *DWSegmentHash;
 
 /* dwb_ctl.c */
 extern Size DWBShmemSize(void);
 extern void DWBShmemInit(void);
 
-/* dwb.c — write path (Stage 1: driven by tests, not FlushBuffer yet) */
-extern void DWBAcquireSlot(const BufferTag *tag, DWBSlotRef *ref);
+/* dwb.c — write path */
+extern void DWBStagePageWrite(const BufferTag *tag, const char *image,
+							  XLogRecPtr page_lsn, DWBSlotRef *ref);
+extern void DWBFinishPageWrite(const DWBSlotRef *ref);
+extern bool DWBWritesPaused(void);
+extern void DWBAcquireSlot(const BufferTag *tag, int wclass,
+						   bool use_resowner, DWBSlotRef *ref);
 extern void DWBPublishImage(const DWBSlotRef *ref, const char *image,
 							XLogRecPtr page_lsn);
 extern void DWBWaitBatchFsynced(const DWBSlotRef *ref);
 extern void DWBReleaseSlot(const DWBSlotRef *ref);
 extern bool DWBForceSealOpenBatch(int wclass);
-extern int	DWBRetireAllSync(void);
+extern bool DWBTrySealBatch(int batch_idx);
 extern DWBatchState DWBGetBatchState(int batch_idx);
 /* internal; exported for test_dwb's stale-open regression test */
 extern void DWBOpenNewBatch(int wclass, uint32 old_idx);
+
+/* dwb_retire.c — segment hash, retirement, worker pool */
+struct FileTag;					/* avoid dragging storage/sync.h in here */
+extern void DWBPublishBatchSegSet(int batch_idx);
+extern void DWBSegmentFsyncBegin(const struct FileTag *ftag);
+extern int	DWBSegmentFsyncEnd(bool synced);
+extern int	DWBRetireAllSync(void);
+extern void DWBRetireWorkersRegister(void);
+pg_noreturn extern void DWBRetireWorkerMain(Datum main_arg);
 
 /* dwb_file.c */
 extern void DWBCreateRing(void);
@@ -282,6 +324,7 @@ extern bool DWBReadControlFile(DWBControlFileData *control, bool missing_ok);
 extern void DWBWriteControlFile(const DWBControlFileData *control);
 extern int	DWBOpenBatchFile(int batch_idx);
 extern void DWBPrepareBatchWrite(int batch_idx);
+extern void DWBReadSlotImage(int batch_idx, int slot_idx, char *dst);
 extern void DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 						  const DWSlotMeta *metas, const char *images);
 extern pg_crc32c DWBImageCrc(const char *image);

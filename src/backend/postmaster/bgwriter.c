@@ -42,6 +42,7 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
+#include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
@@ -231,9 +232,15 @@ BackgroundWriterMain(const void *startup_data, size_t startup_data_len)
 		ProcessMainLoopInterrupts();
 
 		/*
-		 * Do one cycle of dirty-buffer writing.
+		 * Do one cycle of dirty-buffer writing.  While a double write
+		 * buffer stall has us paused (Stage A backpressure), sit the round
+		 * out instead of queueing more flushes behind an exhausted ring;
+		 * user-facing paths keep their reserve, we retry after the delay.
 		 */
-		can_hibernate = BgBufferSync(&wb_context);
+		if (DWBIsEnabled() && DWBWritesPaused())
+			can_hibernate = false;
+		else
+			can_hibernate = BgBufferSync(&wb_context);
 
 		/* Report pending statistics to the cumulative stats system */
 		pgstat_report_bgwriter();

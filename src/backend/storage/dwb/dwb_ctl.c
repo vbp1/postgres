@@ -35,12 +35,20 @@ int			dwb_on_stall = DWB_ON_STALL_PANIC;
 
 DWCtl	   *DWBCtl = NULL;
 char	   *DWBStagingBase = NULL;
+HTAB	   *DWSegmentHash = NULL;
 
 static Size
 DWBCtlSize(void)
 {
 	return offsetof(DWCtl, batches) +
 		mul_size(dwb_num_batches, sizeof(DWBatchCtl));
+}
+
+static Size
+DWBSegEntrySize(void)
+{
+	return offsetof(DWSegEntry, batch_bitmap) +
+		mul_size(DWBSegBitmapWords(), sizeof(pg_atomic_uint64));
 }
 
 static Size
@@ -55,10 +63,15 @@ DWBStagingSize(void)
 Size
 DWBShmemSize(void)
 {
+	Size		size;
+
 	if (!DWBIsEnabled())
 		return 0;
 
-	return add_size(DWBCtlSize(), DWBStagingSize());
+	size = add_size(DWBCtlSize(), DWBStagingSize());
+	size = add_size(size, hash_estimate_size(dwb_max_segments,
+											 DWBSegEntrySize()));
+	return size;
 }
 
 void
@@ -78,6 +91,7 @@ DWBShmemInit(void)
 		for (int i = 0; i < DWB_NUM_WCLASSES; i++)
 			pg_atomic_init_u32(&DWBCtl->open_batch_idx[i], DWB_INVALID_BATCH);
 		pg_atomic_init_u64(&DWBCtl->next_batch_id, 1);
+		pg_atomic_init_u64(&DWBCtl->freed_events, 0);
 		ConditionVariableInit(&DWBCtl->cv_free_batch);
 		ConditionVariableInit(&DWBCtl->cv_retire_wake);
 		SpinLockInit(&DWBCtl->staging_lock);
@@ -94,7 +108,6 @@ DWBShmemInit(void)
 				pg_atomic_init_u64(&batch->slots_written_bitmap[w], 0);
 			pg_atomic_init_u32(&batch->ref_count, 0);
 			pg_atomic_init_u32(&batch->seg_pending_count, 0);
-			pg_atomic_init_u32(&batch->orphaned_refs_count, 0);
 			LWLockInitialize(&batch->publish_lock, LWTRANCHE_DWB_PUBLISH);
 			ConditionVariableInit(&batch->cv_state);
 			batch->staging_idx = -1;
@@ -107,5 +120,17 @@ DWBShmemInit(void)
 		base = (char *) ShmemInitStruct("DWB Staging", DWBStagingSize(),
 										&found);
 		DWBStagingBase = (char *) TYPEALIGN(PG_IO_ALIGN_SIZE, base);
+	}
+
+	{
+		HASHCTL		info;
+
+		info.keysize = sizeof(DWSegRef);
+		info.entrysize = DWBSegEntrySize();
+
+		DWSegmentHash = ShmemInitHash("DWB Segment Hash",
+									  dwb_max_segments, dwb_max_segments,
+									  &info,
+									  HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
 	}
 }

@@ -5,4 +5,5 @@ backend_sources += files(
   'dwb_ctl.c',
   'dwb_file.c',
   'dwb_recovery.c',
+  'dwb_retire.c',
 )
