@@ -275,21 +275,6 @@ DWBOpenBatchFile(int batch_idx)
 	return batch_files[batch_idx];
 }
 
-void
-DWBCloseBatchFiles(void)
-{
-	if (batch_files == NULL)
-		return;
-	for (int i = 0; i < dwb_num_batches; i++)
-	{
-		if (batch_files[i] >= 0)
-		{
-			FileClose(batch_files[i]);
-			batch_files[i] = -1;
-		}
-	}
-}
-
 /*
  * Pre-open the batch file and pre-allocate the meta-region buffer, so that
  * DWBWriteBatch can run inside the leader's critical section without

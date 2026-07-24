@@ -281,7 +281,6 @@ extern void DWBCreateRing(void);
 extern bool DWBReadControlFile(DWBControlFileData *control, bool missing_ok);
 extern void DWBWriteControlFile(const DWBControlFileData *control);
 extern int	DWBOpenBatchFile(int batch_idx);
-extern void DWBCloseBatchFiles(void);
 extern void DWBPrepareBatchWrite(int batch_idx);
 extern void DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 						  const DWSlotMeta *metas, const char *images);
