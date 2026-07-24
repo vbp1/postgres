@@ -9,8 +9,9 @@
  * their page image with a plain memcpy into the batch's staging buffer and
  * set their bit in slots_written_bitmap.  The SEAL initiator becomes the
  * leader: it waits for bitmap coverage of capped_slots, then writes the
- * whole batch (contiguous image stream, then the meta region, then
- * fdatasync) and broadcasts DWB_FSYNCED.
+ * whole batch — in this write order: the contiguous image stream, then the
+ * meta region, then fdatasync (the on-disk layout puts the meta region
+ * first; see dwb.h) — and broadcasts DWB_FSYNCED.
  *
  * Stage 1 scope: the state machine is complete but not yet wired into
  * FlushBuffer; retirement is synchronous (DWBRetireAllSync) — the retire
@@ -37,13 +38,18 @@
 
 /*
  * Slot refs held by this backend, for cleanup on process exit.  A ref lives
- * from DWBAcquireSlot to DWBReleaseSlot.  (Stage 2 additionally attaches
- * refs to the ResourceOwner so that a transaction abort — e.g. an ERROR out
- * of smgrwrite — releases them too.)
+ * from DWBAcquireSlot to DWBReleaseSlot.  Sized to two full batches because
+ * a backend can hold refs on a sealed batch and on its successor at the
+ * same time, releasing the former only after the switch.  (Stage 2
+ * additionally attaches refs to the ResourceOwner so that a transaction
+ * abort — e.g. an ERROR out of smgrwrite — releases them too.)
  */
 static DWBSlotRef pendingRefs[2 * DWB_BATCH_MAX_PAGES];
 static int	nPendingRefs = 0;
 static bool cleanup_registered = false;
+
+/* leader-side meta assembly area, allocated before the seal is attempted */
+static DWSlotMeta *leader_metas = NULL;
 
 static void DWBProcExit(int code, Datum arg);
 static void DWBLeaderWriteBatch(int batch_idx);
@@ -64,9 +70,11 @@ DWBStagingSlotPtr(int staging_idx, int slot_idx)
 static int
 DWBStagingAlloc(void)
 {
+	int			idx;
+
 	for (;;)
 	{
-		int			idx = -1;
+		idx = -1;
 
 		SpinLockAcquire(&DWBCtl->staging_lock);
 		if (DWBCtl->staging_free != 0)
@@ -77,12 +85,18 @@ DWBStagingAlloc(void)
 		SpinLockRelease(&DWBCtl->staging_lock);
 
 		if (idx >= 0)
-			return idx;
+			break;
 
-		/* released together with retired batches / after leader writes */
+		/*
+		 * A buffer frees once its leader finishes the image pwrite;
+		 * retirement broadcasts cv_free_batch too, so just re-check on
+		 * every wake-up.
+		 */
 		ConditionVariableSleep(&DWBCtl->cv_free_batch,
 							   WAIT_EVENT_DWB_FREE_BATCH);
 	}
+	ConditionVariableCancelSleep();
+	return idx;
 }
 
 static void
@@ -116,6 +130,15 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 	for (;;)
 	{
 		int			free_idx = -1;
+		int			staging_idx;
+
+		/*
+		 * Reserve the staging buffer before taking the lock: the wait for a
+		 * free buffer can be long, and no sleeping (or interruptible) point
+		 * may exist below, where we hold DWBRingOpenLock with a batch
+		 * already taken out of DWB_FREE.
+		 */
+		staging_idx = DWBStagingAlloc();
 
 		LWLockAcquire(DWBRingOpenLock, LW_EXCLUSIVE);
 
@@ -123,6 +146,8 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		if (pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]) != old_idx)
 		{
 			LWLockRelease(DWBRingOpenLock);
+			DWBStagingRelease(staging_idx);
+			ConditionVariableCancelSleep();
 			return;
 		}
 
@@ -152,7 +177,7 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 			batch->max_page_lsn = InvalidXLogRecPtr;
 			batch->batch_id = pg_atomic_fetch_add_u64(&DWBCtl->next_batch_id, 1);
 			batch->open_time = GetCurrentTimestamp();
-			batch->staging_idx = DWBStagingAlloc();
+			batch->staging_idx = staging_idx;
 
 			/*
 			 * Open for reservations only after everything above is visible:
@@ -163,10 +188,12 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 
 			pg_atomic_write_u32(&DWBCtl->open_batch_idx[wclass], free_idx);
 			LWLockRelease(DWBRingOpenLock);
+			ConditionVariableCancelSleep();
 			return;
 		}
 
 		LWLockRelease(DWBRingOpenLock);
+		DWBStagingRelease(staging_idx);
 
 		/* whole ring busy: wait for a retirement, then retry */
 		ConditionVariableSleep(&DWBCtl->cv_free_batch,
@@ -192,9 +219,36 @@ DWBSealBatch(int batch_idx)
 	uint32		capped;
 	uint32		expected;
 
+	/*
+	 * Get everything the critical section below could fail at out of the
+	 * way while failure is still harmless (the seal has not been attempted
+	 * yet, so on ERROR the batch stays ALLOCATED and any other writer can
+	 * seal it later): the one-time leader allocations, the batch file VFD,
+	 * and this backend's condition-variable wait event set (the first
+	 * ConditionVariablePrepareToSleep of a backend allocates it).
+	 */
+	if (leader_metas == NULL)
+		leader_metas = MemoryContextAllocZero(TopMemoryContext,
+											  DWB_BATCH_MAX_PAGES * sizeof(DWSlotMeta));
+	DWBPrepareBatchWrite(batch_idx);
+	ConditionVariablePrepareToSleep(&batch->cv_state);
+	ConditionVariableCancelSleep();
+
 	prev = pg_atomic_fetch_or_u32(&batch->next_slot_idx, DWB_SEAL_BIT);
 	if (prev & DWB_SEAL_BIT)
 		return false;			/* somebody else is the leader */
+
+	/*
+	 * We are the leader: nobody else can advance this batch anymore.  A
+	 * failure between here and DWB_FSYNCED would leave the batch wedged
+	 * forever, its waiters stuck and its staging buffer lost, so run the
+	 * whole span as a critical section: any error escalates to PANIC and
+	 * crash recovery resets the ring.  (This also suspends interrupt
+	 * processing, making the coverage wait in DWBLeaderWriteBatch
+	 * non-interruptible; its dwb_slot_stuck_timeout_ms PANIC is the
+	 * backstop.)
+	 */
+	START_CRIT_SECTION();
 
 	capped = Min(prev & DWB_IDX_MASK, (uint32) dwb_batch_pages);
 	pg_atomic_write_u32(&batch->capped_slots, capped);
@@ -216,26 +270,48 @@ DWBSealBatch(int batch_idx)
 		batch->staging_idx = -1;
 		pg_atomic_write_u32(&batch->state, DWB_FREE);
 		ConditionVariableBroadcast(&DWBCtl->cv_free_batch);
+		END_CRIT_SECTION();
 		return true;
 	}
 
+	/*
+	 * Pin the batch with a leader ref for the duration of the write.  All
+	 * writers may exit while we write (dropping their refs), and the
+	 * FSYNCED -> RETIRING hand-off runs when the last ref drops: the pin
+	 * guarantees ref_count stays above zero until DWB_FSYNCED is reached,
+	 * so the hand-off always has exactly one well-defined owner.
+	 */
+	pg_atomic_fetch_add_u32(&batch->ref_count, 1);
+
 	DWBLeaderWriteBatch(batch_idx);
+
+	END_CRIT_SECTION();
+
+	if (pg_atomic_fetch_sub_u32(&batch->ref_count, 1) == 1)
+		DWBFinishBatchData(batch);
+
 	return true;
 }
 
 /*
  * Leader: wait for bitmap coverage of capped_slots, write the batch,
  * fdatasync, broadcast DWB_FSYNCED.
+ *
+ * Runs inside the leader's critical section (see DWBSealBatch); everything
+ * it needs was allocated and opened before the seal, so no palloc happens
+ * here.
  */
 static void
 DWBLeaderWriteBatch(int batch_idx)
 {
 	DWBatchCtl *batch = &DWBCtl->batches[batch_idx];
 	uint32		capped = pg_atomic_read_u32(&batch->capped_slots);
-	static DWSlotMeta *metas = NULL;
 	DWBBatchHeader hdr;
 	TimestampTz wait_start = GetCurrentTimestamp();
 	uint32		expected;
+
+	Assert(CritSectionCount > 0);
+	Assert(leader_metas != NULL);
 
 	/*
 	 * Coverage wait is memcpy-bound: writers do no I/O between reserving a
@@ -281,14 +357,11 @@ DWBLeaderWriteBatch(int batch_idx)
 			 batch_idx, expected);
 
 	/* assemble slot metas entirely from shmem arrays */
-	if (metas == NULL)
-		metas = MemoryContextAllocZero(TopMemoryContext,
-									   DWB_BATCH_MAX_PAGES * sizeof(DWSlotMeta));
-	memset(metas, 0, capped * sizeof(DWSlotMeta));
+	memset(leader_metas, 0, capped * sizeof(DWSlotMeta));
 	batch->max_page_lsn = InvalidXLogRecPtr;
 	for (uint32 i = 0; i < capped; i++)
 	{
-		DWSlotMeta *meta = &metas[i];
+		DWSlotMeta *meta = &leader_metas[i];
 
 		meta->tag = batch->pages[i];
 		meta->page_lsn = batch->page_lsns[i];
@@ -307,7 +380,7 @@ DWBLeaderWriteBatch(int batch_idx)
 	hdr.n_slots = capped;
 	hdr.crc = DWBBatchHeaderCrc(&hdr);
 
-	DWBWriteBatch(batch_idx, &hdr, metas,
+	DWBWriteBatch(batch_idx, &hdr, leader_metas,
 				  DWBStagingSlotPtr(batch->staging_idx, 0));
 
 	/* image pwrite done — staging can serve the next batch */
@@ -336,7 +409,10 @@ DWBAcquireSlot(const BufferTag *tag, DWBSlotRef *ref)
 	const int	wclass = DWB_WCLASS_EVICTION;
 
 	Assert(DWBIsEnabled());
-	Assert(nPendingRefs < 2 * DWB_BATCH_MAX_PAGES);
+
+	/* hard bound: overflowing the static array would corrupt memory */
+	if (nPendingRefs >= (int) lengthof(pendingRefs))
+		elog(ERROR, "too many pending double write buffer slot refs held by one backend");
 
 	if (!cleanup_registered)
 	{
@@ -388,7 +464,11 @@ DWBAcquireSlot(const BufferTag *tag, DWBSlotRef *ref)
 			seg.forknum = BufTagGetForkNum(tag);
 			seg.segno = tag->blockNum / RELSEG_SIZE;
 
-			SpinLockAcquire(&batch->seg_lock);
+			/*
+			 * The dedup scan is O(n_segs), far too long for a spinlock;
+			 * publish_lock is this batch's LWLock over n_segs/seg_set.
+			 */
+			LWLockAcquire(&batch->publish_lock, LW_EXCLUSIVE);
 			for (uint32 i = 0; i < batch->n_segs; i++)
 			{
 				if (RelFileLocatorEquals(batch->seg_set[i].rlocator, seg.rlocator) &&
@@ -401,7 +481,7 @@ DWBAcquireSlot(const BufferTag *tag, DWBSlotRef *ref)
 			}
 			if (!found)
 				batch->seg_set[batch->n_segs++] = seg;
-			SpinLockRelease(&batch->seg_lock);
+			LWLockRelease(&batch->publish_lock);
 		}
 
 		pg_atomic_fetch_add_u32(&batch->ref_count, 1);
@@ -423,6 +503,9 @@ DWBPublishImage(const DWBSlotRef *ref, const char *image, XLogRecPtr page_lsn)
 {
 	DWBatchCtl *batch = &DWBCtl->batches[ref->batch_idx];
 
+	/* a held ref pins the batch, so its incarnation cannot have changed */
+	Assert(ref->batch_id == batch->batch_id);
+
 	memcpy(DWBStagingSlotPtr(batch->staging_idx, ref->slot_idx),
 		   image, BLCKSZ);
 	batch->page_lsns[ref->slot_idx] = page_lsn;
@@ -443,6 +526,8 @@ DWBWaitBatchFsynced(const DWBSlotRef *ref)
 {
 	DWBatchCtl *batch = &DWBCtl->batches[ref->batch_idx];
 
+	Assert(ref->batch_id == batch->batch_id);
+
 	ConditionVariablePrepareToSleep(&batch->cv_state);
 	while (pg_atomic_read_u32(&batch->state) < DWB_FSYNCED)
 		ConditionVariableSleep(&batch->cv_state, WAIT_EVENT_DWB_BATCH_FSYNC);
@@ -450,9 +535,10 @@ DWBWaitBatchFsynced(const DWBSlotRef *ref)
 }
 
 /*
- * Step 7 of the write path: the last ref publishes the segment set and
- * moves the batch to RETIRING.  (Stage 2 publishes into DWSegmentHash here;
- * Stage 1 retirement is DWBRetireAllSync.)
+ * Step 7 of the write path: the last ref hands the batch over to
+ * retirement (FSYNCED -> DATA_WRITTEN -> RETIRING).  (Stage 2 publishes
+ * the segment set into DWSegmentHash here; Stage 1 retirement is
+ * DWBRetireAllSync.)
  */
 static void
 DWBFinishBatchData(DWBatchCtl *batch)
@@ -481,6 +567,8 @@ void
 DWBReleaseSlot(const DWBSlotRef *ref)
 {
 	DWBatchCtl *batch = &DWBCtl->batches[ref->batch_idx];
+
+	Assert(ref->batch_id == batch->batch_id);
 
 	for (int i = 0; i < nPendingRefs; i++)
 	{
@@ -592,6 +680,13 @@ DWBProcExit(int code, Datum arg)
 			batch->orphan_tags[n] = batch->pages[ref.slot_idx];
 		}
 
+		/*
+		 * The last ref finishes the batch only once it is FSYNCED.  A
+		 * sealed batch cannot lose its last ref earlier — the leader holds
+		 * its own pin from SEAL to FSYNCED (see DWBSealBatch) — so reaching
+		 * zero refs in an earlier state means the batch is not sealed yet:
+		 * it stays open and a later seal completes it normally.
+		 */
 		if (pg_atomic_fetch_sub_u32(&batch->ref_count, 1) == 1 &&
 			pg_atomic_read_u32(&batch->state) == DWB_FSYNCED)
 			DWBFinishBatchData(batch);

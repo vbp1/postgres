@@ -5597,9 +5597,9 @@ StartupXLOG(void)
 
 	/*
 	 * Create or validate the double write buffer ring and durably bump its
-	 * generation before any of its slots can be written or applied.  The
-	 * apply-pass over the previous generation runs here, before WAL
-	 * recovery is initialized.
+	 * generation before any of its slots can be written.  (The Stage 4
+	 * apply-pass over the previous generation will run here, before WAL
+	 * recovery is initialized.)
 	 */
 	DWBStartup();
 

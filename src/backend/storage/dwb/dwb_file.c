@@ -32,6 +32,9 @@
  * workers ever open batch files */
 static File *batch_files = NULL;
 
+/* IO-aligned meta-region assembly buffer, allocated by DWBPrepareBatchWrite */
+static char *meta_buf = NULL;
+
 pg_crc32c
 DWBImageCrc(const char *image)
 {
@@ -104,13 +107,22 @@ DWBReadControlFile(DWBControlFileData *control, bool missing_ok)
 	}
 
 	pgstat_report_wait_start(WAIT_EVENT_DWB_CONTROL_READ);
+	errno = 0;
 	r = read(fd, control, sizeof(DWBControlFileData));
 	pgstat_report_wait_end();
 	if (r != sizeof(DWBControlFileData))
+	{
+		/* distinguish a real read error from a truncated file */
+		if (r < 0)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m",
+							DWB_CONTROL_FILE)));
 		ereport(FATAL,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("could not read file \"%s\": read %d of %zu",
 						DWB_CONTROL_FILE, r, sizeof(DWBControlFileData))));
+	}
 	if (CloseTransientFile(fd) != 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
@@ -279,29 +291,48 @@ DWBCloseBatchFiles(void)
 }
 
 /*
+ * Pre-open the batch file and pre-allocate the meta-region buffer, so that
+ * DWBWriteBatch can run inside the leader's critical section without
+ * allocating anything.  Called before the seal is attempted, where an
+ * ERROR is still harmless.
+ */
+void
+DWBPrepareBatchWrite(int batch_idx)
+{
+	if (meta_buf == NULL)
+		meta_buf = MemoryContextAllocAligned(TopMemoryContext,
+											 DWBMetaRegionSize(dwb_batch_pages),
+											 PG_IO_ALIGN_SIZE, 0);
+	(void) DWBOpenBatchFile(batch_idx);
+}
+
+/*
  * Leader write of one batch: (a) one contiguous pwrite of the image stream
  * from staging, (b) one pwrite of the meta region, (c) fdatasync.  Exactly
  * this order: a crash while reusing a slot must never leave valid-looking
  * meta over a torn or foreign image (any partially-persistent mix is
  * rejected locally by meta_crc/generation/image_crc, see 3.2/3.4).
+ *
+ * Runs inside the leader's critical section: every ereport here escalates
+ * to PANIC, which is deliberate — an incomplete leader write cannot be
+ * unwound (see DWBSealBatch).
  */
 void
 DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 			  const DWSlotMeta *metas, const char *images)
 {
-	static char *meta_buf = NULL;
 	Size		meta_region = DWBMetaRegionSize(dwb_batch_pages);
 	File		file = DWBOpenBatchFile(batch_idx);
 	Size		image_bytes = (Size) hdr->n_slots * BLCKSZ;
-	int			rc;
+	ssize_t		nwritten;
+	int			fd;
 
-	if (meta_buf == NULL)
-		meta_buf = MemoryContextAllocAligned(TopMemoryContext, meta_region,
-											 PG_IO_ALIGN_SIZE, 0);
+	/* DWBPrepareBatchWrite has run */
+	Assert(meta_buf != NULL);
 
-	rc = FileWrite(file, images, image_bytes, meta_region,
-				   WAIT_EVENT_DWB_BATCH_WRITE);
-	if (rc != image_bytes)
+	nwritten = FileWrite(file, images, image_bytes, meta_region,
+						 WAIT_EVENT_DWB_BATCH_WRITE);
+	if (nwritten != (ssize_t) image_bytes)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write batch %d of \"%s\": %m",
@@ -312,9 +343,9 @@ DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 	memcpy(meta_buf + sizeof(DWBBatchHeader), metas,
 		   hdr->n_slots * sizeof(DWSlotMeta));
 
-	rc = FileWrite(file, meta_buf, meta_region, 0,
-				   WAIT_EVENT_DWB_BATCH_WRITE);
-	if (rc != meta_region)
+	nwritten = FileWrite(file, meta_buf, meta_region, 0,
+						 WAIT_EVENT_DWB_BATCH_WRITE);
+	if (nwritten != (ssize_t) meta_region)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write batch %d of \"%s\": %m",
@@ -325,8 +356,8 @@ DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 	 * its size and block layout never change (WAL-segment contract).
 	 */
 	pgstat_report_wait_start(WAIT_EVENT_DWB_BATCH_SYNC);
-	rc = FileGetRawDesc(file);
-	if (rc < 0 || pg_fdatasync(rc) != 0)
+	fd = FileGetRawDesc(file);
+	if (fd < 0 || pg_fdatasync(fd) != 0)
 		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(),
 				 errmsg("could not fsync batch %d of \"%s\": %m",

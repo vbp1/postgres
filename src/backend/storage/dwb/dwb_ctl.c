@@ -97,7 +97,6 @@ DWBShmemInit(void)
 			pg_atomic_init_u32(&batch->orphaned_refs_count, 0);
 			LWLockInitialize(&batch->publish_lock, LWTRANCHE_DWB_PUBLISH);
 			ConditionVariableInit(&batch->cv_state);
-			SpinLockInit(&batch->seg_lock);
 			batch->staging_idx = -1;
 		}
 	}

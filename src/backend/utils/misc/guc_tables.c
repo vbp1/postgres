@@ -356,10 +356,6 @@ static const struct config_enum_entry synchronous_commit_options[] = {
 	{NULL, 0, false}
 };
 
-/*
- * Although only "on", "off", "try" are documented, we accept all the likely
- * variants of "on" and "off".
- */
 static const struct config_enum_entry io_torn_pages_protection_options[] = {
 	{"off", DWB_PROTECT_OFF, false},
 	{"full_pages", DWB_PROTECT_FULL_PAGES, false},
@@ -374,6 +370,10 @@ static const struct config_enum_entry dwb_on_stall_options[] = {
 	{NULL, 0, false}
 };
 
+/*
+ * Although only "on", "off", "try" are documented, we accept all the likely
+ * variants of "on" and "off".
+ */
 static const struct config_enum_entry huge_pages_options[] = {
 	{"off", HUGE_PAGES_OFF, false},
 	{"on", HUGE_PAGES_ON, false},
@@ -2211,7 +2211,7 @@ struct config_int ConfigureNamesInt[] =
 			NULL
 		},
 		&dwb_batch_pages,
-		64, 16, 256,
+		64, 16, DWB_BATCH_MAX_PAGES,
 		NULL, NULL, NULL
 	},
 	{

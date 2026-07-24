@@ -85,7 +85,8 @@ extern PGDLLIMPORT int dwb_on_stall;
  * pg_dwb/control        - geometry + durable generation, written atomically
  * pg_dwb/batch_NNNN     - meta region (header + slot metas, padded to
  *                         PG_IO_ALIGN_SIZE) followed by a contiguous
- *                         BLCKSZ-aligned page-image stream
+ *                         PG_IO_ALIGN_SIZE-aligned stream of BLCKSZ page
+ *                         images
  *
  * Slot validity is locally verifiable: meta_crc rejects a torn meta write
  * (including any old/new field mix on slot reuse), image_crc rejects a torn
@@ -130,6 +131,23 @@ typedef struct DWSlotMeta
 /* DWSlotMeta.flags */
 #define DWB_SLOT_ABORTED		0x0001	/* writer died before publishing */
 
+/*
+ * The on-disk layout is pinned: any change to these sizes or offsets is an
+ * on-disk format change and requires a DWB_VERSION bump.
+ */
+StaticAssertDecl(sizeof(DWBControlFileData) == 40,
+				 "DWBControlFileData on-disk size changed");
+StaticAssertDecl(offsetof(DWBControlFileData, crc) == 32,
+				 "DWBControlFileData crc offset changed");
+StaticAssertDecl(sizeof(DWBBatchHeader) == 24,
+				 "DWBBatchHeader on-disk size changed");
+StaticAssertDecl(offsetof(DWBBatchHeader, crc) == 20,
+				 "DWBBatchHeader crc offset changed");
+StaticAssertDecl(sizeof(DWSlotMeta) == 56,
+				 "DWSlotMeta on-disk size changed");
+StaticAssertDecl(offsetof(DWSlotMeta, meta_crc) == 48,
+				 "DWSlotMeta meta_crc offset changed");
+
 #define DWBMetaRegionSize(batch_pages) \
 	TYPEALIGN(PG_IO_ALIGN_SIZE, \
 			  sizeof(DWBBatchHeader) + (batch_pages) * sizeof(DWSlotMeta))
@@ -138,6 +156,11 @@ typedef struct DWSlotMeta
 
 /*
  * Batch lifecycle.  A slot is reused only via DWB_FREE.
+ *
+ * The numeric order of the happy-path states is semantic: the code uses
+ * comparisons like "state < DWB_FSYNCED" as progress tests.  Insert new
+ * states only in lifecycle order; DWB_OOM_RETIRING is a side fork of
+ * DWB_RETIRING and must stay numerically last.
  */
 typedef enum DWBatchState
 {
@@ -149,7 +172,8 @@ typedef enum DWBatchState
 	DWB_FSYNCED,				/* batch durable; writers do smgrwrite */
 	DWB_DATA_WRITTEN,			/* all smgrwrite + sync requests done */
 	DWB_RETIRING,				/* waiting for fsync of seg_set segments */
-	DWB_OOM_RETIRING,			/* publisher retires synchronously (3.5) */
+	DWB_OOM_RETIRING,			/* publisher retires synchronously (Stage 2,
+								 * 3.5) */
 } DWBatchState;
 
 typedef struct DWSegRef
@@ -174,22 +198,28 @@ typedef struct DWBatchCtl
 	pg_atomic_uint64 slots_written_bitmap[DWB_BITMAP_WORDS];
 	pg_atomic_uint32 ref_count; /* writers holding the batch from slot
 								 * reservation to smgrwrite done */
-	pg_atomic_uint32 seg_pending_count; /* seg_set entries not yet fsynced */
+	pg_atomic_uint32 seg_pending_count; /* seg_set entries not yet fsynced;
+										 * Stage 1 sets and clears it
+										 * wholesale, Stage 2 decrements it
+										 * per fsynced segment */
 	pg_atomic_uint32 orphaned_refs_count;	/* refs whose writer aborted after
 											 * publishing the copy but before
 											 * smgrwrite; a retire worker
-											 * finishes their writes */
-	LWLock		publish_lock;	/* serializes seg_set publication and
-								 * seg_pending_count decrement (3.5) */
+											 * finishes their writes (Stage 2;
+											 * Stage 1 only records them) */
+	LWLock		publish_lock;	/* protects n_segs/seg_set (dedup insert);
+								 * Stage 2 also serializes seg_set
+								 * publication and the seg_pending_count
+								 * decrement (3.5) */
 	ConditionVariable cv_state; /* broadcast on state change */
-	slock_t		seg_lock;		/* protects n_segs/seg_set dedup insert */
 	uint32		n_segs;
 	DWSegRef	seg_set[DWB_BATCH_MAX_SEGS];
 	BufferTag	pages[DWB_BATCH_MAX_PAGES];
 	XLogRecPtr	page_lsns[DWB_BATCH_MAX_PAGES];
 	pg_crc32c	image_crcs[DWB_BATCH_MAX_PAGES];	/* computed by writers at
 													 * publication */
-	uint8		slot_flags[DWB_BATCH_MAX_PAGES];
+	uint16		slot_flags[DWB_BATCH_MAX_PAGES];	/* same width as
+													 * DWSlotMeta.flags */
 	int			staging_idx;	/* staging buffer; held from ALLOCATED until
 								 * the leader finishes the image pwrite */
 	BufferTag	orphan_tags[DWB_BATCH_MAX_PAGES];
@@ -210,7 +240,8 @@ typedef struct DWCtl
 									 * bump; constant until restart, stamped
 									 * into DWSlotMeta by the leader */
 	ConditionVariable cv_free_batch;	/* broadcast on retire */
-	ConditionVariable cv_retire_wake;	/* wakes retire workers */
+	ConditionVariable cv_retire_wake;	/* wakes retire workers (Stage 2; no
+										 * waiters yet) */
 	slock_t		staging_lock;	/* protects staging_free bitmap */
 	uint32		staging_free;	/* bitmap of free staging buffers */
 	DWBatchCtl	batches[FLEXIBLE_ARRAY_MEMBER]; /* dwb_num_batches entries */
@@ -249,6 +280,7 @@ extern bool DWBReadControlFile(DWBControlFileData *control, bool missing_ok);
 extern void DWBWriteControlFile(const DWBControlFileData *control);
 extern int	DWBOpenBatchFile(int batch_idx);
 extern void DWBCloseBatchFiles(void);
+extern void DWBPrepareBatchWrite(int batch_idx);
 extern void DWBWriteBatch(int batch_idx, const DWBBatchHeader *hdr,
 						  const DWSlotMeta *metas, const char *images);
 extern pg_crc32c DWBImageCrc(const char *image);

@@ -157,6 +157,7 @@ test_dwb_ring_slots(PG_FUNCTION_ARGS)
 	{
 		char		path[MAXPGPATH];
 		int			fd;
+		ssize_t		r;
 		DWBBatchHeader hdr;
 
 		snprintf(path, MAXPGPATH, DWB_DIR "/batch_%04u", b);
@@ -166,20 +167,56 @@ test_dwb_ring_slots(PG_FUNCTION_ARGS)
 					(errcode_for_file_access(),
 					 errmsg("could not open file \"%s\": %m", path)));
 
-		if (pg_pread(fd, &hdr, sizeof(hdr), 0) != sizeof(hdr))
-			ereport(ERROR, (errmsg("short read of header in \"%s\"", path)));
+		errno = 0;
+		r = pg_pread(fd, &hdr, sizeof(hdr), 0);
+		if (r != sizeof(hdr))
+		{
+			if (r < 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read file \"%s\": %m", path)));
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("short read of header in \"%s\"", path)));
+		}
 
 		/* an all-zero (never written) batch fails the header check */
 		if (hdr.magic == DWB_BATCH_MAGIC &&
-			EQ_CRC32C(hdr.crc, DWBBatchHeaderCrc(&hdr)) &&
-			hdr.n_slots <= control.batch_pages)
+			EQ_CRC32C(hdr.crc, DWBBatchHeaderCrc(&hdr)))
 		{
-			int			nbytes = hdr.n_slots * sizeof(DWSlotMeta);
+			ssize_t		nbytes = hdr.n_slots * sizeof(DWSlotMeta);
 
-			if (pg_pread(fd, metas, nbytes, sizeof(DWBBatchHeader)) != nbytes)
-				ereport(ERROR, (errmsg("short read of metas in \"%s\"", path)));
+			/*
+			 * A CRC-valid header with out-of-range n_slots cannot happen
+			 * under the startup geometry check; report the anomaly instead
+			 * of silently contributing zero slots.
+			 */
+			if (hdr.n_slots > control.batch_pages)
+			{
+				ereport(WARNING,
+						(errmsg("batch file \"%s\" has out-of-range n_slots %u",
+								path, hdr.n_slots)));
+				nbytes = -1;
+			}
 
-			for (uint32 i = 0; i < hdr.n_slots; i++)
+			if (nbytes >= 0)
+			{
+				errno = 0;
+				r = pg_pread(fd, metas, nbytes, sizeof(DWBBatchHeader));
+				if (r != nbytes)
+				{
+					if (r < 0)
+						ereport(ERROR,
+								(errcode_for_file_access(),
+								 errmsg("could not read metas in \"%s\": %m",
+										path)));
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("short read of metas in \"%s\"", path)));
+				}
+			}
+
+			for (uint32 i = 0; nbytes >= 0 && i < hdr.n_slots; i++)
 			{
 				DWSlotMeta *meta = &metas[i];
 
@@ -190,9 +227,20 @@ test_dwb_ring_slots(PG_FUNCTION_ARGS)
 				if (current_only && meta->generation != control.generation)
 					continue;
 
-				if (pg_pread(fd, image, BLCKSZ,
-							 meta_region + (off_t) i * BLCKSZ) != BLCKSZ)
-					ereport(ERROR, (errmsg("short read of image in \"%s\"", path)));
+				errno = 0;
+				r = pg_pread(fd, image, BLCKSZ,
+							 meta_region + (off_t) i * BLCKSZ);
+				if (r != BLCKSZ)
+				{
+					if (r < 0)
+						ereport(ERROR,
+								(errcode_for_file_access(),
+								 errmsg("could not read image in \"%s\": %m",
+										path)));
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("short read of image in \"%s\"", path)));
+				}
 				if (!EQ_CRC32C(meta->image_crc, DWBImageCrc(image)))
 					continue;
 				valid++;
@@ -234,4 +282,59 @@ test_dwb_states(PG_FUNCTION_ARGS)
 					 counts[DWB_FSYNCED], counts[DWB_DATA_WRITTEN],
 					 counts[DWB_RETIRING] + counts[DWB_OOM_RETIRING]);
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
+ * Acquire (and optionally publish) npages slots and return WITHOUT
+ * releasing them: the refs stay pending, so closing the session exercises
+ * DWBProcExit's poison (unpublished) or orphan (published) path.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_leak);
+Datum
+test_dwb_leak(PG_FUNCTION_ARGS)
+{
+	int			npages = PG_GETARG_INT32(0);
+	bool		do_publish = PG_GETARG_BOOL(1);
+	static char page[BLCKSZ];
+
+	check_dwb_enabled();
+	/* stay below the batch size so this backend never seals as leader */
+	if (npages < 1 || npages >= dwb_batch_pages)
+		ereport(ERROR, (errmsg("npages out of range")));
+
+	for (int i = 0; i < npages; i++)
+	{
+		BufferTag	tag;
+		DWBSlotRef	ref;
+		RelFileLocator rlocator;
+
+		rlocator.spcOid = DEFAULTTABLESPACE_OID;
+		rlocator.dbOid = 1;
+		rlocator.relNumber = 91000;
+		InitBufferTag(&tag, &rlocator, MAIN_FORKNUM, (BlockNumber) i);
+
+		DWBAcquireSlot(&tag, &ref);
+		if (do_publish)
+		{
+			memset(page, 'L', BLCKSZ);
+			DWBPublishImage(&ref, page, (XLogRecPtr) 0x2000000 + i);
+		}
+	}
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(test_dwb_force_seal);
+Datum
+test_dwb_force_seal(PG_FUNCTION_ARGS)
+{
+	check_dwb_enabled();
+	PG_RETURN_BOOL(DWBForceSealOpenBatch(DWB_WCLASS_EVICTION));
+}
+
+PG_FUNCTION_INFO_V1(test_dwb_retire);
+Datum
+test_dwb_retire(PG_FUNCTION_ARGS)
+{
+	check_dwb_enabled();
+	PG_RETURN_INT32(DWBRetireAllSync());
 }

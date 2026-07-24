@@ -18,3 +18,15 @@ CREATE FUNCTION test_dwb_ring_slots(current_only bool)
 CREATE FUNCTION test_dwb_states()
 	RETURNS text STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_leak(npages int, do_publish bool)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_force_seal()
+	RETURNS bool STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_retire()
+	RETURNS int STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
