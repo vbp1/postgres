@@ -37,7 +37,8 @@ static void create_target_symlink(const char *path, const char *link);
 static void remove_target_symlink(const char *path);
 
 static void recurse_dir(const char *datadir, const char *parentpath,
-						process_file_callback_t callback);
+						process_file_callback_t callback,
+						bool follow_dwb_symlink);
 
 /*
  * Open a target file for writing. If 'trunc' is true and the file already
@@ -380,11 +381,17 @@ slurpFile(const char *datadir, const char *path, size_t *filesize)
 /*
  * Traverse through all files in a data directory, calling 'callback'
  * for each file.
+ *
+ * 'follow_dwb_symlink' says whether to follow a symlinked pg_dwb: the
+ * target's ring must be enumerated so that the rewind wipes it, but the
+ * source's ring is never used, so a broken link there must not fail the
+ * traversal.
  */
 void
-traverse_datadir(const char *datadir, process_file_callback_t callback)
+traverse_datadir(const char *datadir, process_file_callback_t callback,
+				 bool follow_dwb_symlink)
 {
-	recurse_dir(datadir, NULL, callback);
+	recurse_dir(datadir, NULL, callback, follow_dwb_symlink);
 }
 
 /*
@@ -395,7 +402,7 @@ traverse_datadir(const char *datadir, process_file_callback_t callback)
  */
 static void
 recurse_dir(const char *datadir, const char *parentpath,
-			process_file_callback_t callback)
+			process_file_callback_t callback, bool follow_dwb_symlink)
 {
 	DIR		   *xldir;
 	struct dirent *xlde;
@@ -452,7 +459,7 @@ recurse_dir(const char *datadir, const char *parentpath,
 		{
 			callback(path, FILE_TYPE_DIRECTORY, 0, NULL);
 			/* recurse to handle subdirectories */
-			recurse_dir(datadir, path, callback);
+			recurse_dir(datadir, path, callback, follow_dwb_symlink);
 		}
 		else if (S_ISLNK(fst.st_mode))
 		{
@@ -473,11 +480,15 @@ recurse_dir(const char *datadir, const char *parentpath,
 			/*
 			 * If it's a symlink within pg_tblspc, we need to recurse into it,
 			 * to process all the tablespaces.  We also follow a symlink if
-			 * it's for pg_wal.  Symlinks elsewhere are ignored.
+			 * it's for pg_wal, or — when requested — for pg_dwb so that
+			 * the target's double write buffer ring is enumerated (and thus
+			 * wiped) even when the ring lives behind a symlink.  Symlinks
+			 * elsewhere are ignored.
 			 */
 			if ((parentpath && strcmp(parentpath, PG_TBLSPC_DIR) == 0) ||
-				strcmp(path, "pg_wal") == 0)
-				recurse_dir(datadir, path, callback);
+				strcmp(path, "pg_wal") == 0 ||
+				(follow_dwb_symlink && strcmp(path, "pg_dwb") == 0))
+				recurse_dir(datadir, path, callback, follow_dwb_symlink);
 		}
 	}
 

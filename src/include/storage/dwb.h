@@ -258,7 +258,8 @@ StaticAssertDecl(DWB_NUM_WCLASSES == 2,
 typedef struct DWBatchCtl
 {
 	pg_atomic_uint32 state;		/* DWBatchState */
-	pg_atomic_uint32 next_slot_idx; /* fetch_add on ALLOCATED */
+	pg_atomic_uint32 next_slot_idx; /* CAS-incremented while open, see
+									 * DWBAcquireSlot() */
 	pg_atomic_uint32 capped_slots;	/* fixed by SEAL; leader waits for exactly
 									 * this many bitmap bits */
 	pg_atomic_uint64 slots_written_bitmap[DWB_BITMAP_WORDS];

@@ -45,6 +45,7 @@ tests += {
       't/006_backup.pl',
       't/007_rewind.pl',
       't/008_modes.pl',
+      't/009_fpw_transition.pl',
     ],
   },
 }

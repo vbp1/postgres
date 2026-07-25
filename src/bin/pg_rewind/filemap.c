@@ -718,6 +718,23 @@ decide_file_action(file_entry_t *entry)
 	if (strcmp(path, XLOG_CONTROL_FILE) == 0)
 		return FILE_ACTION_NONE;
 
+	/*
+	 * Never touch the pg_dwb entry itself: either side may have it as a plain
+	 * directory, as a symlink, or (before its first double_writes startup)
+	 * not at all, and the server (re)creates it lazily, see DWBCreateRing().
+	 * Its contents match the exclusion filters and are removed from the
+	 * target below.  The target's entry and ring contents are validated up
+	 * front by checkTargetDwb() before the traversal; on the source side only
+	 * a regular file can show up here, and it never has a legitimate reason
+	 * to exist.
+	 */
+	if (strcmp(path, "pg_dwb") == 0)
+	{
+		if (entry->source_exists && entry->source_type == FILE_TYPE_REGULAR)
+			pg_fatal("\"%s\" in source is not a directory or symbolic link", path);
+		return FILE_ACTION_NONE;
+	}
+
 	/* Skip macOS system files */
 	if (strstr(path, ".DS_Store") != NULL)
 		return FILE_ACTION_NONE;

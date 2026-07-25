@@ -10,6 +10,7 @@
 #include "postgres_fe.h"
 
 #include <sys/stat.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
@@ -46,6 +47,7 @@ static void digestControlFile(ControlFileData *ControlFile,
 							  const char *content, size_t size);
 static void getRestoreCommand(const char *argv0);
 static void sanityChecks(void);
+static void checkTargetDwb(void);
 static TimeLineHistoryEntry *getTimelineHistory(TimeLineID tli, bool is_source,
 												int *nentries);
 static void findCommonAncestorTimeline(TimeLineHistoryEntry *a_history,
@@ -318,6 +320,8 @@ main(int argc, char **argv)
 	else
 		source = init_local_source(datadir_source);
 
+	checkTargetDwb();
+
 	/*
 	 * Check the status of the target instance.
 	 *
@@ -476,7 +480,7 @@ main(int argc, char **argv)
 
 	if (showprogress)
 		pg_log_info("reading target file list");
-	traverse_datadir(datadir_target, &process_target_file);
+	traverse_datadir(datadir_target, &process_target_file, true);
 
 	/*
 	 * Read the target WAL from last checkpoint before the point of fork, to
@@ -778,6 +782,80 @@ sanityChecks(void)
 		ControlFile_source.state != DB_SHUTDOWNED &&
 		ControlFile_source.state != DB_SHUTDOWNED_IN_RECOVERY)
 		pg_fatal("source data directory must be shut down cleanly");
+}
+
+/*
+ * Validate the target's pg_dwb entry before the target is touched in any
+ * way — in particular before the single-user recovery run and the
+ * no-rewind-required exit.
+ *
+ * The file-list traversal classifies only directories, symlinks and regular
+ * files, so garbage in place of pg_dwb or inside it (a FIFO, a socket...)
+ * would go unnoticed and survive the rewind, only to fail the next
+ * double_writes startup.  The entry must be a directory or a symlink to an
+ * accessible directory — or absent, since the server creates the ring
+ * lazily — and, the ring being flat, nothing but regular files belongs
+ * inside; anything else is rejected here, which lets the traversal's
+ * exclusion-driven removal wipe the ring completely.
+ */
+static void
+checkTargetDwb(void)
+{
+	char		dwb_path[MAXPGPATH];
+	struct stat st;
+	DIR		   *dir;
+	struct dirent *de;
+
+	snprintf(dwb_path, sizeof(dwb_path), "%s/pg_dwb", datadir_target);
+
+	if (lstat(dwb_path, &st) < 0)
+	{
+		if (errno == ENOENT)
+			return;
+		pg_fatal("could not stat file \"%s\": %m", dwb_path);
+	}
+
+	if (!S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode))
+		pg_fatal("\"%s\" in target is not a directory or symbolic link",
+				 "pg_dwb");
+
+	if (S_ISLNK(st.st_mode))
+	{
+		if (stat(dwb_path, &st) < 0)
+		{
+			if (errno == ENOENT || errno == ENOTDIR)
+				pg_fatal("\"%s\" in target is a symbolic link that does not point to a directory",
+						 "pg_dwb");
+			pg_fatal("could not stat file \"%s\": %m", dwb_path);
+		}
+		if (!S_ISDIR(st.st_mode))
+			pg_fatal("\"%s\" in target is a symbolic link that does not point to a directory",
+					 "pg_dwb");
+	}
+
+	dir = opendir(dwb_path);
+	if (dir == NULL)
+		pg_fatal("could not open directory \"%s\": %m", dwb_path);
+
+	while (errno = 0, (de = readdir(dir)) != NULL)
+	{
+		char		entry_path[MAXPGPATH * 2];
+
+		if (strcmp(de->d_name, ".") == 0 ||
+			strcmp(de->d_name, "..") == 0)
+			continue;
+
+		snprintf(entry_path, sizeof(entry_path), "%s/%s", dwb_path, de->d_name);
+		if (lstat(entry_path, &st) < 0)
+			pg_fatal("could not stat file \"%s\": %m", entry_path);
+		if (!S_ISREG(st.st_mode))
+			pg_fatal("\"%s/%s\" in target is not a regular file",
+					 "pg_dwb", de->d_name);
+	}
+	if (errno)
+		pg_fatal("could not read directory \"%s\": %m", dwb_path);
+
+	(void) closedir(dir);
 }
 
 /*

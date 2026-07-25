@@ -760,8 +760,9 @@ test_dwb_open_stale(PG_FUNCTION_ARGS)
 	stale_idx = pg_atomic_read_u32(&DWBCtl->open_batch_idx[DWB_WCLASS_EVICTION]);
 
 	/*
-	 * Acquire one slot: the fetch_add bounces on SEAL_BIT and reopens the
-	 * lowest FREE index — the same index again, as a new live incarnation.
+	 * Acquire one slot: the reservation CAS bounces on SEAL_BIT and reopens
+	 * the lowest FREE index — the same index again, as a new live
+	 * incarnation.
 	 */
 	tag = make_tag(1, 92000, 0);
 	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
