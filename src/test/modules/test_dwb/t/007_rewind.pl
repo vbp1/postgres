@@ -85,6 +85,11 @@ ok(-f $node_a->data_dir . '/pg_dwb/control',
 
 $node_b->stop('fast');
 
+my @rewind_from_b = (
+	'pg_rewind',
+	'--target-pgdata' => $node_a->data_dir,
+	'--source-pgdata' => $node_b->data_dir);
+
 # --- a garbage entry in place of pg_dwb is refused -----------------------
 
 # Anything but a directory, a symlink or nothing at all would survive the
@@ -96,11 +101,7 @@ $node_b->stop('fast');
 	rename($dwb_path, $stash) or BAIL_OUT("could not move $dwb_path: $!");
 	append_to_file($dwb_path, "not a ring\n");
 	command_fails_like(
-		[
-			'pg_rewind',
-			'--target-pgdata' => $node_a->data_dir,
-			'--source-pgdata' => $node_b->data_dir
-		],
+		[@rewind_from_b],
 		qr/"pg_dwb" in target is not a directory or symbolic link/,
 		'pg_rewind refuses a regular file in place of pg_dwb');
 	unlink($dwb_path) or BAIL_OUT("could not remove $dwb_path: $!");
@@ -114,11 +115,7 @@ $node_b->stop('fast');
 		POSIX::mkfifo($dwb_path, 0700)
 		  or BAIL_OUT("could not create FIFO $dwb_path: $!");
 		command_fails_like(
-			[
-				'pg_rewind',
-				'--target-pgdata' => $node_a->data_dir,
-				'--source-pgdata' => $node_b->data_dir
-			],
+			[@rewind_from_b],
 			qr/"pg_dwb" in target is not a directory or symbolic link/,
 			'pg_rewind refuses a FIFO in place of pg_dwb');
 		unlink($dwb_path) or BAIL_OUT("could not remove $dwb_path: $!");
@@ -127,11 +124,7 @@ $node_b->stop('fast');
 		symlink('/nonexistent/dwb_ring_target', $dwb_path)
 		  or BAIL_OUT("could not symlink $dwb_path: $!");
 		command_fails_like(
-			[
-				'pg_rewind',
-				'--target-pgdata' => $node_a->data_dir,
-				'--source-pgdata' => $node_b->data_dir
-			],
+			[@rewind_from_b],
 			qr/"pg_dwb" in target is a symbolic link that does not point to a directory/,
 			'pg_rewind refuses a broken pg_dwb symlink');
 		unlink($dwb_path) or BAIL_OUT("could not remove $dwb_path: $!");
@@ -140,11 +133,7 @@ $node_b->stop('fast');
 		symlink("$stash.file", $dwb_path)
 		  or BAIL_OUT("could not symlink $dwb_path: $!");
 		command_fails_like(
-			[
-				'pg_rewind',
-				'--target-pgdata' => $node_a->data_dir,
-				'--source-pgdata' => $node_b->data_dir
-			],
+			[@rewind_from_b],
 			qr/"pg_dwb" in target is a symbolic link that does not point to a directory/,
 			'pg_rewind refuses a pg_dwb symlink to a regular file');
 		unlink($dwb_path) or BAIL_OUT("could not remove $dwb_path: $!");
@@ -156,11 +145,7 @@ $node_b->stop('fast');
 		POSIX::mkfifo("$dwb_path/control", 0700)
 		  or BAIL_OUT("could not create FIFO $dwb_path/control: $!");
 		command_fails_like(
-			[
-				'pg_rewind',
-				'--target-pgdata' => $node_a->data_dir,
-				'--source-pgdata' => $node_b->data_dir
-			],
+			[@rewind_from_b],
 			qr!"pg_dwb/control" in target is not a regular file!,
 			'pg_rewind refuses a FIFO inside pg_dwb');
 		unlink("$dwb_path/control")
@@ -198,13 +183,7 @@ unless ($windows_os)
 	  or BAIL_OUT("could not symlink $b_dwb: $!");
 }
 
-command_ok(
-	[
-		'pg_rewind',
-		'--target-pgdata' => $node_a->data_dir,
-		'--source-pgdata' => $node_b->data_dir
-	],
-	'pg_rewind from a stopped source succeeds');
+command_ok([@rewind_from_b], 'pg_rewind from a stopped source succeeds');
 
 ok(-d $node_a->data_dir . '/pg_dwb', 'the target still has a pg_dwb directory');
 {

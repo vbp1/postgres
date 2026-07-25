@@ -313,27 +313,21 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		 */
 		{
 			uint32		cur = pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]);
+			bool		stale = (cur == old_idx);
 
-			if (cur != old_idx)
+			if (stale && cur != DWB_INVALID_BATCH)
+			{
+				uint32		nsi = pg_atomic_read_u32(&DWBCtl->batches[cur].next_slot_idx);
+
+				stale = (nsi & DWB_SEAL_BIT) ||
+					(nsi & DWB_WCLASS_BIT) != DWBWClassBit(wclass);
+			}
+			if (!stale)
 			{
 				LWLockRelease(DWBRingOpenLock);
 				DWBStagingRelease(staging_idx);
 				ConditionVariableCancelSleep();
 				return;
-			}
-			if (cur != DWB_INVALID_BATCH)
-			{
-				uint32		nsi = pg_atomic_read_u32(&DWBCtl->batches[cur].next_slot_idx);
-
-				if (!(nsi & DWB_SEAL_BIT) &&
-					(nsi & DWB_WCLASS_BIT) == DWBWClassBit(wclass))
-				{
-					/* still our live open batch */
-					LWLockRelease(DWBRingOpenLock);
-					DWBStagingRelease(staging_idx);
-					ConditionVariableCancelSleep();
-					return;
-				}
 			}
 		}
 
