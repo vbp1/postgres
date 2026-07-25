@@ -278,9 +278,9 @@ typedef struct xl_parameter_change
 	int			max_prepared_xacts;
 	int			max_locks_per_xact;
 	int			wal_level;
+	int			io_torn_pages_protection;	/* DWBTornPageProtection */
 	bool		wal_log_hints;
 	bool		track_commit_timestamp;
-	int			io_torn_pages_protection;
 } xl_parameter_change;
 
 /* logs restore point */

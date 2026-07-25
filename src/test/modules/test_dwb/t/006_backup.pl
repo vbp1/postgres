@@ -129,8 +129,9 @@ $restored->stop;
 # there — the slots carry the restored control's own generation, and the
 # restored data files are legitimately older than the slot copies — so a
 # start from a base backup (backup_label present) must not apply the ring:
-# it is wiped and recreated cold.  The planted control file is garbage,
-# which without the guard would be a fatal checksum error.
+# it is wiped and recreated cold.  The planted control file is short
+# garbage; reading it would be a fatal "read 16 of 40" error, so this also
+# pins that the wipe comes before any ring-state read.
 my $planted = PostgreSQL::Test::Cluster->new('dwb_planted');
 $planted->init_from_backup($node, 'content_check');
 ok(-f $planted->data_dir . '/backup_label',
@@ -166,6 +167,34 @@ ok( $planted->log_contains(
 		$planted_log_offset),
 	'a later crash of the restored cluster applies the ring normally');
 $planted->stop;
+
+# --- the wipe also covers restores in the non-ring modes ------------------
+
+# A planted ring is dangerous even to a cluster restored under
+# "full_pages": left dormant, it would greet a much later switch to
+# double_writes with a plausible control file.  The restore start must
+# discard it — before any ring-state read, and without tripping the
+# downgrade guard on it.
+my $planted_fp = PostgreSQL::Test::Cluster->new('dwb_planted_fp');
+$planted_fp->init_from_backup($node, 'content_check');
+$planted_fp->append_conf('postgresql.conf',
+	'io_torn_pages_protection = full_pages');
+append_to_file($planted_fp->data_dir . '/pg_dwb/control', 'torn by the tool');
+append_to_file($planted_fp->data_dir . '/pg_dwb/batch_9999', 'foreign slots');
+
+my $planted_fp_log_offset = -s $planted_fp->logfile;
+$planted_fp->start;
+ok( $planted_fp->log_contains(
+		qr/discarding double write buffer ring contents restored from a base backup/,
+		$planted_fp_log_offset),
+	'a full_pages restore discards the planted ring too');
+ok(!-f $planted_fp->data_dir . '/pg_dwb/batch_9999',
+	'... removing the foreign files');
+ok( !$planted_fp->log_contains(qr/ring opened/, $planted_fp_log_offset),
+	'... without creating a ring it will not use');
+is( $planted_fp->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
+	'100', 'restored data is intact under full_pages');
+$planted_fp->stop;
 
 # --- pg_dwb as a symlink backs up as an empty real directory --------------
 

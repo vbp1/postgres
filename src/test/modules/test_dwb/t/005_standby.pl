@@ -155,6 +155,65 @@ $primary->wait_for_catchup($standby);
 is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
 	'10002', 'replication resumed after the primary crash');
 
+# --- a torn page on the standby is repaired by its own apply-pass ---------
+
+# The apply-pass on a crashed standby runs against pg_control state
+# DB_IN_ARCHIVE_RECOVERY — the branch that may raise minRecoveryPoint —
+# and must repair from the standby's OWN ring: the replayed WAL carries no
+# page images that could do it instead.
+sub read_block
+{
+	my ($file, $blkno) = @_;
+	my $buf;
+
+	open my $fh, '<:raw', $file or die "could not open $file: $!";
+	sysseek($fh, $blkno * 8192, 0) or die "could not seek $file: $!";
+	sysread($fh, $buf, 8192) == 8192 or die "short read from $file: $!";
+	close $fh;
+	return $buf;
+}
+
+sub write_block
+{
+	my ($file, $blkno, $buf) = @_;
+
+	open my $fh, '+<:raw', $file or die "could not open $file: $!";
+	sysseek($fh, $blkno * 8192, 0) or die "could not seek $file: $!";
+	syswrite($fh, $buf) == length($buf) or die "short write to $file: $!";
+	close $fh;
+	return;
+}
+
+$primary->safe_psql('postgres', q(
+	CREATE TABLE ts_repair AS SELECT g AS id FROM generate_series(1, 100) g;
+));
+$primary->safe_psql('postgres', 'CHECKPOINT');
+$primary->wait_for_catchup($standby);
+my $ts_path = $primary->safe_psql('postgres',
+	"SELECT pg_relation_filepath('ts_repair')");
+my $ts_relnum = $primary->safe_psql('postgres',
+	"SELECT relfilenode FROM pg_class WHERE relname = 'ts_repair'");
+
+# a restartpoint flushes the replayed pages through the standby's ring;
+# crash right after, while the table's slot is still on disk
+$standby->append_conf('postgresql.conf', 'log_min_messages = debug1');
+$standby->safe_psql('postgres', 'CHECKPOINT');
+$standby->stop('immediate');
+
+my $ts_file = $standby->data_dir . '/' . $ts_path;
+write_block($ts_file, 0,
+	substr(read_block($ts_file, 0), 0, 4096) . ("\0" x 4096));
+
+$standby_log_offset = -s $standby->logfile;
+$standby->start;
+ok( $standby->log_contains(
+		qr!restoring page 0 of relation \d+/\d+/$ts_relnum fork 0!,
+		$standby_log_offset),
+	'the crashed standby repaired its torn page from its own ring');
+$primary->wait_for_catchup($standby);
+is( $standby->safe_psql('postgres', 'SELECT count(*) FROM ts_repair'),
+	'100', 'the repaired standby page reads whole');
+
 # --- promotion with a replay backlog -------------------------------------
 
 # Pause replay, pile up a burst, make sure it is flushed to the standby's

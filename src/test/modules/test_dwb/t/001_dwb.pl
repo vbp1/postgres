@@ -246,7 +246,8 @@ like(
 
 # The on-disk layout follows the geometry GUCs, so a change rebuilds the
 # ring from scratch (after applying the old one if needed — exercised in
-# t/010_recovery.pl); the generation restarts with the fresh control file.
+# t/011_geometry_recovery.pl); the generation restarts with the fresh
+# control file.
 $node->stop;
 my $log_offset = -s $node->logfile;
 $node->append_conf('postgresql.conf', 'dwb_num_batches = 32');

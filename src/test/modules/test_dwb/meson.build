@@ -47,6 +47,7 @@ tests += {
       't/008_modes.pl',
       't/009_fpw_transition.pl',
       't/010_recovery.pl',
+      't/011_geometry_recovery.pl',
     ],
   },
 }

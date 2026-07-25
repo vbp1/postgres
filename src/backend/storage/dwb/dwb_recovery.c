@@ -5,11 +5,12 @@
  *	  the apply-pass that repairs torn data pages, and the durable
  *	  generation protocol around it.
  *
- * On every start (clean, unclean or cold) the durable generation in
- * pg_dwb/control is bumped BEFORE the ring opens for new writes, so slots
- * left behind by the previous run can never masquerade as current after a
- * future crash.  Order: read G -> (ring not cleanly closed) apply-pass over
- * generation G + fsync -> durable control.generation := G+1 -> open ring.
+ * On every double_writes start (clean, unclean or cold) the durable
+ * generation in pg_dwb/control is bumped BEFORE the ring opens for new
+ * writes, so slots left behind by the previous run can never masquerade as
+ * current after a future crash.  Order: read G -> (RING_CLEAN not set)
+ * apply-pass over generation G + fsync -> durable control.generation := G+1
+ * -> open ring.  Starts in the other modes leave the ring untouched.
  *
  * The apply-pass runs before WAL replay and repairs the data files
  * directly: a candidate slot must carry a valid meta_crc, the current
@@ -48,17 +49,26 @@ typedef struct DWBApplyCandidate
 {
 	BufferTag	tag;			/* hash key */
 	XLogRecPtr	lsn;
-	uint64		batch_id;		/* tie-breaker for equal LSNs */
+	uint64		batch_id;		/* tie-breaker for equal LSNs: equal
+								 * generation means one server run, where
+								 * batch_id is monotonic in publication order
+								 * (see DWBBatchHeader.batch_id), so the
+								 * higher id holds the later copy */
 	uint32		batch_idx;
 	uint32		slot_idx;
+	pg_crc32c	image_crc;		/* revalidates the image on re-read */
 } DWBApplyCandidate;
 
-/* one fork the apply-pass has written to and must fsync */
+/* one fork the apply-pass has written to and must fsync (HASH_BLOBS key) */
 typedef struct DWBAppliedFork
 {
 	RelFileLocator rlocator;
 	ForkNumber	forknum;
 } DWBAppliedFork;
+
+StaticAssertDecl(sizeof(DWBAppliedFork) ==
+				 sizeof(RelFileLocator) + sizeof(ForkNumber),
+				 "DWBAppliedFork has padding; unsafe as a HASH_BLOBS key");
 
 static XLogRecPtr DWBApplyPass(const DWBControlFileData *control);
 static void DWBWipeRing(void);
@@ -114,10 +124,10 @@ DWBApplyPass(const DWBControlFileData *control)
 	char	   *disk_buf = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, 0);
 	HASHCTL		info;
 	HTAB	   *candidates;
+	HTAB	   *applied_forks;
 	HASH_SEQ_STATUS seq;
 	DWBApplyCandidate *cand;
-	DWBAppliedFork *applied_forks;
-	int			n_applied_forks = 0;
+	DWBAppliedFork *fork;
 	int			n_candidates = 0;
 	int			n_applied = 0;
 	XLogRecPtr	applied_upto = InvalidXLogRecPtr;
@@ -128,6 +138,12 @@ DWBApplyPass(const DWBControlFileData *control)
 							 (long) control->num_batches * control->batch_pages,
 							 &info,
 							 HASH_ELEM | HASH_BLOBS);
+
+	/* forks written to, for the final fsync sweep */
+	info.keysize = sizeof(DWBAppliedFork);
+	info.entrysize = sizeof(DWBAppliedFork);
+	applied_forks = hash_create("DWB apply-pass forks", 16, &info,
+								HASH_ELEM | HASH_BLOBS);
 
 	/*
 	 * Scan every batch file with the geometry recorded in control.  A batch
@@ -144,7 +160,7 @@ DWBApplyPass(const DWBControlFileData *control)
 		DWBBatchHeader hdr;
 		DWSlotMeta *metas;
 
-		snprintf(path, sizeof(path), DWB_DIR "/batch_%04u", batch_idx);
+		DWBBatchFilePath(path, batch_idx);
 		fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 		if (fd < 0)
 			ereport(ERROR,
@@ -196,6 +212,13 @@ DWBApplyPass(const DWBControlFileData *control)
 			if (!EQ_CRC32C(meta->image_crc, DWBImageCrc(image_buf)))
 				continue;
 
+			/*
+			 * Keep the highest LSN; on equal LSNs the later batch wins (equal
+			 * LSNs with different contents are real: a re-flush after
+			 * hint-bit-only changes does not move the LSN).  Within one batch
+			 * the later slot wins by plain overwrite, matching the order the
+			 * slots were filled in.
+			 */
 			n_candidates++;
 			entry = hash_search(candidates, &meta->tag, HASH_ENTER, &found);
 			if (found &&
@@ -207,6 +230,7 @@ DWBApplyPass(const DWBControlFileData *control)
 			entry->batch_id = hdr.batch_id;
 			entry->batch_idx = batch_idx;
 			entry->slot_idx = slot_idx;
+			entry->image_crc = meta->image_crc;
 		}
 
 		if (CloseTransientFile(fd) != 0)
@@ -222,9 +246,6 @@ DWBApplyPass(const DWBControlFileData *control)
 	 * skipped: there is nothing to repair and replay or a replayed truncate
 	 * drives the final state.
 	 */
-	applied_forks = palloc(sizeof(DWBAppliedFork) *
-						   hash_get_num_entries(candidates));
-
 	hash_seq_init(&seq, candidates);
 	while ((cand = hash_seq_search(&seq)) != NULL)
 	{
@@ -234,7 +255,7 @@ DWBApplyPass(const DWBControlFileData *control)
 		SMgrRelation reln;
 		char		path[MAXPGPATH];
 		int			fd;
-		bool		known_fork;
+		DWBAppliedFork fkey;
 
 		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
 		if (!smgrexists(reln, forknum))
@@ -243,12 +264,29 @@ DWBApplyPass(const DWBControlFileData *control)
 			continue;
 
 		smgrread(reln, forknum, blkno, disk_buf);
+
+		/*
+		 * A "new" page (empty header) is never repaired.  Every staged image
+		 * is an initialized page, so an empty on-disk header means the
+		 * covered write's first sector never reached disk and the block had
+		 * never held an initialized page before — its init record therefore
+		 * lies after the last checkpoint, and replay recreates the page
+		 * without reading the current contents.  The skip is also required
+		 * for correctness in the other direction: after a truncate +
+		 * re-extend within one generation the ring can hold a pre-truncate
+		 * copy of this block, and the re-extended zeroed page (LSN 0) would
+		 * lose the LSN comparison below to that stale image, which nothing
+		 * would then replay over.
+		 */
+		if (PageIsNew((Page) disk_buf))
+			continue;
+
 		if (PageIsVerified((Page) disk_buf, blkno, PIV_LOG_LOG, NULL) &&
 			PageGetLSN((Page) disk_buf) >= cand->lsn)
 			continue;
 
 		/* re-read the winning copy; the scan buffer is long overwritten */
-		snprintf(path, sizeof(path), DWB_DIR "/batch_%04u", cand->batch_idx);
+		DWBBatchFilePath(path, (int) cand->batch_idx);
 		fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 		if (fd < 0)
 			ereport(ERROR,
@@ -261,6 +299,18 @@ DWBApplyPass(const DWBControlFileData *control)
 					(errcode_for_file_access(),
 					 errmsg("could not close file \"%s\": %m", path)));
 
+		/*
+		 * The image was CRC-checked during the scan, but this is a second
+		 * physical read; a divergence means the storage returned different
+		 * bytes twice, and writing them over a data page would defeat the
+		 * pass's whole purpose.
+		 */
+		if (!EQ_CRC32C(cand->image_crc, DWBImageCrc(image_buf)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("page image in file \"%s\" slot %u failed verification on re-read",
+							path, cand->slot_idx)));
+
 		elog(DEBUG1, "double write buffer recovery: restoring page %u of relation %u/%u/%u fork %d from batch %u slot %u (LSN %X/%X)",
 			 blkno, rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
 			 forknum, cand->batch_idx, cand->slot_idx,
@@ -272,36 +322,23 @@ DWBApplyPass(const DWBControlFileData *control)
 		if (cand->lsn > applied_upto)
 			applied_upto = cand->lsn;
 
-		known_fork = false;
-		for (int i = 0; i < n_applied_forks; i++)
-		{
-			if (RelFileLocatorEquals(applied_forks[i].rlocator, rlocator) &&
-				applied_forks[i].forknum == forknum)
-			{
-				known_fork = true;
-				break;
-			}
-		}
-		if (!known_fork)
-		{
-			applied_forks[n_applied_forks].rlocator = rlocator;
-			applied_forks[n_applied_forks].forknum = forknum;
-			n_applied_forks++;
-		}
+		fkey.rlocator = rlocator;
+		fkey.forknum = forknum;
+		(void) hash_search(applied_forks, &fkey, HASH_ENTER, NULL);
 	}
 
 	/* make the repairs durable before the generation moves on */
-	for (int i = 0; i < n_applied_forks; i++)
-		smgrimmedsync(smgropen(applied_forks[i].rlocator,
-							   INVALID_PROC_NUMBER),
-					  applied_forks[i].forknum);
+	hash_seq_init(&seq, applied_forks);
+	while ((fork = hash_seq_search(&seq)) != NULL)
+		smgrimmedsync(smgropen(fork->rlocator, INVALID_PROC_NUMBER),
+					  fork->forknum);
 
 	ereport(LOG,
 			(errmsg("double write buffer recovery: %d of %d candidate pages restored, generation " UINT64_FORMAT,
 					n_applied, n_candidates, control->generation)));
 
 	hash_destroy(candidates);
-	pfree(applied_forks);
+	hash_destroy(applied_forks);
 	pfree(meta_buf);
 	pfree(image_buf);
 	pfree(disk_buf);
@@ -313,6 +350,13 @@ DWBApplyPass(const DWBControlFileData *control)
  * Durably remove the contents of pg_dwb/, keeping the directory (or the
  * symlink to it) in place.  Used when a restored backup ships a foreign
  * ring and when the geometry GUCs changed.
+ *
+ * The control file goes first, durably: a crash in the middle of the batch
+ * sweep must not leave a readable control beside missing batch files, or a
+ * retried apply-pass would hard-fail on the ENOENT forever.  With the
+ * control gone first, a retry takes the cold-create path (which itself
+ * wipes leftovers) — correct for both callers, since the apply-pass, if
+ * one was needed, ran to completion before any wipe starts.
  */
 static void
 DWBWipeRing(void)
@@ -327,6 +371,13 @@ DWBWipeRing(void)
 				(errcode_for_file_access(),
 				 errmsg("could not stat directory \"%s\": %m", DWB_DIR)));
 	}
+
+	if (unlink(DWB_CONTROL_FILE) < 0 && errno != ENOENT)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not remove file \"%s\": %m",
+						DWB_CONTROL_FILE)));
+	fsync_fname(DWB_DIR, true);
 
 	if (!rmtree(DWB_DIR, false))
 		ereport(FATAL,
@@ -344,29 +395,39 @@ DWBWipeRing(void)
  * metas.  Returns the highest LSN the apply-pass wrote to a data file, or
  * InvalidXLogRecPtr.
  *
- * unclean_start is the caller's pg_control verdict (neither DB_SHUTDOWNED
- * state).  The apply-pass additionally keys on the ring's own RING_CLEAN
- * marker: a standby's shutdown restartpoint can be skipped entirely,
- * leaving retirement fsyncs pending, and then only the marker knows the
- * ring still covers data writes that may not have reached disk.
+ * Whether the apply-pass must run is decided by the ring's own RING_CLEAN
+ * marker alone, never by the pg_control state.  The marker is the exact
+ * certificate: it is set only after full retirement (so while it is set,
+ * no slot covers a data write that has not reached disk) and cleared
+ * before the ring reopens (so slots of the clearing run are covered until
+ * the next clean shutdown re-sets it).  pg_control can be both cleaner and
+ * dirtier than the ring: a standby's shutdown restartpoint can be skipped
+ * entirely, leaving retirement fsyncs pending behind a clean pg_control —
+ * and a crash under an interim full_pages/off run (which touches neither
+ * the marker nor the generation) leaves an unclean pg_control over a fully
+ * retired ring whose stale slots still match the current generation, where
+ * an apply would resurrect ancient pages over blocks torn long after the
+ * ring was closed.
  *
  * restoring_backup means the data directory is a restored base backup
- * (backup_label present, or pg_control still carries backupStartPoint
- * after a crash mid-backup-recovery).  Any ring found in that case was
- * shipped by a third-party backup tool and must not be applied: its slots
- * carry the restored control's own generation, and the restored data files
- * are legitimately older than the slot copies, so both staleness defences
- * pass — an unguarded apply would push pages from the future of the backup
- * into a PITR target.  The WAL of the backup window carries forced full
- * page images instead, so the ring is not needed for this recovery; it is
+ * (backup_label present, or pg_control still carrying backupStartPoint
+ * after a crash mid-backup-recovery).  A ring found in that case — shipped
+ * by a third-party backup tool, or this server's own from a crashed
+ * backup-recovery run — must not be applied: its slots carry the restored
+ * control's own generation, and the restored data files are legitimately
+ * older than the slot copies, so both staleness defences pass — an
+ * unguarded apply would push pages from the future of the backup into a
+ * PITR target.  The WAL of the backup window carries forced full page
+ * images instead, so the ring is not needed for this recovery; it is
  * wiped and recreated cold.
  */
 XLogRecPtr
-DWBStartup(bool unclean_start, bool restoring_backup)
+DWBStartup(bool restoring_backup)
 {
 	DWBControlFileData control;
 	XLogRecPtr	applied_upto = InvalidXLogRecPtr;
 	bool		created = false;
+	bool		corrupt;
 	bool		need_apply;
 
 	if (!DWBIsEnabled())
@@ -388,6 +449,8 @@ DWBStartup(bool unclean_start, bool restoring_backup)
 			 * lying dormant: a much later switch to double_writes would find
 			 * it with a plausible control file.  Discard it now.
 			 */
+			ereport(LOG,
+					(errmsg("discarding double write buffer ring contents restored from a base backup")));
 			DWBWipeRing();
 			return InvalidXLogRecPtr;
 		}
@@ -400,16 +463,35 @@ DWBStartup(bool unclean_start, bool restoring_backup)
 		 * failure under data_sync_retry) leaves RING_CLEAN unset, and the
 		 * pending data writes it covers are exactly as unprotected.
 		 */
-		if (DWBReadControlFile(&control, true) &&
-			(control.flags & DWB_CONTROL_RING_CLEAN) == 0)
+		if (DWBReadControlFile(&control, true, &corrupt))
+		{
+			if ((control.flags & DWB_CONTROL_RING_CLEAN) == 0)
+				ereport(FATAL,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the double write buffer ring was not cleanly shut down, cannot start with \"io_torn_pages_protection=%s\"",
+								DWBProtectionModeName(io_torn_pages_protection)),
+						 errdetail("The ring in \"%s\" may hold repairs of torn data pages that have not been applied.",
+								   DWB_DIR),
+						 errhint("Start the server once with \"io_torn_pages_protection=double_writes\" and shut it down cleanly, or remove \"%s\" if you accept the risk of torn data pages.",
+								 DWB_DIR)));
+		}
+		else if (corrupt)
+		{
+			/*
+			 * An unreadable ring state must not block modes that never touch
+			 * the ring with a bare low-level error: name the way out.  (A
+			 * double_writes start would refuse too, so the only cure is
+			 * removal.)
+			 */
 			ereport(FATAL,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("the double write buffer ring was not cleanly shut down, cannot start with \"io_torn_pages_protection=%s\"",
+					 errmsg("the double write buffer ring state could not be validated, cannot start with \"io_torn_pages_protection=%s\"",
 							DWBProtectionModeName(io_torn_pages_protection)),
-					 errdetail("The ring in \"%s\" may hold repairs of torn data pages that have not been applied.",
+					 errdetail("The control file in \"%s\" is unreadable or corrupt, and the ring may hold repairs of torn data pages that have not been applied.",
 							   DWB_DIR),
-					 errhint("Start the server once with \"io_torn_pages_protection=double_writes\" and shut it down cleanly, or remove \"%s\" if you accept the risk of torn data pages.",
+					 errhint("Remove \"%s\" if you accept the risk of torn data pages.",
 							 DWB_DIR)));
+		}
 		return InvalidXLogRecPtr;
 	}
 
@@ -427,22 +509,27 @@ DWBStartup(bool unclean_start, bool restoring_backup)
 		DWBWipeRing();
 	}
 
-	if (!DWBReadControlFile(&control, true))
+	if (!DWBReadControlFile(&control, true, NULL))
 	{
-		/* cold start: no ring yet */
+		/*
+		 * Cold start: no ring yet.  Sweep the directory first — an
+		 * interrupted wipe can leave batch files behind after the control
+		 * file is gone.
+		 */
+		DWBWipeRing();
 		DWBCreateRing();
 		created = true;
-		if (!DWBReadControlFile(&control, false))
+		if (!DWBReadControlFile(&control, false, NULL))
 			pg_unreachable();
 	}
 
 	/*
-	 * The pg_control verdict alone is not enough: see the RING_CLEAN
-	 * discussion in the header comment.  A freshly created ring has nothing
-	 * to apply even though its marker is unset.
+	 * The RING_CLEAN marker alone decides (see the DWBStartup comment above
+	 * for why pg_control must not weigh in).  A freshly created ring has
+	 * nothing to apply even though its marker is unset.
 	 */
 	need_apply = !created &&
-		(unclean_start || (control.flags & DWB_CONTROL_RING_CLEAN) == 0);
+		(control.flags & DWB_CONTROL_RING_CLEAN) == 0;
 
 	if (!created &&
 		(control.num_batches != (uint32) dwb_num_batches ||
@@ -463,7 +550,7 @@ DWBStartup(bool unclean_start, bool restoring_backup)
 						dwb_num_batches, dwb_batch_pages)));
 		DWBWipeRing();
 		DWBCreateRing();
-		if (!DWBReadControlFile(&control, false))
+		if (!DWBReadControlFile(&control, false, NULL))
 			pg_unreachable();
 	}
 	else if (need_apply)
@@ -532,7 +619,7 @@ DWBMarkCleanShutdown(void)
 		}
 	}
 
-	if (!DWBReadControlFile(&control, false))
+	if (!DWBReadControlFile(&control, false, NULL))
 		pg_unreachable();
 	control.flags |= DWB_CONTROL_RING_CLEAN;
 	control.crc = DWBControlCrc(&control);

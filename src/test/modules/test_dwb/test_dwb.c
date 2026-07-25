@@ -199,7 +199,7 @@ count_ring_slots(bool current_only, bool have_filter, Oid relnumber)
 	char	   *image;
 	int			valid = 0;
 
-	if (!DWBReadControlFile(&control, false))
+	if (!DWBReadControlFile(&control, false, NULL))
 		pg_unreachable();
 
 	meta_region = DWBMetaRegionSize(control.batch_pages);

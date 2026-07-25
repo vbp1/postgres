@@ -330,7 +330,9 @@ main(int argc, char **argv)
 	 * any way.  A stopped source has no such requirement.  The mode is read
 	 * from the source's pg_control — the authoritative record, unlike the
 	 * legacy full_page_writes GUC, which only matters under "full_pages" and
-	 * is checked in init_libpq_source.
+	 * is checked by init_libpq_conn when the connection is made (so a
+	 * double_writes source with full_page_writes=off draws that message, not
+	 * this one).
 	 */
 	if (connstr_source)
 	{

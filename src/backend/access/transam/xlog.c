@@ -5630,28 +5630,60 @@ StartupXLOG(void)
 		bool		restoring_backup;
 		XLogRecPtr	dwb_applied_upto;
 
-		restoring_backup =
-			!XLogRecPtrIsInvalid(ControlFile->backupStartPoint) ||
-			access(BACKUP_LABEL_FILE, F_OK) == 0;
-
-		dwb_applied_upto = DWBStartup(didCrash, restoring_backup);
+		/*
+		 * A failure to probe for backup_label must fail closed: reading its
+		 * absence out of an EACCES/EIO would drop the one guard that keeps a
+		 * ring shipped inside a base backup from being applied into the
+		 * restored cluster.  (read_backup_label treats a failing open the
+		 * same way.)
+		 */
+		if (access(BACKUP_LABEL_FILE, F_OK) == 0)
+			restoring_backup = true;
+		else if (errno != ENOENT)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not access file \"%s\": %m",
+							BACKUP_LABEL_FILE)));
+		else
+			restoring_backup =
+				!XLogRecPtrIsInvalid(ControlFile->backupStartPoint);
 
 		/*
-		 * On a crashed standby, consistency must not be declared before the
-		 * local WAL covers the repaired pages.  The write path guarantees
-		 * minRecoveryPoint already does — FlushBuffer's XLogFlush advances
-		 * it durably before the page can enter the ring — so this raise is
-		 * expected to be a no-op; it stays as a belt-and-braces enforcement
-		 * of the invariant.  The timeline is left alone: any LSN the ring can
-		 * hold lies on a timeline minRecoveryPoint has already seen, by the
-		 * same write-path argument.
+		 * Crash recovery over WAL generated without any torn page protection
+		 * cannot repair pages the crash tore, whatever the local mode says
+		 * now.  The mode-based FATAL in CheckRequiredParameterValues covers
+		 * archive recovery only, so this is the one transition that would
+		 * otherwise be silent.
 		 */
-		if (ControlFile->state == DB_IN_ARCHIVE_RECOVERY &&
+		if (didCrash &&
+			ControlFile->io_torn_pages_protection == DWB_PROTECT_OFF &&
+			io_torn_pages_protection != DWB_PROTECT_OFF)
+			ereport(WARNING,
+					(errmsg("database system was interrupted while torn page protection was disabled"),
+					 errdetail("WAL generated with \"io_torn_pages_protection=off\" carries no full page images; pages torn by the crash cannot be repaired by this recovery.")));
+
+		dwb_applied_upto = DWBStartup(restoring_backup);
+
+		/*
+		 * On a standby that did not durably retire the ring — whether it
+		 * crashed or merely skipped its shutdown restartpoint — consistency
+		 * must not be declared before the local WAL covers the repaired
+		 * pages.  The write path guarantees minRecoveryPoint already does —
+		 * FlushBuffer's XLogFlush advances it durably before the page can
+		 * enter the ring — so this raise is expected to be a no-op; it
+		 * stays as a belt-and-braces enforcement of the invariant.  The
+		 * timeline is left alone: any LSN the ring can hold lies on a
+		 * timeline minRecoveryPoint has already seen, by the same write-path
+		 * argument.
+		 */
+		if ((ControlFile->state == DB_IN_ARCHIVE_RECOVERY ||
+			 ControlFile->state == DB_SHUTDOWNED_IN_RECOVERY) &&
 			!XLogRecPtrIsInvalid(ControlFile->minRecoveryPoint) &&
 			dwb_applied_upto > ControlFile->minRecoveryPoint)
 		{
-			elog(LOG, "raising minimum recovery point to %X/%X to cover pages repaired from the double write buffer",
-				 LSN_FORMAT_ARGS(dwb_applied_upto));
+			ereport(LOG,
+					(errmsg("raising minimum recovery point to %X/%X to cover pages repaired from the double write buffer",
+							LSN_FORMAT_ARGS(dwb_applied_upto))));
 			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 			ControlFile->minRecoveryPoint = dwb_applied_upto;
 			UpdateControlFile();
@@ -8239,6 +8271,10 @@ XLogReportParameters(void)
 		 * with wal_level=minimal anyway. We don't really care about the
 		 * values in pg_control either if wal_level=minimal, but seems better
 		 * to keep them up-to-date to avoid confusion.
+		 *
+		 * An io_torn_pages_protection change is always WAL-logged: replay
+		 * must learn the generating server's mode, because the FATAL in
+		 * CheckRequiredParameterValues keys on it.
 		 */
 		if (wal_level != ControlFile->wal_level ||
 			io_torn_pages_protection != ControlFile->io_torn_pages_protection ||
@@ -8376,9 +8412,11 @@ UpdateFullPageWrites(void)
  * off) emits no XLOG_FPW_CHANGE — its checkpoints are the only replayed
  * evidence of the change (see UpdateFullPageWrites).
  *
- * A server that replays image-less WAL while expecting full-page protection
- * is refused outright by CheckRequiredParameterValues, keyed on the
- * generating server's io_torn_pages_protection in pg_control.
+ * Only the mode-based loss of images is refused by
+ * CheckRequiredParameterValues (keyed on the generating server's
+ * io_torn_pages_protection in pg_control); the legacy case — a "full_pages"
+ * primary running with full_page_writes = off — still replays, and this
+ * tracking is what lets the backup guards reject it.
  */
 static void
 XLogTrackFullPageWritesDisabled(XLogReaderState *record, bool fpw)

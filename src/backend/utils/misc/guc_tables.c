@@ -356,6 +356,7 @@ static const struct config_enum_entry synchronous_commit_options[] = {
 	{NULL, 0, false}
 };
 
+/* keep the spellings in sync with DWBProtectionModeName() in pg_control.h */
 static const struct config_enum_entry io_torn_pages_protection_options[] = {
 	{"off", DWB_PROTECT_OFF, false},
 	{"full_pages", DWB_PROTECT_FULL_PAGES, false},

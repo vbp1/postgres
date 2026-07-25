@@ -8,6 +8,7 @@
 
 use strict;
 use warnings FATAL => 'all';
+use File::Path qw(rmtree);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -133,5 +134,52 @@ is( $node->safe_psql('postgres', 'SHOW io_torn_pages_protection'),
 	'full_pages', 'after a clean stop the mode change is legal');
 ok( !$node->log_contains(qr/ring opened/, $log_offset),
 	'... and the leftover ring stays closed');
+
+# --- reopening the ring re-arms the guard --------------------------------
+
+# A double_writes start clears RING_CLEAN before the ring reopens, so a
+# crash of that run leaves the marker unset and the guard must fire again:
+# the marker certifies one clean closure, not a permanent state.
+$node->stop;
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = double_writes');
+$node->start;
+$node->stop('immediate');
+
+$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$ret = $node->start(fail_ok => 1);
+is($ret, 0, 'a crash after reopening the ring re-arms the guard');
+
+# close it cleanly once more
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = double_writes');
+$node->start;
+$node->stop;
+
+# --- a corrupt ring control is refused, with a way out -------------------
+
+# Modes that never touch the ring must still refuse an unreadable control
+# (the ring may hold unapplied repairs), but with a message naming the
+# removal recipe instead of a bare low-level read error.
+my $control = $node->data_dir . '/pg_dwb/control';
+open my $fh, '>', $control or die "open $control: $!";
+binmode $fh;
+print $fh "\x00" x 16;
+close $fh;
+
+$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$log_offset = -s $node->logfile;
+$ret = $node->start(fail_ok => 1);
+is($ret, 0, 'a corrupt ring control refuses a full_pages start');
+ok( $node->log_contains(
+		qr/FATAL: .* the double write buffer ring state could not be validated, cannot start with "io_torn_pages_protection=full_pages"/,
+		$log_offset),
+	'... naming the ring state as the problem');
+
+# the hint's recipe: removing pg_dwb unblocks the start
+rmtree($node->data_dir . '/pg_dwb');
+$node->start;
+is( $node->safe_psql('postgres', 'SHOW io_torn_pages_protection'),
+	'full_pages', 'removing pg_dwb unblocks the non-ring mode');
 
 done_testing();

@@ -108,7 +108,11 @@ typedef struct DWBControlFileData
 	uint32		batch_pages;
 	uint32		flags;			/* DWB_CONTROL_* */
 	uint64		generation;		/* apply-pass horizon: bumped durably on every
-								 * start before the ring opens */
+								 * double_writes start before the ring opens.
+								 * Monotonic within one ring incarnation; a
+								 * geometry-change recreate restarts it at
+								 * zero, which is safe because the wipe leaves
+								 * no CRC-valid slot behind */
 	pg_crc32c	crc;			/* CRC of all preceding fields */
 } DWBControlFileData;
 
@@ -116,9 +120,16 @@ typedef struct DWBControlFileData
  * DWBControlFileData.flags.  RING_CLEAN certifies that every data-file write
  * covered by an on-disk slot had been fsynced when the server shut down: it
  * is written at the end of a clean shutdown after the ring is fully retired,
- * and cleared by the next startup before the ring reopens.  While it is set,
- * the ring holds no unapplied repairs, so the apply-pass can be skipped and
- * a start under a different io_torn_pages_protection mode is legal.
+ * and cleared by the next double_writes startup before the ring reopens.
+ * While it is set, the ring holds no unapplied repairs, so the apply-pass
+ * must be skipped (non-double_writes runs in between leave the generation
+ * untouched, so old slots would otherwise still match it) and a start under
+ * a different io_torn_pages_protection mode is legal.
+ *
+ * The flags field occupies what was interior alignment padding in version-1
+ * control files; those read back with flags == 0 (the padding was always
+ * memset and CRC-covered), which is the safe "not clean" state, so filling
+ * the hole needed no DWB_VERSION bump.
  */
 #define DWB_CONTROL_RING_CLEAN	0x0001
 
@@ -126,7 +137,11 @@ typedef struct DWBBatchHeader
 {
 	uint32		magic;
 	uint32		version;
-	uint64		batch_id;
+	uint64		batch_id;		/* incarnation id, monotonic in publication
+								 * order within one server run (next_batch_id
+								 * restarts at 1 with each start); the
+								 * apply-pass relies on this to break LSN ties
+								 * between slots of one generation */
 	uint32		n_slots;		/* capped_slots at seal time */
 	pg_crc32c	crc;			/* CRC of all preceding fields */
 } DWBBatchHeader;
@@ -374,7 +389,9 @@ pg_noreturn extern void DWBRetireWorkerMain(Datum main_arg);
 
 /* dwb_file.c */
 extern void DWBCreateRing(void);
-extern bool DWBReadControlFile(DWBControlFileData *control, bool missing_ok);
+extern void DWBBatchFilePath(char *path, int batch_idx);
+extern bool DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
+							   bool *corruptp);
 extern void DWBWriteControlFile(const DWBControlFileData *control);
 extern int	DWBOpenBatchFile(int batch_idx);
 extern void DWBPrepareBatchWrite(int batch_idx);
@@ -387,7 +404,7 @@ extern pg_crc32c DWBControlCrc(const DWBControlFileData *control);
 extern pg_crc32c DWBBatchHeaderCrc(const DWBBatchHeader *hdr);
 
 /* dwb_recovery.c */
-extern XLogRecPtr DWBStartup(bool unclean_start, bool restoring_backup);
+extern XLogRecPtr DWBStartup(bool restoring_backup);
 extern void DWBMarkCleanShutdown(void);
 
 #endif							/* DWB_H */

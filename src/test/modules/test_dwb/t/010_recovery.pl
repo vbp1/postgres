@@ -203,4 +203,61 @@ write_block($tstale_file, 0, $tstale_good);
 is( $node->safe_psql('postgres', 'SELECT count(*) FROM tstale'),
 	'100', 'page manually restored, cluster consistent');
 
+# --- the marker alone triggers the pass, not the pg_control state --------
+
+# Leave a crashed ring behind a CLEAN pg_control: stash the ring right
+# after a crash, run a clean stop cycle, then put the crashed ring back.
+# Only the unset RING_CLEAN marker knows this ring was never retired — a
+# standby whose shutdown restartpoint was skipped leaves exactly this
+# combination, and the pass must key on the marker, not on pg_control.
+$node->safe_psql('postgres', q(
+	CREATE TABLE tmark AS SELECT g AS id FROM generate_series(1, 100) g;
+));
+$node->safe_psql('postgres', 'CHECKPOINT');
+my $tmark_file =
+  $node->data_dir . '/'
+  . $node->safe_psql('postgres', "SELECT pg_relation_filepath('tmark')");
+$node->stop('immediate');
+
+my $mark_stash = $node->basedir . '/mark_stash';
+PostgreSQL::Test::RecursiveCopy::copypath($node->data_dir . '/pg_dwb',
+	$mark_stash);
+
+$node->start;
+$node->stop;
+
+rmtree($node->data_dir . '/pg_dwb');
+PostgreSQL::Test::RecursiveCopy::copypath($mark_stash,
+	$node->data_dir . '/pg_dwb');
+write_block($tmark_file, 0,
+	substr(read_block($tmark_file, 0), 0, 4096) . ("\0" x 4096));
+
+$log_offset = -s $node->logfile;
+$node->start;
+ok( $node->log_contains(
+		qr/double write buffer recovery: 1 of 1 candidate pages restored/,
+		$log_offset),
+	'unretired ring is applied despite a clean pg_control');
+is( $node->safe_psql('postgres', 'SELECT count(*) FROM tmark'),
+	'100', 'torn page behind a clean shutdown is whole again');
+
+# --- a slot for a dropped relation is skipped ----------------------------
+
+# The relation's file may survive as an empty tombstone until the next
+# checkpoint, or be gone entirely; either way there is nothing to repair
+# and the pass must not trip over it.
+$node->safe_psql('postgres', q(
+	CREATE TABLE tdrop AS SELECT g AS id FROM generate_series(1, 100) g;
+));
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->safe_psql('postgres', 'DROP TABLE tdrop');
+$node->stop('immediate');
+
+$log_offset = -s $node->logfile;
+$node->start;
+ok( $node->log_contains(
+		qr/double write buffer recovery: 0 of 1 candidate pages restored/,
+		$log_offset),
+	'a candidate for a dropped relation is counted but skipped');
+
 done_testing();

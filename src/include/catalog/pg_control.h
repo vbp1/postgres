@@ -30,23 +30,29 @@
 /*
  * The torn-page protection mechanism (GUC io_torn_pages_protection).  Like
  * wal_level, the value in force on the WAL-generating server is a protocol
- * fact: it decides whether the WAL carries full page images, so it is
- * recorded in pg_control and in XLOG_PARAMETER_CHANGE records for replay to
- * track.  Defined here rather than in storage/dwb.h so that frontend code
- * reading pg_control can use it.
+ * fact: it decides whether the WAL can carry full page images at all (under
+ * "full_pages" the legacy full_page_writes GUC still chooses whether it
+ * actually does), so it is recorded in pg_control and in
+ * XLOG_PARAMETER_CHANGE records for replay to track.  Defined here rather
+ * than in storage/dwb.h so that frontend code reading pg_control can use it.
+ *
+ * The numeric values are stored on disk and in WAL; never renumber the
+ * members.  Keep the names in sync with the GUC option list in
+ * guc_tables.c.
  */
 typedef enum
 {
-	DWB_PROTECT_OFF,
-	DWB_PROTECT_FULL_PAGES,
-	DWB_PROTECT_DOUBLE_WRITES,
+	DWB_PROTECT_OFF = 0,
+	DWB_PROTECT_FULL_PAGES = 1,
+	DWB_PROTECT_DOUBLE_WRITES = 2,
 } DWBTornPageProtection;
 
 /* GUC-spelling name of a DWBTornPageProtection value, for messages */
 static inline const char *
 DWBProtectionModeName(int mode)
 {
-	switch (mode)
+	/* the cast keeps -Wswitch honest about newly added members */
+	switch ((DWBTornPageProtection) mode)
 	{
 		case DWB_PROTECT_OFF:
 			return "off";
@@ -55,6 +61,7 @@ DWBProtectionModeName(int mode)
 		case DWB_PROTECT_DOUBLE_WRITES:
 			return "double_writes";
 	}
+	/* garbage read from disk or WAL must not turn into UB */
 	return "unrecognized";
 }
 
@@ -207,6 +214,7 @@ typedef struct ControlFileData
 	 * or hot standby.
 	 */
 	int			wal_level;
+	int			io_torn_pages_protection;	/* DWBTornPageProtection */
 	bool		wal_log_hints;
 	int			MaxConnections;
 	int			max_worker_processes;
@@ -214,7 +222,6 @@ typedef struct ControlFileData
 	int			max_prepared_xacts;
 	int			max_locks_per_xact;
 	bool		track_commit_timestamp;
-	int			io_torn_pages_protection;	/* DWBTornPageProtection */
 
 	/*
 	 * This data is used to check for hardware-architecture compatibility of
