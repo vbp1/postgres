@@ -124,7 +124,10 @@ typedef struct DWBControlFileData
  * While it is set, the ring holds no unapplied repairs, so the apply-pass
  * must be skipped (non-double_writes runs in between leave the generation
  * untouched, so old slots would otherwise still match it) and a start under
- * a different io_torn_pages_protection mode is legal.
+ * a different io_torn_pages_protection mode is legal.  Any new code path
+ * that opens the ring for writes must clear the marker in the same control
+ * write that bumps the generation — the marker-only apply decision is
+ * sound only while set-marker implies untouched-since-retirement.
  *
  * The flags field occupies what was interior alignment padding in version-1
  * control files; those read back with flags == 0 (the padding was always
@@ -137,11 +140,16 @@ typedef struct DWBBatchHeader
 {
 	uint32		magic;
 	uint32		version;
-	uint64		batch_id;		/* incarnation id, monotonic in publication
-								 * order within one server run (next_batch_id
-								 * restarts at 1 with each start); the
-								 * apply-pass relies on this to break LSN ties
-								 * between slots of one generation */
+	uint64		batch_id;		/* incarnation id, assigned at batch open,
+								 * monotonic in open order within one server
+								 * run (next_batch_id restarts at 1 with each
+								 * start); the apply-pass breaks LSN ties
+								 * between slots of one generation by it — a
+								 * deterministic pick, not a strict later-copy
+								 * guarantee: with two writer classes a later
+								 * flush can land in an earlier-opened batch,
+								 * but equal-LSN copies differ only in hint
+								 * bits */
 	uint32		n_slots;		/* capped_slots at seal time */
 	pg_crc32c	crc;			/* CRC of all preceding fields */
 } DWBBatchHeader;

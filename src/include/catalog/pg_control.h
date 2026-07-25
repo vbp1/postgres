@@ -22,7 +22,7 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	1801
+#define PG_CONTROL_VERSION	1802
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32

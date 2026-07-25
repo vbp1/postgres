@@ -156,6 +156,24 @@ $node->append_conf('postgresql.conf',
 $node->start;
 $node->stop;
 
+# --- a standing marker suppresses the pass even over a crash -------------
+
+# The reverse direction of the marker keying: a crash under an interim
+# full_pages run (which touches neither the marker nor the generation)
+# must NOT re-arm the ring — an apply here would resurrect ancient
+# same-generation slots over pages torn long after the ring was closed.
+$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$node->start;
+$node->stop('immediate');
+
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = double_writes');
+$log_offset = -s $node->logfile;
+$node->start;
+ok( !$node->log_contains(qr/double write buffer recovery:/, $log_offset),
+	'a crash under an interim mode does not re-arm the apply-pass');
+$node->stop;
+
 # --- a corrupt ring control is refused, with a way out -------------------
 
 # Modes that never touch the ring must still refuse an unreadable control
@@ -181,5 +199,22 @@ rmtree($node->data_dir . '/pg_dwb');
 $node->start;
 is( $node->safe_psql('postgres', 'SHOW io_torn_pages_protection'),
 	'full_pages', 'removing pg_dwb unblocks the non-ring mode');
+
+# --- a crash under "off" is announced on the next protected start --------
+
+# Nothing can repair pages torn by a crash that happened while WAL carried
+# no images and no ring was active; the restart into a protected mode must
+# say so instead of recovering in silence.
+$node->append_conf('postgresql.conf', 'io_torn_pages_protection = off');
+$node->restart;
+$node->stop('immediate');
+
+$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$log_offset = -s $node->logfile;
+$node->start;
+ok( $node->log_contains(
+		qr/WARNING: .* database system was interrupted while torn page protection was disabled/,
+		$log_offset),
+	'crash under "off" draws a warning on the protected restart');
 
 done_testing();

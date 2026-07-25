@@ -93,8 +93,11 @@ DWBBatchFilePath(char *path, int batch_idx)
  * a damaged control file must not silently degrade the apply-pass.
  *
  * A caller that can refuse startup with a more helpful message than the
- * low-level FATALs may pass corruptp: any failure other than a tolerated
- * ENOENT then sets *corruptp and returns false instead.
+ * low-level FATALs may pass corruptp: an unreadable or corrupt file then
+ * sets *corruptp and returns false instead, with the specific cause
+ * reported at LOG so it is not lost behind the caller's summary.  A
+ * too-new format version is FATAL either way: that ring is intact, and
+ * "corrupt" advice would invite discarding it.
  */
 bool
 DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
@@ -113,6 +116,10 @@ DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
 			return false;
 		if (corruptp)
 		{
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m",
+							DWB_CONTROL_FILE)));
 			*corruptp = true;
 			return false;
 		}
@@ -129,8 +136,24 @@ DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
 	{
 		if (corruptp)
 		{
+			/* distinguish a real read error from a truncated file */
+			if (r < 0)
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not read file \"%s\": %m",
+								DWB_CONTROL_FILE)));
+			else
+				ereport(LOG,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("could not read file \"%s\": read %d of %zu",
+								DWB_CONTROL_FILE, r,
+								sizeof(DWBControlFileData))));
+			if (CloseTransientFile(fd) != 0)
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not close file \"%s\": %m",
+								DWB_CONTROL_FILE)));
 			*corruptp = true;
-			CloseTransientFile(fd);
 			return false;
 		}
 		/* distinguish a real read error from a truncated file */
@@ -150,25 +173,27 @@ DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
 				 errmsg("could not close file \"%s\": %m", DWB_CONTROL_FILE)));
 
 	if (control->magic != DWB_CONTROL_MAGIC ||
-		!EQ_CRC32C(control->crc, DWBControlCrc(control)) ||
-		control->min_version > DWB_VERSION)
+		!EQ_CRC32C(control->crc, DWBControlCrc(control)))
 	{
 		if (corruptp)
 		{
-			*corruptp = true;
-			return false;
-		}
-		if (control->magic != DWB_CONTROL_MAGIC ||
-			!EQ_CRC32C(control->crc, DWBControlCrc(control)))
-			ereport(FATAL,
+			ereport(LOG,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid checksum or magic number in file \"%s\"",
 							DWB_CONTROL_FILE)));
+			*corruptp = true;
+			return false;
+		}
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid checksum or magic number in file \"%s\"",
+						DWB_CONTROL_FILE)));
+	}
+	if (control->min_version > DWB_VERSION)
 		ereport(FATAL,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("file \"%s\" requires format version at least %u, but this server supports %u",
 						DWB_CONTROL_FILE, control->min_version, DWB_VERSION)));
-	}
 
 	return true;
 }

@@ -260,4 +260,36 @@ ok( $node->log_contains(
 		$log_offset),
 	'a candidate for a dropped relation is counted but skipped');
 
+# --- an all-zero on-disk page is never repaired --------------------------
+
+# Zero the whole block: an empty header means replay recreates the page
+# from its init record without reading it, and a stale slot must not
+# resurrect on it — the zeroed page's LSN 0 would lose the LSN comparison
+# that this skip protects.
+$node->safe_psql('postgres', q(
+	CREATE TABLE tzero AS SELECT g AS id FROM generate_series(1, 100) g;
+));
+$node->safe_psql('postgres', 'CHECKPOINT');
+my $tzero_file =
+  $node->data_dir . '/'
+  . $node->safe_psql('postgres', "SELECT pg_relation_filepath('tzero')");
+$node->stop('immediate');
+
+my $tzero_good = read_block($tzero_file, 0);
+write_block($tzero_file, 0, "\0" x 8192);
+
+$log_offset = -s $node->logfile;
+$node->start;
+ok( $node->log_contains(
+		qr/double write buffer recovery: 0 of 1 candidate pages restored/,
+		$log_offset),
+	'a zeroed page is not repaired from its slot');
+is( read_block($tzero_file, 0), "\0" x 8192,
+	'... and stays zero for replay to drive');
+
+# put the good page back so the cluster winds down healthy
+write_block($tzero_file, 0, $tzero_good);
+is( $node->safe_psql('postgres', 'SELECT count(*) FROM tzero'),
+	'100', 'page manually restored, cluster consistent');
+
 done_testing();

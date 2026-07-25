@@ -5651,11 +5651,16 @@ StartupXLOG(void)
 		/*
 		 * Crash recovery over WAL generated without any torn page protection
 		 * cannot repair pages the crash tore, whatever the local mode says
-		 * now.  The mode-based FATAL in CheckRequiredParameterValues covers
-		 * archive recovery only, so this is the one transition that would
-		 * otherwise be silent.
+		 * now.  The mode-based FATAL in CheckRequiredParameterValues fires
+		 * for archive recovery only, so this is the one transition that would
+		 * otherwise be silent.  On a standby the pg_control field describes
+		 * the primary, not the run that crashed here — and a local
+		 * double_writes standby of an "off" primary repairs its own torn
+		 * pages from its ring — so the warning is limited to servers whose
+		 * crashed run owned the field.
 		 */
 		if (didCrash &&
+			ControlFile->state != DB_IN_ARCHIVE_RECOVERY &&
 			ControlFile->io_torn_pages_protection == DWB_PROTECT_OFF &&
 			io_torn_pages_protection != DWB_PROTECT_OFF)
 			ereport(WARNING,

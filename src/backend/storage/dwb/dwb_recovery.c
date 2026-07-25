@@ -10,7 +10,8 @@
  * writes, so slots left behind by the previous run can never masquerade as
  * current after a future crash.  Order: read G -> (RING_CLEAN not set)
  * apply-pass over generation G + fsync -> durable control.generation := G+1
- * -> open ring.  Starts in the other modes leave the ring untouched.
+ * -> open ring.  Starts in the other modes leave the ring untouched,
+ * except that a restored base backup's ring contents are discarded.
  *
  * The apply-pass runs before WAL replay and repairs the data files
  * directly: a candidate slot must carry a valid meta_crc, the current
@@ -31,6 +32,7 @@
  */
 #include "postgres.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -49,11 +51,12 @@ typedef struct DWBApplyCandidate
 {
 	BufferTag	tag;			/* hash key */
 	XLogRecPtr	lsn;
-	uint64		batch_id;		/* tie-breaker for equal LSNs: equal
-								 * generation means one server run, where
-								 * batch_id is monotonic in publication order
-								 * (see DWBBatchHeader.batch_id), so the
-								 * higher id holds the later copy */
+	uint64		batch_id;		/* tie-breaker for equal LSNs: equal-LSN
+								 * copies of one generation can differ only in
+								 * hint bits, so either is a valid redo base
+								 * and the id (monotonic in batch-open order,
+								 * see DWBBatchHeader.batch_id) just makes the
+								 * pick deterministic */
 	uint32		batch_idx;
 	uint32		slot_idx;
 	pg_crc32c	image_crc;		/* revalidates the image on re-read */
@@ -71,7 +74,7 @@ StaticAssertDecl(sizeof(DWBAppliedFork) ==
 				 "DWBAppliedFork has padding; unsafe as a HASH_BLOBS key");
 
 static XLogRecPtr DWBApplyPass(const DWBControlFileData *control);
-static void DWBWipeRing(void);
+static bool DWBWipeRing(void);
 static bool DWBRingIsQuiescent(void);
 
 /*
@@ -213,11 +216,14 @@ DWBApplyPass(const DWBControlFileData *control)
 				continue;
 
 			/*
-			 * Keep the highest LSN; on equal LSNs the later batch wins (equal
-			 * LSNs with different contents are real: a re-flush after
-			 * hint-bit-only changes does not move the LSN).  Within one batch
-			 * the later slot wins by plain overwrite, matching the order the
-			 * slots were filled in.
+			 * Keep the highest LSN; on equal LSNs the higher batch_id wins
+			 * (equal LSNs with different contents are real: a re-flush after
+			 * hint-bit-only changes does not move the LSN — but such copies
+			 * differ only in hint bits, so any of them is a valid redo base
+			 * and the id merely makes the pick deterministic; with two writer
+			 * classes a later flush can even land in an earlier- opened
+			 * batch).  Within one batch the later slot wins by plain
+			 * overwrite, matching the order the slots were filled in.
 			 */
 			n_candidates++;
 			entry = hash_search(candidates, &meta->tag, HASH_ENTER, &found);
@@ -266,17 +272,20 @@ DWBApplyPass(const DWBControlFileData *control)
 		smgrread(reln, forknum, blkno, disk_buf);
 
 		/*
-		 * A "new" page (empty header) is never repaired.  Every staged image
-		 * is an initialized page, so an empty on-disk header means the
+		 * A "new" page (empty header) is never repaired.  For a candidate
+		 * holding an initialized image, an empty on-disk header means the
 		 * covered write's first sector never reached disk and the block had
 		 * never held an initialized page before — its init record therefore
 		 * lies after the last checkpoint, and replay recreates the page
-		 * without reading the current contents.  The skip is also required
-		 * for correctness in the other direction: after a truncate +
-		 * re-extend within one generation the ring can hold a pre-truncate
-		 * copy of this block, and the re-extended zeroed page (LSN 0) would
-		 * lose the LSN comparison below to that stale image, which nothing
-		 * would then replay over.
+		 * without reading the current contents.  (A staged image can itself
+		 * be all-zero — FlushBuffer may flush a still-new page — but such
+		 * a copy carries LSN 0: skipping it here changes nothing, and on the
+		 * repair branch below it would merely complete an intended zeroing.)
+		 * The skip is also required for correctness in the other direction:
+		 * after a truncate + re-extend within one generation the ring can
+		 * hold a pre-truncate copy of this block, and the re-extended zeroed
+		 * page (LSN 0) would lose the LSN comparison below to that stale
+		 * image, which nothing would then replay over.
 		 */
 		if (PageIsNew((Page) disk_buf))
 			continue;
@@ -348,29 +357,50 @@ DWBApplyPass(const DWBControlFileData *control)
 
 /*
  * Durably remove the contents of pg_dwb/, keeping the directory (or the
- * symlink to it) in place.  Used when a restored backup ships a foreign
- * ring and when the geometry GUCs changed.
+ * symlink to it) in place, and report whether there was anything to
+ * remove — a restored backup normally ships pg_dwb/ empty, and the
+ * callers must not claim to have discarded ring contents that never
+ * existed.  Callers: the restored-backup branches (a shipped ring must
+ * not survive), the geometry change, and the cold-create sweep that
+ * clears leftovers of an interrupted wipe.
  *
  * The control file goes first, durably: a crash in the middle of the batch
  * sweep must not leave a readable control beside missing batch files, or a
  * retried apply-pass would hard-fail on the ENOENT forever.  With the
- * control gone first, a retry takes the cold-create path (which itself
- * wipes leftovers) — correct for both callers, since the apply-pass, if
- * one was needed, ran to completion before any wipe starts.
+ * control gone first, a retry takes the cold-create path instead, which is
+ * correct for every caller, since the apply-pass, if one was needed, ran
+ * to completion before any wipe starts.
  */
-static void
+static bool
 DWBWipeRing(void)
 {
 	struct stat st;
+	DIR		   *dir;
+	struct dirent *de;
+	bool		had_contents = false;
 
 	if (lstat(DWB_DIR, &st) < 0)
 	{
 		if (errno == ENOENT)
-			return;
+			return false;
 		ereport(FATAL,
 				(errcode_for_file_access(),
 				 errmsg("could not stat directory \"%s\": %m", DWB_DIR)));
 	}
+
+	dir = AllocateDir(DWB_DIR);
+	while ((de = ReadDir(dir, DWB_DIR)) != NULL)
+	{
+		if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+		{
+			had_contents = true;
+			break;
+		}
+	}
+	FreeDir(dir);
+
+	if (!had_contents)
+		return false;
 
 	if (unlink(DWB_CONTROL_FILE) < 0 && errno != ENOENT)
 		ereport(FATAL,
@@ -385,6 +415,8 @@ DWBWipeRing(void)
 				 errmsg("could not remove contents of directory \"%s\"",
 						DWB_DIR)));
 	fsync_fname(DWB_DIR, true);
+
+	return true;
 }
 
 /*
@@ -449,9 +481,9 @@ DWBStartup(bool restoring_backup)
 			 * lying dormant: a much later switch to double_writes would find
 			 * it with a plausible control file.  Discard it now.
 			 */
-			ereport(LOG,
-					(errmsg("discarding double write buffer ring contents restored from a base backup")));
-			DWBWipeRing();
+			if (DWBWipeRing())
+				ereport(LOG,
+						(errmsg("discarding double write buffer ring contents restored from a base backup")));
 			return InvalidXLogRecPtr;
 		}
 
@@ -504,9 +536,9 @@ DWBStartup(bool restoring_backup)
 
 	if (restoring_backup)
 	{
-		ereport(LOG,
-				(errmsg("discarding double write buffer ring contents restored from a base backup")));
-		DWBWipeRing();
+		if (DWBWipeRing())
+			ereport(LOG,
+					(errmsg("discarding double write buffer ring contents restored from a base backup")));
 	}
 
 	if (!DWBReadControlFile(&control, true, NULL))
@@ -516,7 +548,7 @@ DWBStartup(bool restoring_backup)
 		 * interrupted wipe can leave batch files behind after the control
 		 * file is gone.
 		 */
-		DWBWipeRing();
+		(void) DWBWipeRing();
 		DWBCreateRing();
 		created = true;
 		if (!DWBReadControlFile(&control, false, NULL))
@@ -548,7 +580,7 @@ DWBStartup(bool restoring_backup)
 				(errmsg("recreating double write buffer ring: geometry changed from %u batches of %u pages to %d batches of %d pages",
 						control.num_batches, control.batch_pages,
 						dwb_num_batches, dwb_batch_pages)));
-		DWBWipeRing();
+		(void) DWBWipeRing();
 		DWBCreateRing();
 		if (!DWBReadControlFile(&control, false, NULL))
 			pg_unreachable();
