@@ -221,9 +221,9 @@ DWBApplyPass(const DWBControlFileData *control)
 			 * hint-bit-only changes does not move the LSN — but such copies
 			 * differ only in hint bits, so any of them is a valid redo base
 			 * and the id merely makes the pick deterministic; with two writer
-			 * classes a later flush can even land in an earlier- opened
-			 * batch).  Within one batch the later slot wins by plain
-			 * overwrite, matching the order the slots were filled in.
+			 * classes a later flush can even land in a batch opened earlier).
+			 * Within one batch the later slot wins by plain overwrite,
+			 * matching the order the slots were filled in.
 			 */
 			n_candidates++;
 			entry = hash_search(candidates, &meta->tag, HASH_ENTER, &found);
