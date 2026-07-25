@@ -242,26 +242,34 @@ like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
 	qr/free=16/, 'ring idle after the stale-open scenario');
 
-# --- geometry is fixed by the on-disk control file ---------------------
+# --- a geometry change recreates the ring ------------------------------
 
+# The on-disk layout follows the geometry GUCs, so a change rebuilds the
+# ring from scratch (after applying the old one if needed — exercised in
+# t/010_recovery.pl); the generation restarts with the fresh control file.
 $node->stop;
-$node->append_conf('postgresql.conf', 'dwb_num_batches = 32');
-my $ret = $node->start(fail_ok => 1);
-is($ret, 0, 'start refused after geometry change');
-ok( $node->log_contains('was created with dwb_num_batches = 16'),
-	'geometry mismatch reported');
-$node->append_conf('postgresql.conf', 'dwb_num_batches = 16');
-$node->start;
-$node->stop;
-
-# the second geometry GUC is enforced independently
 my $log_offset = -s $node->logfile;
-$node->append_conf('postgresql.conf', 'dwb_batch_pages = 32');
-$ret = $node->start(fail_ok => 1);
-is($ret, 0, 'start refused after batch_pages change');
-ok( $node->log_contains('was created with dwb_num_batches = 16 and dwb_batch_pages = 16',
+$node->append_conf('postgresql.conf', 'dwb_num_batches = 32');
+$node->start;
+ok( $node->log_contains(
+		'recreating double write buffer ring: geometry changed from 16 batches of 16 pages to 32 batches of 16 pages',
 		$log_offset),
-	'batch_pages mismatch reported');
+	'geometry change recreates the ring');
+ok( $node->log_contains(
+		qr/ring opened: 32 batches of 16 pages, generation 1\b/,
+		$log_offset),
+	'recreated ring opens with a fresh generation');
+$node->stop;
+$log_offset = -s $node->logfile;
+$node->append_conf('postgresql.conf',
+	'dwb_num_batches = 16
+dwb_batch_pages = 32');
+$node->start;
+ok( $node->log_contains(
+		'geometry changed from 32 batches of 16 pages to 16 batches of 32 pages',
+		$log_offset),
+	'batch_pages change recreates the ring too');
+$node->stop;
 $node->append_conf('postgresql.conf', 'dwb_batch_pages = 16');
 $node->start;
 $node->stop;
@@ -277,7 +285,7 @@ $node->append_conf(
 max_worker_processes = 1
 dwb_retire_workers = 1
 ));
-$ret = $node->start(fail_ok => 1);
+my $ret = $node->start(fail_ok => 1);
 is($ret, 0, 'start refused when the pool does not fit into worker slots');
 ok( $node->log_contains(
 		'needs more "max_worker_processes" slots than remain free',

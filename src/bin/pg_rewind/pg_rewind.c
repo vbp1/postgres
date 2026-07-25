@@ -320,6 +320,29 @@ main(int argc, char **argv)
 	else
 		source = init_local_source(datadir_source);
 
+	/*
+	 * A live source must itself be protected by full page images: reading
+	 * files from a running server can catch pages mid-write, and only WAL
+	 * page images repair such torn reads on the rewound target.  Under
+	 * io_torn_pages_protection = "double_writes" or "off" the source's WAL
+	 * has no images (its double write buffer repairs its own torn writes, not
+	 * our torn reads), so refuse up front, before the target is touched in
+	 * any way.  A stopped source has no such requirement.  The mode is read
+	 * from the source's pg_control — the authoritative record, unlike the
+	 * legacy full_page_writes GUC, which only matters under "full_pages" and
+	 * is checked in init_libpq_source.
+	 */
+	if (connstr_source)
+	{
+		buffer = source->fetch_file(source, XLOG_CONTROL_FILE, &size);
+		digestControlFile(&ControlFile_source, buffer, size);
+		pg_free(buffer);
+
+		if (ControlFile_source.io_torn_pages_protection != DWB_PROTECT_FULL_PAGES)
+			pg_fatal("\"io_torn_pages_protection\" must be \"full_pages\" in the source server, not \"%s\"",
+					 DWBProtectionModeName(ControlFile_source.io_torn_pages_protection));
+	}
+
 	checkTargetDwb();
 
 	/*

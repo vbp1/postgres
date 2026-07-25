@@ -600,6 +600,8 @@ DR_sqlfunction
 DR_transientrel
 DSMRegistryCtxStruct
 DSMRegistryEntry
+DWBAppliedFork
+DWBApplyCandidate
 DWBBatchHeader
 DWBControlFileData
 DWBOnStall

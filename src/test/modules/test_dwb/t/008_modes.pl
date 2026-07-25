@@ -98,4 +98,40 @@ is($err, '', 'pg_waldump read the reload window cleanly');
 unlike($out, qr/FPW_CHANGE/,
 	'the no-op reload emitted no XLOG_FPW_CHANGE record');
 
+# --- leaving double_writes takes one clean shutdown ----------------------
+
+# After a crash the ring may hold repairs only a double_writes start can
+# apply, so a start in any other mode is refused until the ring has been
+# closed cleanly once.
+$node->stop('immediate');
+
+$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+my $ret = $node->start(fail_ok => 1);
+is($ret, 0, 'crashed ring refuses a full_pages start');
+ok( $node->log_contains(
+		qr/FATAL: .* the double write buffer ring was not cleanly shut down, cannot start with "io_torn_pages_protection=full_pages"/
+	),
+	'... naming the mode change as the problem');
+
+$node->append_conf('postgresql.conf', 'io_torn_pages_protection = off');
+$ret = $node->start(fail_ok => 1);
+is($ret, 0, 'crashed ring refuses an off start too');
+
+# one double_writes start applies the ring, and a clean stop releases it
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = double_writes');
+$log_offset = -s $node->logfile;
+$node->start;
+ok( $node->log_contains(qr/double write buffer recovery:/, $log_offset),
+	'the double_writes start runs the apply-pass');
+$node->stop;
+
+$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$log_offset = -s $node->logfile;
+$node->start;
+is( $node->safe_psql('postgres', 'SHOW io_torn_pages_protection'),
+	'full_pages', 'after a clean stop the mode change is legal');
+ok( !$node->log_contains(qr/ring opened/, $log_offset),
+	'... and the leftover ring stays closed');
+
 done_testing();

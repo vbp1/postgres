@@ -22,10 +22,41 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	1800
+#define PG_CONTROL_VERSION	1801
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
+
+/*
+ * The torn-page protection mechanism (GUC io_torn_pages_protection).  Like
+ * wal_level, the value in force on the WAL-generating server is a protocol
+ * fact: it decides whether the WAL carries full page images, so it is
+ * recorded in pg_control and in XLOG_PARAMETER_CHANGE records for replay to
+ * track.  Defined here rather than in storage/dwb.h so that frontend code
+ * reading pg_control can use it.
+ */
+typedef enum
+{
+	DWB_PROTECT_OFF,
+	DWB_PROTECT_FULL_PAGES,
+	DWB_PROTECT_DOUBLE_WRITES,
+} DWBTornPageProtection;
+
+/* GUC-spelling name of a DWBTornPageProtection value, for messages */
+static inline const char *
+DWBProtectionModeName(int mode)
+{
+	switch (mode)
+	{
+		case DWB_PROTECT_OFF:
+			return "off";
+		case DWB_PROTECT_FULL_PAGES:
+			return "full_pages";
+		case DWB_PROTECT_DOUBLE_WRITES:
+			return "double_writes";
+	}
+	return "unrecognized";
+}
 
 /*
  * Body of CheckPoint XLOG records.  This is declared here because we keep
@@ -183,6 +214,7 @@ typedef struct ControlFileData
 	int			max_prepared_xacts;
 	int			max_locks_per_xact;
 	bool		track_commit_timestamp;
+	int			io_torn_pages_protection;	/* DWBTornPageProtection */
 
 	/*
 	 * This data is used to check for hardware-architecture compatibility of

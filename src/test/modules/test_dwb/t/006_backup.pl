@@ -122,6 +122,51 @@ is( $restored->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
 	'100', 'restored data is intact');
 $restored->stop;
 
+# --- a ring shipped into a restore by a foreign tool is discarded ---------
+
+# pg_basebackup excludes the ring, but a third-party backup tool may ship
+# pg_dwb/ contents into the restore.  Neither staleness defence works
+# there — the slots carry the restored control's own generation, and the
+# restored data files are legitimately older than the slot copies — so a
+# start from a base backup (backup_label present) must not apply the ring:
+# it is wiped and recreated cold.  The planted control file is garbage,
+# which without the guard would be a fatal checksum error.
+my $planted = PostgreSQL::Test::Cluster->new('dwb_planted');
+$planted->init_from_backup($node, 'content_check');
+ok(-f $planted->data_dir . '/backup_label',
+	'the restore still carries backup_label');
+append_to_file($planted->data_dir . '/pg_dwb/control', 'torn by the tool');
+append_to_file($planted->data_dir . '/pg_dwb/batch_9999', 'foreign slots');
+
+my $planted_log_offset = -s $planted->logfile;
+$planted->start;
+ok( $planted->log_contains(
+		qr/discarding double write buffer ring contents restored from a base backup/,
+		$planted_log_offset),
+	'the restored ring is discarded');
+ok( !$planted->log_contains(
+		qr/double write buffer recovery:/, $planted_log_offset),
+	'... without an apply-pass over it');
+ok( $planted->log_contains(
+		qr/ring opened: 16 batches of 16 pages, generation 1\b/,
+		$planted_log_offset),
+	'... and a fresh ring is created cold');
+ok(!-f $planted->data_dir . '/pg_dwb/batch_9999',
+	'the foreign ring files are gone');
+is( $planted->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
+	'100', 'restored data is intact');
+
+# once the backup recovery is over the guard is gone: an ordinary crash
+# of this cluster is served by the apply-pass again
+$planted->stop('immediate');
+$planted_log_offset = -s $planted->logfile;
+$planted->start;
+ok( $planted->log_contains(
+		qr/double write buffer recovery: \d+ of \d+ candidate pages restored/,
+		$planted_log_offset),
+	'a later crash of the restored cluster applies the ring normally');
+$planted->stop;
+
 # --- pg_dwb as a symlink backs up as an empty real directory --------------
 
 SKIP:

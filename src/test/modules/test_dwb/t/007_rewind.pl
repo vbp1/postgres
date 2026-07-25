@@ -163,10 +163,10 @@ my @rewind_from_b = (
 	rename($stash, $dwb_path) or BAIL_OUT("could not restore $dwb_path: $!");
 }
 
-# return the target to a clean shutdown for the rewind proper; recovery
-# runs with the ring already behind the symlink
-$node_a->start;
-$node_a->stop('fast');
+# The target stays crashed on purpose: the rewind itself drives it to a
+# clean shutdown through ensureCleanShutdown's single-user run, which
+# exercises the apply-pass and the ring drain with no worker pool at all —
+# and with the ring already behind the symlink.
 
 # --- a broken ring symlink on the source is harmless ---------------------
 

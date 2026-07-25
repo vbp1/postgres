@@ -310,6 +310,8 @@ main(int argc, char *argv[])
 		   ControlFile->max_locks_per_xact);
 	printf(_("track_commit_timestamp setting:       %s\n"),
 		   ControlFile->track_commit_timestamp ? _("on") : _("off"));
+	printf(_("io_torn_pages_protection setting:     %s\n"),
+		   DWBProtectionModeName(ControlFile->io_torn_pages_protection));
 	printf(_("Maximum data alignment:               %u\n"),
 		   ControlFile->maxAlign);
 	/* we don't print floatFormat since can't say much useful about it */

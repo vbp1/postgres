@@ -23,6 +23,7 @@
 #define DWB_H
 
 #include "access/xlogdefs.h"
+#include "catalog/pg_control.h"
 #include "port/pg_crc32c.h"
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h"
@@ -32,13 +33,10 @@
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
 
-/* GUC: io_torn_pages_protection */
-typedef enum
-{
-	DWB_PROTECT_OFF,
-	DWB_PROTECT_FULL_PAGES,
-	DWB_PROTECT_DOUBLE_WRITES,
-} DWBTornPageProtection;
+/*
+ * The io_torn_pages_protection GUC values (DWBTornPageProtection) live in
+ * catalog/pg_control.h: the mode is recorded in pg_control.
+ */
 
 /* GUC: dwb_on_stall (Stage B backpressure behaviour) */
 typedef enum
@@ -108,10 +106,21 @@ typedef struct DWBControlFileData
 	uint32		min_version;
 	uint32		num_batches;
 	uint32		batch_pages;
+	uint32		flags;			/* DWB_CONTROL_* */
 	uint64		generation;		/* apply-pass horizon: bumped durably on every
 								 * start before the ring opens */
 	pg_crc32c	crc;			/* CRC of all preceding fields */
 } DWBControlFileData;
+
+/*
+ * DWBControlFileData.flags.  RING_CLEAN certifies that every data-file write
+ * covered by an on-disk slot had been fsynced when the server shut down: it
+ * is written at the end of a clean shutdown after the ring is fully retired,
+ * and cleared by the next startup before the ring reopens.  While it is set,
+ * the ring holds no unapplied repairs, so the apply-pass can be skipped and
+ * a start under a different io_torn_pages_protection mode is legal.
+ */
+#define DWB_CONTROL_RING_CLEAN	0x0001
 
 typedef struct DWBBatchHeader
 {
@@ -378,6 +387,7 @@ extern pg_crc32c DWBControlCrc(const DWBControlFileData *control);
 extern pg_crc32c DWBBatchHeaderCrc(const DWBBatchHeader *hdr);
 
 /* dwb_recovery.c */
-extern void DWBStartup(void);
+extern XLogRecPtr DWBStartup(bool unclean_start, bool restoring_backup);
+extern void DWBMarkCleanShutdown(void);
 
 #endif							/* DWB_H */
