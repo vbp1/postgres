@@ -43,6 +43,8 @@ tests += {
       't/004_retire_paths.pl',
       't/005_standby.pl',
       't/006_backup.pl',
+      't/007_rewind.pl',
+      't/008_modes.pl',
     ],
   },
 }

@@ -3,8 +3,9 @@
 
 # Hot standby under io_torn_pages_protection = double_writes: the standby
 # runs its own ring while replaying, both sides survive crashes, promotion
-# works with a replay backlog, and the minRecoveryPoint contract holds for
-# pages the standby flushes through the DWB.
+# drains a replay backlog through the ring, the minRecoveryPoint contract
+# holds for replay-driven flushes, and a base backup initiated on the
+# standby is refused loudly.
 
 use strict;
 use warnings FATAL => 'all';
@@ -14,8 +15,9 @@ use Test::More;
 
 my $primary = PostgreSQL::Test::Cluster->new('dwb_primary');
 $primary->init(allows_streaming => 1);
-# A tiny buffer pool forces replay evictions through the standby's ring;
-# fsync must be ON so restartpoint ProcessSyncRequests retires batches.
+# The workload table (~3.4 MB) exceeds shared_buffers, so replay on the
+# standby must evict through its ring; fsync stays ON so the restartpoint
+# ProcessSyncRequests path runs its DWB wrap for real.
 $primary->append_conf(
 	'postgresql.conf', qq(
 io_torn_pages_protection = double_writes
@@ -35,13 +37,13 @@ $primary->safe_psql('postgres', 'CREATE EXTENSION test_dwb');
 $primary->backup('bkp');
 my $standby = PostgreSQL::Test::Cluster->new('dwb_standby');
 $standby->init_from_backup($primary, 'bkp', has_streaming => 1);
-my $standby_log_offset = -s $standby->logfile;
+my $standby_log_offset = (-s $standby->logfile) // 0;
 $standby->start;
 
 # pg_dwb/ is excluded from the backup, so the standby must open a fresh
 # ring rather than inherit the primary's.
 ok( $standby->log_contains(
-		qr/double write buffer ring opened: 16 batches of 16 pages, generation 1/,
+		qr/double write buffer ring opened: 16 batches of 16 pages, generation 1\b/,
 		$standby_log_offset),
 	'standby cold-started a fresh ring from the base backup');
 
@@ -54,33 +56,47 @@ pass('retire worker is running on the standby during recovery');
 
 # --- replay traffic flows through the standby ring -----------------------
 
-my $mrp_before = $standby->safe_psql('postgres',
-	'SELECT min_recovery_end_lsn FROM pg_control_recovery()');
-
 $primary->safe_psql('postgres', q(
 	CREATE TABLE dwb_t AS
 		SELECT g AS id, repeat('x', 300) AS filler
-		FROM generate_series(1, 50000) g;
+		FROM generate_series(1, 10000) g;
 	UPDATE dwb_t SET filler = repeat('y', 300) WHERE id % 10 = 0;
 ));
 $primary->safe_psql('postgres', 'CHECKPOINT');
 $primary->wait_for_catchup($standby);
 
-# The workload far exceeds the standby's shared_buffers, so replay must
-# have evicted dirty pages through the standby's own DWB write path.
-$standby->safe_psql('postgres', 'CHECKPOINT');
-is( $standby->safe_psql(
-		'postgres',
-		"SELECT sum(writes) > 0 FROM pg_stat_io WHERE object = 'dwb'"),
-	't', 'standby replay flushed pages through its own ring');
+# The workload exceeds the standby's shared_buffers, so the startup
+# process itself must have evicted dirty pages through the standby's own
+# DWB write path.  Startup flushes its stats when it replays the
+# XLOG_RUNNING_XACTS record the primary's CHECKPOINT above emitted, but
+# that is asynchronous to wait_for_catchup — hence the poll.
+$standby->poll_query_until('postgres',
+	"SELECT COALESCE(sum(writes), 0) > 0 FROM pg_stat_io "
+	  . "WHERE object = 'dwb' AND backend_type = 'startup'")
+  or die 'timed out waiting for startup-process DWB writes on the standby';
+pass('replay evictions flowed through the standby ring');
 
-# The restartpoint moved the minRecoveryPoint contract forward: FlushBuffer
-# on the standby cannot fsync WAL itself, it advances minRecoveryPoint
-# through XLogFlush instead (see 3.9 of the design plan).
-is( $standby->safe_psql(
-		'postgres',
-		"SELECT min_recovery_end_lsn > '$mrp_before'::pg_lsn FROM pg_control_recovery()"),
-	't', 'minRecoveryPoint advanced past the replayed flushes');
+is( $standby->safe_psql('postgres',
+		"SELECT count(*) FROM dwb_t WHERE filler = repeat('y', 300)"),
+	'1000', 'replayed page contents are correct');
+
+# --- FlushBuffer on the standby advances minRecoveryPoint ----------------
+
+# Take the baseline right after a restartpoint, then push replay-eviction
+# traffic with NO further checkpoint or restartpoint anywhere: any advance
+# past the baseline can then come only from buffer flushes — XLogFlush in
+# recovery does not fsync WAL, it calls UpdateMinRecoveryPoint instead
+# (see 3.9 of the design plan).
+$standby->safe_psql('postgres', 'CHECKPOINT');
+my $mrp_before = $standby->safe_psql('postgres',
+	'SELECT min_recovery_end_lsn FROM pg_control_recovery()');
+$primary->safe_psql('postgres',
+	"UPDATE dwb_t SET filler = repeat('m', 300) WHERE id % 9 = 0");
+$primary->wait_for_catchup($standby);
+$standby->poll_query_until('postgres',
+	"SELECT min_recovery_end_lsn > '$mrp_before'::pg_lsn FROM pg_control_recovery()")
+  or die 'minRecoveryPoint did not advance from replay-driven flushes alone';
+pass('replay-driven flushes advanced minRecoveryPoint without a restartpoint');
 
 # and the ring keeps circulating: the worker drains it back to all-free
 $standby->poll_query_until('postgres',
@@ -88,60 +104,111 @@ $standby->poll_query_until('postgres',
   or die 'timed out waiting for the standby ring to drain';
 pass('standby ring drained back to all-free');
 
+# --- a base backup initiated on the standby is refused loudly ------------
+
+# The replayed WAL carries no page images and the primary's ring cannot
+# substitute for them, so the vanilla do_pg_backup_start guard must refuse
+# with a hint that names the real knob.
+my $refused_path = $primary->backup_dir . '/standby_backup';
+my ($out, $err) = run_command(
+	[
+		'pg_basebackup', '--no-sync',
+		'--pgdata' => $refused_path,
+		'--host' => $standby->host,
+		'--port' => $standby->port,
+		'--checkpoint' => 'fast'
+	]);
+ok(!-f "$refused_path/PG_VERSION",
+	'base backup from the standby is refused');
+like(
+	$err,
+	qr/WAL generated without full page images was replayed/,
+	'... loudly');
+like(
+	$err,
+	qr/io_torn_pages_protection/,
+	'... with a hint naming the real knob');
+
 # --- the standby survives its own crash ----------------------------------
 
 $standby->stop('immediate');
 $standby_log_offset = -s $standby->logfile;
 $standby->start;
 ok( $standby->log_contains(
-		qr/double write buffer ring opened: 16 batches of 16 pages, generation 2/,
+		qr/double write buffer ring opened: 16 batches of 16 pages, generation 2\b/,
 		$standby_log_offset),
 	'crashed standby reopened its ring under a bumped generation');
 
-$primary->safe_psql('postgres', 'INSERT INTO dwb_t VALUES (100001, \'after standby crash\')');
+$primary->safe_psql('postgres',
+	"INSERT INTO dwb_t VALUES (100001, 'after standby crash')");
 $primary->wait_for_catchup($standby);
 is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
-	'50001', 'replication resumed after the standby crash');
+	'10001', 'replication resumed after the standby crash');
 
 # --- the primary survives its own crash ----------------------------------
 
 $primary->stop('immediate');
 $primary->start;
-$primary->safe_psql('postgres', 'INSERT INTO dwb_t VALUES (100002, \'after primary crash\')');
+$primary->safe_psql('postgres',
+	"INSERT INTO dwb_t VALUES (100002, 'after primary crash')");
 $primary->wait_for_catchup($standby);
 is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
-	'50002', 'replication resumed after the primary crash');
+	'10002', 'replication resumed after the primary crash');
 
 # --- promotion with a replay backlog -------------------------------------
 
 # Pause replay, pile up a burst, make sure it is flushed to the standby's
-# local WAL, then resume and promote: the promotion completes only after
-# the backlog has replayed through the standby's DWB write path.
+# local WAL, and promote with the pause still in effect: promotion breaks
+# the pause (recoveryPausesHere exits on the standby trigger), so the
+# whole backlog demonstrably replays through the standby's DWB write path
+# before the timeline switch.
 $standby->safe_psql('postgres', 'SELECT pg_wal_replay_pause()');
+$standby->poll_query_until('postgres',
+	"SELECT pg_get_wal_replay_pause_state() = 'paused'")
+  or die 'timed out waiting for replay to pause';
 $primary->safe_psql('postgres', q(
 	UPDATE dwb_t SET filler = repeat('p', 300) WHERE id % 3 = 0;
 	INSERT INTO dwb_t VALUES (100003, 'burst tail');
 ));
 $primary->wait_for_catchup($standby, 'flush', $primary->lsn('write'));
-$standby->safe_psql('postgres', 'SELECT pg_wal_replay_resume()');
+is( $standby->safe_psql('postgres',
+		'SELECT pg_last_wal_replay_lsn() < pg_last_wal_receive_lsn()'),
+	't', 'a real replay backlog exists at promotion time');
 $standby->promote;
 
 is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
-	'50003', 'promoted standby replayed the whole backlog');
+	'10003', 'promoted standby replayed the whole backlog');
+is( $standby->safe_psql('postgres',
+		"SELECT count(*) FROM dwb_t WHERE filler = repeat('p', 300)"),
+	'3334', 'backlog page contents are correct');
 is( $standby->safe_psql('postgres', 'SELECT pg_is_in_recovery()'),
 	'f', 'standby left recovery');
 
-# the promoted node keeps writing through its ring as a primary
+# --- the promoted node is a full DWB primary -----------------------------
+
+my $tl2_start = $standby->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 $standby->safe_psql('postgres', q(
 	UPDATE dwb_t SET filler = repeat('q', 300) WHERE id % 5 = 0;
 	INSERT INTO dwb_t VALUES (100004, 'after promotion');
 ));
+my $tl2_end = $standby->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 $standby->safe_psql('postgres', 'CHECKPOINT');
 is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
-	'50004', 'promoted node accepts writes through the DWB path');
+	'10004', 'promoted node accepts writes');
 $standby->poll_query_until('postgres',
 	"SELECT test_dwb_states() LIKE 'free=16 %'")
   or die 'timed out waiting for the promoted ring to drain';
 pass('promoted ring drained back to all-free');
+
+# the new timeline still carries no page images
+my ($waldump, $walerr) = run_command(
+	[
+		'pg_waldump', '--path' => $standby->data_dir . '/pg_wal',
+		'--timeline' => 2,
+		'--start' => $tl2_start, '--end' => $tl2_end
+	]);
+is($walerr, '', 'pg_waldump read the post-promotion window cleanly');
+like($waldump, qr/Heap/, 'the window covers the post-promotion update');
+unlike($waldump, qr/\bFPW\b/, 'no full-page images after promotion');
 
 done_testing();

@@ -1130,11 +1130,15 @@ SELECT * FROM pg_backup_stop(wait_for_archive => true);
    </para>
 
    <para>
-    The contents of the directories <filename>pg_dynshmem/</filename>,
+    The contents of the directories <filename>pg_dwb/</filename>,
+    <filename>pg_dynshmem/</filename>,
     <filename>pg_notify/</filename>, <filename>pg_serial/</filename>,
     <filename>pg_snapshots/</filename>, <filename>pg_stat_tmp/</filename>,
     and <filename>pg_subtrans/</filename> (but not the directories themselves) can be
     omitted from the backup as they will be initialized on postmaster startup.
+    The double write buffer ring in <filename>pg_dwb/</filename> in particular
+    must never be restored to another cluster: its page copies only repair
+    torn writes of the instance that wrote them.
    </para>
 
    <para>

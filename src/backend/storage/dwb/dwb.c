@@ -5,13 +5,14 @@
  *
  * Batch lifecycle: FREE -> ALLOCATED -> SEALED -> WRITTEN -> FSYNCED ->
  * DATA_WRITTEN -> RETIRING -> FREE.  Writers reserve slots with an atomic
- * fetch_add on next_slot_idx (31-bit index + SEAL_BIT sentinel), publish
- * their page image with a plain memcpy into the batch's staging buffer and
- * set their bit in slots_written_bitmap.  The SEAL initiator becomes the
- * leader: it waits for bitmap coverage of capped_slots, then writes the
- * whole batch — in this write order: the contiguous image stream, then the
- * meta region, then fdatasync (the on-disk layout puts the meta region
- * first; see dwb.h) — and broadcasts DWB_FSYNCED.
+ * CAS on next_slot_idx (30-bit index + writer-class bit + SEAL_BIT
+ * sentinel; see dwb.h), publish their page image with a plain memcpy into
+ * the batch's staging buffer and set their bit in slots_written_bitmap.
+ * The SEAL initiator becomes the leader: it waits for bitmap coverage of
+ * capped_slots, then writes the whole batch — in this write order: the
+ * contiguous image stream, then the meta region, then fdatasync (the
+ * on-disk layout puts the meta region first; see dwb.h) — and broadcasts
+ * DWB_FSYNCED.
  *
  * FlushBuffer drives this through DWBStagePageWrite/DWBFinishPageWrite;
  * retirement (segment fsyncs, the worker pool) lives in dwb_retire.c.
@@ -261,14 +262,16 @@ DWBStagingRelease(int idx)
 
 /*
  * Make open_batch_idx[wclass] point at an ALLOCATED batch, if it currently
- * points at old_idx (a sealed or invalid batch).  Serialized by
- * DWBRingOpenLock; sleeps on cv_free_batch when the whole ring is busy.
+ * points at old_idx (a sealed, foreign-class or invalid batch).  Serialized
+ * by DWBRingOpenLock; sleeps on cv_free_batch when the whole ring is busy.
  *
  * Ordering note for stale writers: a batch keeps SEAL_BIT in next_slot_idx
- * from its SEAL until we finish re-initializing it here, so a stale
- * fetch_add against a reused batch either sees SEAL_BIT (and retries) or
- * lands on a valid slot of the new incarnation — never on a slot that a
- * concurrent reset can wipe.
+ * from its SEAL until we finish re-initializing it here, and the
+ * re-initialization stamps the opening class into DWB_WCLASS_BIT, so a
+ * stale reservation attempt against a reused batch either sees SEAL_BIT or
+ * a foreign class bit (and retries) or lands on a valid slot of a new
+ * same-class incarnation — never on a slot that a concurrent reset can
+ * wipe, and never in a batch the other class is filling.
  *
  * Non-static only for test_dwb's stale-open regression test.
  */
@@ -300,23 +303,37 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		 * a slow opener gets here, old_idx may name a NEW live incarnation of
 		 * the same slot (sealed, retired, freed and reopened behind our
 		 * back), and replacing it would orphan that live batch together with
-		 * its staging buffer.  SEAL_BIT disambiguates the incarnations: it is
-		 * set from SEAL through FREE and cleared only by the
-		 * re-initialization below, under this same lock — so the open batch
-		 * needs replacing if and only if its SEAL_BIT is set.
+		 * its staging buffer.  SEAL_BIT plus the class bit disambiguate the
+		 * incarnations: SEAL_BIT is set from SEAL through FREE and cleared
+		 * only by the re-initialization below (under this same lock), which
+		 * also stamps the opening class — so the open batch needs replacing
+		 * if and only if it is sealed or belongs to the other class (a reused
+		 * index that the other class reopened while our pointer kept naming
+		 * it).
 		 */
 		{
 			uint32		cur = pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]);
 
-			if (cur != old_idx ||
-				(cur != DWB_INVALID_BATCH &&
-				 !(pg_atomic_read_u32(&DWBCtl->batches[cur].next_slot_idx) &
-				   DWB_SEAL_BIT)))
+			if (cur != old_idx)
 			{
 				LWLockRelease(DWBRingOpenLock);
 				DWBStagingRelease(staging_idx);
 				ConditionVariableCancelSleep();
 				return;
+			}
+			if (cur != DWB_INVALID_BATCH)
+			{
+				uint32		nsi = pg_atomic_read_u32(&DWBCtl->batches[cur].next_slot_idx);
+
+				if (!(nsi & DWB_SEAL_BIT) &&
+					(nsi & DWB_WCLASS_BIT) == DWBWClassBit(wclass))
+				{
+					/* still our live open batch */
+					LWLockRelease(DWBRingOpenLock);
+					DWBStagingRelease(staging_idx);
+					ConditionVariableCancelSleep();
+					return;
+				}
 			}
 		}
 
@@ -365,10 +382,12 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 
 			/*
 			 * Open for reservations only after everything above is visible:
-			 * clearing SEAL_BIT is the point where writers may enter.
+			 * clearing SEAL_BIT is the point where writers may enter.  The
+			 * write also stamps the opening class into DWB_WCLASS_BIT, which
+			 * reservations validate atomically with their increment.
 			 */
 			pg_write_barrier();
-			pg_atomic_write_u32(&batch->next_slot_idx, 0);
+			pg_atomic_write_u32(&batch->next_slot_idx, DWBWClassBit(wclass));
 
 			pg_atomic_write_u32(&DWBCtl->open_batch_idx[wclass], free_idx);
 			LWLockRelease(DWBRingOpenLock);
@@ -683,11 +702,31 @@ DWBAcquireSlot(const BufferTag *tag, int wclass, bool use_resowner,
 		}
 
 		batch = &DWBCtl->batches[idx];
-		prev = pg_atomic_fetch_add_u32(&batch->next_slot_idx, 1);
 
-		if (prev & DWB_SEAL_BIT)
+		/*
+		 * Reserve with a CAS rather than a plain fetch_add: the seal and
+		 * class bits are validated atomically with the increment.  The class
+		 * check is what makes a stale open pointer safe: the ring reuses
+		 * indexes, so idx may name a batch that was freed and reopened under
+		 * the OTHER class while our per-class pointer kept naming it, and a
+		 * blind increment there would consume a slot nobody ever publishes —
+		 * the leader would wait for its coverage forever.
+		 */
+		prev = pg_atomic_read_u32(&batch->next_slot_idx);
+		for (;;)
 		{
-			/* already sealed; the extra increment is harmless (3.4) */
+			if (prev & DWB_SEAL_BIT)
+				break;			/* sealed: reopen and retry */
+			if ((prev & DWB_WCLASS_BIT) != DWBWClassBit(wclass))
+				break;			/* foreign incarnation: our pointer is stale */
+			if (pg_atomic_compare_exchange_u32(&batch->next_slot_idx,
+											   &prev, prev + 1))
+				break;			/* reserved */
+		}
+
+		if ((prev & DWB_SEAL_BIT) ||
+			(prev & DWB_WCLASS_BIT) != DWBWClassBit(wclass))
+		{
 			DWBOpenNewBatch(wclass, idx);
 			continue;
 		}

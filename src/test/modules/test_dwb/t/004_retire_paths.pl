@@ -59,7 +59,7 @@ like(
 $node->safe_psql('postgres', "SELECT test_dwb_checkpoint_pending($filenode)");
 like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
-	qr/retiring=1/, 'one batch parked in RETIRING with a pending sync request');
+	qr/retiring=1$/, 'one batch parked in RETIRING with a pending sync request');
 $node->safe_psql('postgres', 'CHECKPOINT');
 like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
@@ -67,38 +67,27 @@ like(
 
 # --- a checkpoint tolerates a live ALLOCATED batch ------------------------
 
-# Checkpoints take no DWB barrier: an open batch whose timeout has not
-# fired stays ALLOCATED across a CHECKPOINT and is finished asynchronously.
+# Checkpoints take no DWB barrier.  With no retire workers nothing seals
+# behind our back, so the holder's open batch must stay ALLOCATED across a
+# CHECKPOINT; the test seals and retires it explicitly once the holder is
+# gone.
 #
-# Warmup: a throwaway session runs the same statements once and a
-# CHECKPOINT flushes every catalog page its login dirtied (hint bits under
-# checksums), so the real holder below leaves no dirty buffer for the
-# checkpoint to feed through the DWB write path — which would seal the
-# open batch as a side effect.
-my $warm = $node->background_psql('postgres');
-$warm->query_safe('SELECT test_dwb_leak(1, true)');
-$warm->quit;
-$node->poll_query_until('postgres',
-	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
-	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
-	  . "test_dwb_states() LIKE 'free=64 %' END END")
-  or die 'timed out draining the warmup batch';
-$node->safe_psql('postgres', 'CHECKPOINT');
-$node->poll_query_until('postgres',
-	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
-	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
-	  . "test_dwb_states() LIKE 'free=64 %' END END")
-  or die 'timed out draining the warmup checkpoint traffic';
-
+# This doubles as the regression test for cross-class open-pointer
+# aliasing: the checkpoints above left open_batch_idx[BACKGROUND] naming a
+# long-freed batch index, the holder's EVICTION-class open reuses exactly
+# that index (lowest FREE), and the CHECKPOINT below makes the checkpointer
+# flush the holder's login hint bits through the DWB.  Without the writer
+# class stamp in next_slot_idx the checkpointer would join the holder's
+# batch and, on the no-pool path, seal it.
 my $holder = $node->background_psql('postgres');
 $holder->query_safe('SELECT test_dwb_leak(1, true)');
-like(
-	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
-	qr/allocated=1/, 'an open ALLOCATED batch is live before the checkpoint');
+my $one_open =
+  'free=63 allocated=1 sealed=0 written=0 fsynced=0 data_written=0 retiring=0';
+is( $node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	$one_open, 'an open ALLOCATED batch is live before the checkpoint');
 $node->safe_psql('postgres', 'CHECKPOINT');
-like(
-	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
-	qr/allocated=1/, 'CHECKPOINT completed and left the open batch alone');
+is( $node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	$one_open, 'CHECKPOINT completed and left the open batch alone');
 $holder->quit;
 $node->poll_query_until('postgres',
 	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
@@ -140,11 +129,11 @@ pass('ring drained after the hash overflow');
 $node->safe_psql('postgres', 'SELECT test_dwb_park(98000)');
 like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
-	qr/retiring=1/, 'batch parked for the stale-snapshot scenario');
+	qr/retiring=1$/, 'batch parked for the stale-snapshot scenario');
 $node->safe_psql('postgres', 'SELECT test_dwb_stale_snapshot(98000)');
 like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
-	qr/retiring=1/, 'stale snapshot dropped, parked batch still RETIRING');
+	qr/retiring=1$/, 'stale snapshot dropped, parked batch still RETIRING');
 $node->poll_query_until('postgres',
 	"SELECT CASE WHEN test_dwb_retire() >= 0 THEN "
 	  . "test_dwb_states() LIKE 'free=64 %' END")
@@ -174,7 +163,7 @@ like(
 	'soft fsync failure reported as a WARNING');
 like(
 	$node->safe_psql('postgres', 'SELECT test_dwb_states()'),
-	qr/retiring=1/, 'batch stays RETIRING after the soft fsync failure');
+	qr/retiring=1$/, 'batch stays RETIRING after the soft fsync failure');
 
 rmdir $segdir or die "rmdir $segdir: $!";
 is( $node->safe_psql('postgres', 'SELECT test_dwb_retire()'),

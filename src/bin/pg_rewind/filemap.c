@@ -133,10 +133,12 @@ static const char *const excludeDirContents[] =
 	"pg_dynshmem",				/* defined as PG_DYNSHMEM_DIR */
 
 	/*
-	 * The double write buffer ring is local to an instance; copying the
-	 * source's ring over would hand the target foreign page copies.  The
-	 * target's own leftover ring is inert: the durable generation bump on
-	 * every start (see DWBStartup()) keeps its slots out of any apply-pass.
+	 * The double write buffer ring is local to an instance: its slots are
+	 * page copies of that cluster's own in-flight writes.  Excluding it keeps
+	 * the source's ring off the target and, because decide_file_action()
+	 * removes excluded paths that exist in the target, also wipes the
+	 * target's own ring — the rewound cluster cold-starts a fresh one, see
+	 * DWBStartup().
 	 */
 	"pg_dwb",					/* defined as DWB_DIR */
 

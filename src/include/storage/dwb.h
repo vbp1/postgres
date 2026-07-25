@@ -235,10 +235,25 @@ typedef struct DWSegEntry
 #define DWB_EVICT_RESERVE		Max(2, dwb_num_batches / 8)
 
 /*
- * next_slot_idx encoding: 31-bit index + seal sentinel bit.
+ * next_slot_idx encoding: 30-bit index + writer-class bit + seal sentinel.
+ *
+ * The class bit records which writer class opened this incarnation of the
+ * batch.  A reservation validates it atomically with the increment (CAS in
+ * DWBAcquireSlot), so a stale per-class open pointer can never join a batch
+ * that was freed and reopened under the other class: the ring reuses batch
+ * indexes, and open_batch_idx[] of an idle class keeps naming its last batch
+ * long after that batch was retired.
  */
 #define DWB_SEAL_BIT			(1U << 31)
-#define DWB_IDX_MASK			(DWB_SEAL_BIT - 1)
+#define DWB_WCLASS_BIT			(1U << 30)
+#define DWB_IDX_MASK			(DWB_WCLASS_BIT - 1)
+
+/* one flag bit encodes the opening class: works for exactly two classes */
+StaticAssertDecl(DWB_NUM_WCLASSES == 2,
+				 "next_slot_idx has a single writer-class bit");
+
+#define DWBWClassBit(wclass) \
+	((wclass) == DWB_WCLASS_BACKGROUND ? DWB_WCLASS_BIT : 0)
 
 typedef struct DWBatchCtl
 {

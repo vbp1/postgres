@@ -78,6 +78,13 @@ Item
 </row>
 
 <row>
+ <entry><filename>pg_dwb</filename></entry>
+ <entry>Subdirectory containing the double write buffer ring
+  (when <varname>io_torn_pages_protection</varname> is set to
+  <literal>double_writes</literal>)</entry>
+</row>
+
+<row>
  <entry><filename>pg_dynshmem</filename></entry>
  <entry>Subdirectory containing files used by the dynamic shared memory
   subsystem</entry>

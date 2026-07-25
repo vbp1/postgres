@@ -168,10 +168,10 @@ static const char *const excludeDirContents[] =
 	PG_DYNSHMEM_DIR,
 
 	/*
-	 * The double write buffer ring only repairs torn writes on the local
-	 * instance; restoring it elsewhere would let the apply-pass overwrite
-	 * pages with copies from the backup moment.  A restored cluster starts
-	 * with a fresh ring instead, see DWBStartup().
+	 * The double write buffer ring holds page copies belonging to the
+	 * instance being backed up; they are meaningless anywhere else and must
+	 * never be applied to a restored cluster.  A restored cluster cold-starts
+	 * a fresh ring instead, see DWBStartup().
 	 */
 	DWB_DIR,
 

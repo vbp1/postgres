@@ -33,7 +33,18 @@ DWBStartup(void)
 	DWBControlFileData control;
 
 	if (!DWBIsEnabled())
+	{
+		/*
+		 * The most dangerous mode must not be the quietest one: with "off"
+		 * neither page images nor the ring protect data files, and the legacy
+		 * full_page_writes GUC may still read "on".
+		 */
+		if (io_torn_pages_protection == DWB_PROTECT_OFF)
+			ereport(LOG,
+					(errmsg("torn page protection is disabled (io_torn_pages_protection = \"off\")"),
+					 errdetail("WAL carries no full page images; \"full_page_writes\" is ignored in this mode.")));
 		return;
+	}
 
 	/* 3.1.7: a torn page with an intact header must never pass unnoticed */
 	if (!DataChecksumsEnabled())

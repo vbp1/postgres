@@ -132,10 +132,23 @@ init_libpq_conn(PGconn *conn)
 	PQclear(res);
 
 	/*
-	 * Also check that full_page_writes is enabled.  We can get torn pages if
-	 * a page is modified while we read it with pg_read_binary_file(), and we
-	 * rely on full page images to fix them.
+	 * Also check that the source server actually writes full page images. We
+	 * can get torn pages if a page is modified while we read it with
+	 * pg_read_binary_file(), and we rely on full page images to fix them. The
+	 * full_page_writes GUC alone is not the authority: under
+	 * io_torn_pages_protection = "double_writes" or "off" page images are
+	 * forced off while the GUC may still read "on" (its value only matters
+	 * under "full_pages").  The double write buffer cannot substitute here:
+	 * it repairs torn writes of its own instance, not torn reads of a remote
+	 * copy.  Rewinding from a stopped source (--source-pgdata) has no such
+	 * requirement.
 	 */
+	str = run_simple_query(conn, "SHOW io_torn_pages_protection");
+	if (strcmp(str, "full_pages") != 0)
+		pg_fatal("\"io_torn_pages_protection\" must be \"full_pages\" in the source server, not \"%s\"",
+				 str);
+	pg_free(str);
+
 	str = run_simple_query(conn, "SHOW full_page_writes");
 	if (strcmp(str, "on") != 0)
 		pg_fatal("\"full_page_writes\" must be enabled in the source server");
