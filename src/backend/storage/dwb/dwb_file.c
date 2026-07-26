@@ -103,6 +103,8 @@ bool
 DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
 				   bool *corruptp)
 {
+	/* with elevel < ERROR the ereports return and the *corruptp tails run */
+	int			elevel = corruptp ? LOG : FATAL;
 	int			fd;
 	int			r;
 
@@ -114,18 +116,11 @@ DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
 	{
 		if (errno == ENOENT && missing_ok)
 			return false;
-		if (corruptp)
-		{
-			ereport(LOG,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m",
-							DWB_CONTROL_FILE)));
-			*corruptp = true;
-			return false;
-		}
-		ereport(FATAL,
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", DWB_CONTROL_FILE)));
+		*corruptp = true;
+		return false;
 	}
 
 	pgstat_report_wait_start(WAIT_EVENT_DWB_CONTROL_READ);
@@ -134,38 +129,25 @@ DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
 	pgstat_report_wait_end();
 	if (r != sizeof(DWBControlFileData))
 	{
-		if (corruptp)
-		{
-			/* distinguish a real read error from a truncated file */
-			if (r < 0)
-				ereport(LOG,
-						(errcode_for_file_access(),
-						 errmsg("could not read file \"%s\": %m",
-								DWB_CONTROL_FILE)));
-			else
-				ereport(LOG,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("could not read file \"%s\": read %d of %zu",
-								DWB_CONTROL_FILE, r,
-								sizeof(DWBControlFileData))));
-			if (CloseTransientFile(fd) != 0)
-				ereport(LOG,
-						(errcode_for_file_access(),
-						 errmsg("could not close file \"%s\": %m",
-								DWB_CONTROL_FILE)));
-			*corruptp = true;
-			return false;
-		}
 		/* distinguish a real read error from a truncated file */
 		if (r < 0)
-			ereport(FATAL,
+			ereport(elevel,
 					(errcode_for_file_access(),
 					 errmsg("could not read file \"%s\": %m",
 							DWB_CONTROL_FILE)));
-		ereport(FATAL,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("could not read file \"%s\": read %d of %zu",
-						DWB_CONTROL_FILE, r, sizeof(DWBControlFileData))));
+		else
+			ereport(elevel,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read file \"%s\": read %d of %zu",
+							DWB_CONTROL_FILE, r,
+							sizeof(DWBControlFileData))));
+		if (CloseTransientFile(fd) != 0)
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not close file \"%s\": %m",
+							DWB_CONTROL_FILE)));
+		*corruptp = true;
+		return false;
 	}
 	if (CloseTransientFile(fd) != 0)
 		ereport(FATAL,
@@ -175,19 +157,12 @@ DWBReadControlFile(DWBControlFileData *control, bool missing_ok,
 	if (control->magic != DWB_CONTROL_MAGIC ||
 		!EQ_CRC32C(control->crc, DWBControlCrc(control)))
 	{
-		if (corruptp)
-		{
-			ereport(LOG,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("invalid checksum or magic number in file \"%s\"",
-							DWB_CONTROL_FILE)));
-			*corruptp = true;
-			return false;
-		}
-		ereport(FATAL,
+		ereport(elevel,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid checksum or magic number in file \"%s\"",
 						DWB_CONTROL_FILE)));
+		*corruptp = true;
+		return false;
 	}
 	if (control->min_version > DWB_VERSION)
 		ereport(FATAL,

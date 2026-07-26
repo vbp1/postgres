@@ -143,13 +143,8 @@ typedef struct DWBBatchHeader
 	uint64		batch_id;		/* incarnation id, assigned at batch open,
 								 * monotonic in open order within one server
 								 * run (next_batch_id restarts at 1 with each
-								 * start); the apply-pass breaks LSN ties
-								 * between slots of one generation by it — a
-								 * deterministic pick, not a strict later-copy
-								 * guarantee: with two writer classes a later
-								 * flush can land in an earlier-opened batch,
-								 * but equal-LSN copies differ only in hint
-								 * bits */
+								 * start); the apply-pass dedup uses it as an
+								 * LSN tie-breaker — see DWBApplyPass */
 	uint32		n_slots;		/* capped_slots at seal time */
 	pg_crc32c	crc;			/* CRC of all preceding fields */
 } DWBBatchHeader;

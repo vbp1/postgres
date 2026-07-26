@@ -21,6 +21,9 @@
 use strict;
 use warnings FATAL => 'all';
 use File::Path qw(rmtree);
+use FindBin;
+use lib $FindBin::RealBin;
+use DWBTest;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::RecursiveCopy;
 use PostgreSQL::Test::Utils;
@@ -40,29 +43,6 @@ bgwriter_lru_maxpages = 0
 log_min_messages = debug1
 ));
 $node->start;
-
-sub read_block
-{
-	my ($file, $blkno) = @_;
-	my $buf;
-
-	open my $fh, '<:raw', $file or die "could not open $file: $!";
-	sysseek($fh, $blkno * 8192, 0) or die "could not seek $file: $!";
-	sysread($fh, $buf, 8192) == 8192 or die "short read from $file: $!";
-	close $fh;
-	return $buf;
-}
-
-sub write_block
-{
-	my ($file, $blkno, $buf) = @_;
-
-	open my $fh, '+<:raw', $file or die "could not open $file: $!";
-	sysseek($fh, $blkno * 8192, 0) or die "could not seek $file: $!";
-	syswrite($fh, $buf) == length($buf) or die "short write to $file: $!";
-	close $fh;
-	return;
-}
 
 $node->safe_psql('postgres', q(
 	CREATE TABLE thint AS SELECT g AS id FROM generate_series(1, 100) g;

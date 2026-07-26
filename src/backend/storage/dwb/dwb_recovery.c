@@ -51,12 +51,8 @@ typedef struct DWBApplyCandidate
 {
 	BufferTag	tag;			/* hash key */
 	XLogRecPtr	lsn;
-	uint64		batch_id;		/* tie-breaker for equal LSNs: equal-LSN
-								 * copies of one generation can differ only in
-								 * hint bits, so either is a valid redo base
-								 * and the id (monotonic in batch-open order,
-								 * see DWBBatchHeader.batch_id) just makes the
-								 * pick deterministic */
+	uint64		batch_id;		/* LSN tie-breaker; see the dedup comment in
+								 * the scan loop below */
 	uint32		batch_idx;
 	uint32		slot_idx;
 	pg_crc32c	image_crc;		/* revalidates the image on re-read */
@@ -462,6 +458,17 @@ DWBStartup(bool restoring_backup)
 	bool		corrupt;
 	bool		need_apply;
 
+	/*
+	 * A ring shipped inside a restored backup must not survive in any mode:
+	 * dormant, it would greet a much later switch to double_writes with a
+	 * plausible control file, and under double_writes it must not be applied
+	 * (see the header comment).  Discard it before anything reads the ring
+	 * state.
+	 */
+	if (restoring_backup && DWBWipeRing())
+		ereport(LOG,
+				(errmsg("discarding double write buffer ring contents restored from a base backup")));
+
 	if (!DWBIsEnabled())
 	{
 		/*
@@ -475,17 +482,7 @@ DWBStartup(bool restoring_backup)
 					 errdetail("WAL carries no full page images; \"full_page_writes\" is ignored in this mode.")));
 
 		if (restoring_backup)
-		{
-			/*
-			 * A foreign ring shipped in a restored backup is dangerous even
-			 * lying dormant: a much later switch to double_writes would find
-			 * it with a plausible control file.  Discard it now.
-			 */
-			if (DWBWipeRing())
-				ereport(LOG,
-						(errmsg("discarding double write buffer ring contents restored from a base backup")));
 			return InvalidXLogRecPtr;
-		}
 
 		/*
 		 * Mode-downgrade guard: a ring that was not cleanly closed may hold
@@ -533,13 +530,6 @@ DWBStartup(bool restoring_backup)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("io_torn_pages_protection = \"double_writes\" requires data checksums"),
 				 errhint("Enable checksums with initdb -k or pg_checksums.")));
-
-	if (restoring_backup)
-	{
-		if (DWBWipeRing())
-			ereport(LOG,
-					(errmsg("discarding double write buffer ring contents restored from a base backup")));
-	}
 
 	if (!DWBReadControlFile(&control, true, NULL))
 	{
