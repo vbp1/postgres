@@ -184,16 +184,19 @@
    <firstterm>double write buffer</firstterm>, selected by setting
    <xref linkend="guc-io-torn-pages-protection"/> to
    <literal>double_writes</literal>.  Instead of recording page images in
-   WAL, every data page leaving shared buffers is first written and flushed
-   to a small reusable ring of files in the <filename>pg_dwb</filename>
+   WAL, every permanent data page leaving shared buffers is first written
+   and flushed to a small reusable ring of files in the
+   <filename>pg_dwb</filename>
    directory, and only then written to its actual location; a batch of
    pages is flushed to the ring with a single <function>fsync</function>,
    and ring space is reused as soon as the covered data-file writes have
    been made durable.  After a crash, the server scans the ring before WAL
    replay begins and rewrites every data page that is torn or older than
    its ring copy, so replay always starts from intact pages.  Since the
-   torn-page repair no longer depends on WAL contents, WAL carries no full
-   page images at all: WAL volume shrinks by their share, and the write
+   torn-page repair no longer depends on WAL contents, the automatic page
+   images written on the first modification after a checkpoint disappear
+   from WAL (operations that explicitly request a page image still log
+   one): WAL volume shrinks by their share, and the write
    bursts that follow each checkpoint flatten out.  In exchange every
    flushed data page is written twice, which moves the cost from the WAL
    device to the data-file write path.  This mode relies on data checksums

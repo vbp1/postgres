@@ -3442,15 +3442,18 @@ include_dir 'conf.d'
 
        <para>
         <literal>double_writes</literal> replaces the page images in WAL
-        with a <firstterm>double write buffer</firstterm>: every data page
-        leaving shared buffers is first written and flushed to a small
-        reusable ring of files in the <filename>pg_dwb</filename> directory,
-        and only then written to its actual location.  After a crash, pages
-        torn by interrupted writes are restored from their ring copies
-        before WAL replay begins.  WAL carries no full page images at all in
-        this mode, which can substantially reduce WAL volume and the
-        associated commit latency spikes after checkpoints, at the price of
-        writing every flushed data page twice.  See
+        with a <firstterm>double write buffer</firstterm>: every permanent
+        data page leaving shared buffers is first written and flushed to a
+        small reusable ring of files in the <filename>pg_dwb</filename>
+        directory, and only then written to its actual location.  After a
+        crash, pages torn by interrupted writes are restored from their
+        ring copies before WAL replay begins.  The automatic page images
+        that <literal>full_pages</literal> mode writes into WAL on the
+        first modification after a checkpoint are not written in this mode
+        (operations that explicitly request a page image still log one),
+        which can substantially reduce WAL volume and the associated commit
+        latency spikes after checkpoints, at the price of writing every
+        flushed data page twice.  See
         <xref linkend="wal-reliability"/> for discussion.  This mode
         requires data checksums (see <xref linkend="app-initdb-data-checksums"/>);
         the server refuses to start without them.  An active base backup

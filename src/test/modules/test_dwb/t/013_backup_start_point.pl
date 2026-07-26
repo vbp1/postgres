@@ -74,6 +74,9 @@ ok( $restored->log_contains(
 		qr/discarding double write buffer ring contents restored from a base backup/,
 		$log_offset),
 	'the label start discarded the copied ring');
+ok( !$restored->log_contains(
+		qr/double write buffer recovery:/, $log_offset),
+	'... and ran no apply-pass');
 
 ok(!-f "$pgdata/backup_label", 'the failed recovery consumed backup_label');
 ok(-f "$pgdata/backup_label.old", '... renaming it out of the way');
@@ -95,6 +98,6 @@ ok( $restored->log_contains(
 	'backupStartPoint alone still discards the ring');
 ok( !$restored->log_contains(
 		qr/double write buffer recovery:/, $log_offset),
-	'... and no apply-pass ran on either start');
+	'... and no apply-pass ran on the second start either');
 
 done_testing();
