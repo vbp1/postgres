@@ -24,11 +24,14 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/bufpage.h"
+#include "storage/checksum.h"
 #include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
 #include "utils/builtins.h"
+#include "utils/pg_lsn.h"
+#include "varatt.h"
 
 PG_MODULE_MAGIC;
 
@@ -791,6 +794,145 @@ test_dwb_open_stale(PG_FUNCTION_ARGS)
 	DWBWaitBatchFsynced(&ref);
 	DWBReleaseSlot(&ref);
 	(void) DWBRetireAllSync();
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Write a synthetic single-slot batch file directly into pg_dwb/, bypassing
+ * the ring state machine.  The apply-pass dedup scenarios need on-disk
+ * layouts — the same page in two batches with chosen LSNs and batch_ids —
+ * that the runtime write path cannot be steered into: a sequential writer
+ * keeps reusing the lowest free ring index, so only the last copy of a page
+ * survives on disk.
+ *
+ * The image is the target block's current on-disk content with the given
+ * LSN, the marker planted in the page hole and the checksum recomputed, so
+ * an applied image is a valid page the server can read back afterwards.
+ * The caller keeps the batch index away from runtime traffic (quiet server,
+ * high index) and must not hand out an LSN beyond the current WAL insert
+ * position: it ends up as a real page LSN, and a later flush of that page
+ * would ask XLogFlush for WAL that does not exist.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_craft_batch);
+Datum
+test_dwb_craft_batch(PG_FUNCTION_ARGS)
+{
+	int			batch_idx = PG_GETARG_INT32(0);
+	uint64		batch_id = (uint64) PG_GETARG_INT64(1);
+	Oid			relnumber = PG_GETARG_OID(2);
+	BlockNumber blkno = (BlockNumber) PG_GETARG_INT32(3);
+	XLogRecPtr	lsn = PG_GETARG_LSN(4);
+	text	   *marker = PG_GETARG_TEXT_PP(5);
+	BufferTag	tag = make_tag(MyDatabaseId, relnumber, blkno);
+	DWBControlFileData control;
+	DWBBatchHeader hdr;
+	DWSlotMeta	meta;
+	static PGAlignedBlock image;
+	PageHeader	ph = (PageHeader) image.data;
+	RelPathStr	relpath;
+	char		path[MAXPGPATH];
+	char	   *region;
+	Size		region_size;
+	int			fd;
+
+	check_dwb_enabled();
+
+	if (!DWBReadControlFile(&control, false, NULL))
+		pg_unreachable();
+	if (batch_idx < 0 || (uint32) batch_idx >= control.num_batches)
+		ereport(ERROR, (errmsg("batch index out of range")));
+
+	/* base image: the block's current on-disk content */
+	relpath = relpathperm(BufTagGetRelFileLocator(&tag), MAIN_FORKNUM);
+	fd = OpenTransientFile(relpath.str, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", relpath.str)));
+	errno = 0;
+	if (pg_pread(fd, image.data, BLCKSZ, (off_t) blkno * BLCKSZ) != BLCKSZ)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read block %u of file \"%s\": %m",
+						blkno, relpath.str)));
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", relpath.str)));
+
+	if (PageIsNew((Page) image.data))
+		ereport(ERROR,
+				(errmsg("block %u of \"%s\" is empty on disk; CHECKPOINT first",
+						blkno, relpath.str)));
+	if ((Size) (ph->pd_upper - ph->pd_lower) < VARSIZE_ANY_EXHDR(marker))
+		ereport(ERROR, (errmsg("marker does not fit into the page hole")));
+
+	memcpy(image.data + ph->pd_lower, VARDATA_ANY(marker),
+		   VARSIZE_ANY_EXHDR(marker));
+	PageSetLSN((Page) image.data, lsn);
+	ph->pd_checksum = pg_checksum_page(image.data, blkno);
+
+	memset(&meta, 0, sizeof(meta));
+	meta.tag = tag;
+	meta.page_lsn = lsn;
+	meta.generation = control.generation;
+	meta.image_crc = DWBImageCrc(image.data);
+	meta.meta_crc = DWBSlotMetaCrc(&meta);
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = DWB_BATCH_MAGIC;
+	hdr.version = DWB_VERSION;
+	hdr.batch_id = batch_id;
+	hdr.n_slots = 1;
+	hdr.crc = DWBBatchHeaderCrc(&hdr);
+
+	region_size = DWBMetaRegionSize(control.batch_pages);
+	region = palloc0(region_size);
+	memcpy(region, &hdr, sizeof(hdr));
+	memcpy(region + sizeof(hdr), &meta, sizeof(meta));
+
+	DWBBatchFilePath(path, batch_idx);
+	fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+	errno = 0;
+	if (pg_pwrite(fd, region, region_size, 0) != (ssize_t) region_size ||
+		pg_pwrite(fd, image.data, BLCKSZ, (off_t) region_size) != BLCKSZ)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", path)));
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", path)));
+	pfree(region);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Rewrite pg_dwb/control with the given min_version (and a matching CRC):
+ * the state a ring left behind by a newer server would present after a
+ * binary downgrade.  The next start must refuse it with the format-version
+ * FATAL, never with the "corrupt, remove pg_dwb" advice — the ring is
+ * intact and may hold unapplied repairs only the newer server can read.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_set_control_min_version);
+Datum
+test_dwb_set_control_min_version(PG_FUNCTION_ARGS)
+{
+	DWBControlFileData control;
+
+	check_dwb_enabled();
+
+	if (!DWBReadControlFile(&control, false, NULL))
+		pg_unreachable();
+	control.min_version = (uint32) PG_GETARG_INT32(0);
+	control.crc = DWBControlCrc(&control);
+	DWBWriteControlFile(&control);
 
 	PG_RETURN_VOID();
 }

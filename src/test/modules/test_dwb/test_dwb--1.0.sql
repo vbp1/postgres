@@ -74,3 +74,12 @@ CREATE FUNCTION test_dwb_park(relnumber oid)
 CREATE FUNCTION test_dwb_stale_snapshot(relnumber oid)
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_craft_batch(batch_idx int, batch_id int8,
+	relnumber oid, blkno int, lsn pg_lsn, marker text)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_set_control_min_version(min_version int)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;

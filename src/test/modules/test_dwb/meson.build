@@ -48,6 +48,9 @@ tests += {
       't/009_fpw_transition.pl',
       't/010_recovery.pl',
       't/011_geometry_recovery.pl',
+      't/012_apply_crafted.pl',
+      't/013_backup_start_point.pl',
+      't/014_pg_upgrade.pl',
     ],
   },
 }

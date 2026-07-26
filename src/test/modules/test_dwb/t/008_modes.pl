@@ -217,4 +217,60 @@ ok( $node->log_contains(
 		$log_offset),
 	'crash under "off" draws a warning on the protected restart');
 
+# --- a ring of a newer format version is refused intact ------------------
+
+# A binary downgrade can meet a ring whose min_version exceeds what this
+# server reads.  That ring is intact and may hold unapplied repairs only
+# the newer server understands, so the refusal must name the version gap —
+# never the "corrupt, remove pg_dwb" advice, which would invite discarding
+# it.
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = double_writes');
+$node->restart;
+$node->safe_psql('postgres', 'CREATE EXTENSION test_dwb');
+$node->safe_psql('postgres', 'SELECT test_dwb_set_control_min_version(2)');
+# an immediate stop: a clean shutdown would try to rewrite the control
+$node->stop('immediate');
+
+$log_offset = -s $node->logfile;
+$ret = $node->start(fail_ok => 1);
+is($ret, 0, 'a too-new ring format refuses the start');
+ok( $node->log_contains(
+		qr!FATAL: .* file "pg_dwb/control" requires format version at least 2, but this server supports 1!,
+		$log_offset),
+	'... naming the version gap');
+ok( !$node->log_contains(qr/could not be validated/, $log_offset),
+	'... and not the corrupt-ring advice');
+
+# the intact-but-unreadable ring can only be resolved by removal
+rmtree($node->data_dir . '/pg_dwb');
+$log_offset = -s $node->logfile;
+$node->start;
+ok( $node->log_contains(
+		qr/ring opened: .* generation 1\b/, $log_offset),
+	'removing the newer ring unblocks a fresh double_writes start');
+
+# --- leftovers of an interrupted wipe are swept, not fatal ---------------
+
+# DWBWipeRing removes the control first, durably: a crash between that and
+# the batch sweep leaves batch files behind a missing control.  The next
+# start must take the cold-create path and clear them — a start that
+# trusted the batch files would fail on the missing control forever.
+$node->stop;
+unlink($node->data_dir . '/pg_dwb/control')
+  or die "unlink pg_dwb/control: $!";
+my $leftover = $node->data_dir . '/pg_dwb/batch_9999';
+open my $lf, '>', $leftover or die "open $leftover: $!";
+print $lf 'leftover of an interrupted wipe';
+close $lf;
+
+$log_offset = -s $node->logfile;
+$node->start;
+ok( !$node->log_contains(qr/double write buffer recovery:/, $log_offset),
+	'no apply-pass over the swept leftovers');
+ok( $node->log_contains(
+		qr/ring opened: .* generation 1\b/, $log_offset),
+	'the interrupted-wipe state cold-starts a fresh ring');
+ok(!-e $leftover, 'the leftover batch file is gone');
+
 done_testing();

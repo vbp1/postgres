@@ -122,4 +122,27 @@ $primary->wait_for_catchup($standby);
 is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpw'),
 	'3000', 'and replays the image-less WAL');
 
+# --- a crash of a double_writes standby of an "off" primary is quiet ------
+
+# The crash-under-off warning keys on pg_control's io_torn_pages_protection,
+# which on a standby describes the PRIMARY's run, not the one that crashed
+# here.  A double_writes standby of an "off" primary repairs its own torn
+# pages from its own ring, so its crash restart must stay silent.
+$primary->append_conf('postgresql.conf', 'io_torn_pages_protection = off');
+$primary->restart;
+$primary->safe_psql('postgres',
+	'INSERT INTO dwb_fpw SELECT g FROM generate_series(3001, 4000) g');
+$primary->wait_for_catchup($standby);
+
+$standby->stop('immediate');
+my $warn_offset = -s $standby->logfile;
+$standby->start;
+ok( !$standby->log_contains(
+		qr/interrupted while torn page protection was disabled/,
+		$warn_offset),
+	'crashed double_writes standby of an "off" primary draws no warning');
+$primary->wait_for_catchup($standby);
+is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpw'),
+	'4000', 'and keeps replaying');
+
 done_testing();

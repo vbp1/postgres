@@ -118,6 +118,10 @@ ok( $restored->log_contains(
 		qr/double write buffer ring opened: 16 batches of 16 pages, generation 1\b/,
 		$restored_log_offset),
 	'restored cluster opened a fresh ring');
+ok( !$restored->log_contains(
+		qr/discarding double write buffer ring contents/,
+		$restored_log_offset),
+	'... without claiming to discard the empty restored pg_dwb');
 is( $restored->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
 	'100', 'restored data is intact');
 $restored->stop;
