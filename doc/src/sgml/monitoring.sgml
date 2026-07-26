@@ -2664,6 +2664,13 @@ description | Waiting for a newly initialized WAL file to reach durable storage
         </listitem>
         <listitem>
          <para>
+          <literal>dwb</literal>: The double write buffer ring in
+          <filename>pg_dwb</filename> (see
+          <xref linkend="guc-io-torn-pages-protection"/>).
+         </para>
+        </listitem>
+        <listitem>
+         <para>
           <literal>wal</literal>: Write Ahead Logs.
          </para>
         </listitem>

@@ -115,7 +115,11 @@ PostgreSQL documentation
     <listitem>
      <para>
       All WAL records required for the backup must contain sufficient full-page writes,
-      which requires you to enable <varname>full_page_writes</varname> on the primary.
+      which requires you to enable <varname>full_page_writes</varname> on the
+      primary and to run it with <xref linkend="guc-io-torn-pages-protection"/>
+      set to <literal>full_pages</literal>.  In the other modes the primary
+      writes no page images and a standby has no way to request them, so a
+      backup taken from the standby is refused.
      </para>
     </listitem>
    </itemizedlist>

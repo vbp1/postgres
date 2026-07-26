@@ -180,6 +180,30 @@
    they guarantee that data is written to the BBU as full (8kB) pages.
   </para>
   <para>
+   An alternative protection against partial page writes is the
+   <firstterm>double write buffer</firstterm>, selected by setting
+   <xref linkend="guc-io-torn-pages-protection"/> to
+   <literal>double_writes</literal>.  Instead of recording page images in
+   WAL, every data page leaving shared buffers is first written and flushed
+   to a small reusable ring of files in the <filename>pg_dwb</filename>
+   directory, and only then written to its actual location; a batch of
+   pages is flushed to the ring with a single <function>fsync</function>,
+   and ring space is reused as soon as the covered data-file writes have
+   been made durable.  After a crash, the server scans the ring before WAL
+   replay begins and rewrites every data page that is torn or older than
+   its ring copy, so replay always starts from intact pages.  Since the
+   torn-page repair no longer depends on WAL contents, WAL carries no full
+   page images at all: WAL volume shrinks by their share, and the write
+   bursts that follow each checkpoint flatten out.  In exchange every
+   flushed data page is written twice, which moves the cost from the WAL
+   device to the data-file write path.  This mode relies on data checksums
+   to detect torn pages, so checksums must be enabled.  The ring only
+   repairs pages torn by the local instance's own writes: it is excluded
+   from base backups, and a backup taken while this mode is active
+   temporarily carries forced page images in WAL instead (see
+   <xref linkend="backup-base-backup"/>).
+  </para>
+  <para>
    <productname>PostgreSQL</productname> also protects against some kinds of data corruption
    on storage devices that may occur because of hardware errors or media failure over time,
    such as reading/writing garbage data.

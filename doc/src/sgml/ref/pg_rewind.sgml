@@ -359,6 +359,19 @@ GRANT EXECUTE ON function pg_catalog.pg_read_binary_file(text, bigint, bigint, b
 </programlisting>
   </para>
 
+  <para>
+   When the source is a running server, it must run with
+   <xref linkend="guc-io-torn-pages-protection"/> set to
+   <literal>full_pages</literal> and <varname>full_page_writes</varname>
+   enabled: <application>pg_rewind</application> reads data blocks from the
+   source while they may be concurrently written, and such a torn read is
+   only repaired by the full page images the target replays afterwards.  A
+   cleanly shut down source can be used whatever its mode.  The double
+   write buffer ring in <filename>pg_dwb</filename> is never copied from
+   the source, and the target's own ring contents are discarded when the
+   rewound cluster first starts.
+  </para>
+
   <refsect2>
    <title>How It Works</title>
 
