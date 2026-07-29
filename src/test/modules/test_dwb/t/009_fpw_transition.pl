@@ -107,7 +107,8 @@ ok( $standby->log_contains(
 
 # --- a double_writes standby follows the same primary --------------------
 
-$standby->append_conf('postgresql.conf', qq(
+$standby->append_conf(
+	'postgresql.conf', qq(
 io_torn_pages_protection = double_writes
 dwb_num_batches = 16
 dwb_batch_pages = 16
@@ -119,7 +120,7 @@ ok( $standby->log_contains(
 		$ring_offset),
 	'reconfigured standby cold-starts a ring of its own');
 $primary->wait_for_catchup($standby);
-is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpw'),
+is($standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpw'),
 	'3000', 'and replays the image-less WAL');
 
 # --- a crash of a double_writes standby of an "off" primary is quiet ------
@@ -138,11 +139,11 @@ $standby->stop('immediate');
 my $warn_offset = -s $standby->logfile;
 $standby->start;
 ok( !$standby->log_contains(
-		qr/interrupted while torn page protection was disabled/,
-		$warn_offset),
+		qr/interrupted while torn page protection was disabled/, $warn_offset
+	),
 	'crashed double_writes standby of an "off" primary draws no warning');
 $primary->wait_for_catchup($standby);
-is( $standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpw'),
+is($standby->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpw'),
 	'4000', 'and keeps replaying');
 
 done_testing();

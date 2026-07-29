@@ -37,17 +37,18 @@ log_min_messages = debug1
 $primary->start;
 $primary->safe_psql('postgres', 'CREATE EXTENSION test_dwb');
 
-$primary->safe_psql('postgres', q(
+$primary->safe_psql(
+	'postgres', q(
 	CREATE TABLE tlsn AS SELECT g AS id FROM generate_series(1, 100) g;
 	CREATE TABLE ttie AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $primary->safe_psql('postgres', 'CHECKPOINT');
 
 my $tlsn_file =
-  $primary->data_dir . '/'
+	$primary->data_dir . '/'
   . $primary->safe_psql('postgres', "SELECT pg_relation_filepath('tlsn')");
 my $ttie_file =
-  $primary->data_dir . '/'
+	$primary->data_dir . '/'
   . $primary->safe_psql('postgres', "SELECT pg_relation_filepath('ttie')");
 my $tlsn_relnum = $primary->safe_psql('postgres',
 	"SELECT relfilenode FROM pg_class WHERE relname = 'tlsn'");
@@ -71,7 +72,8 @@ my ($lsn_a, $lsn_b) = split /\|/,
 # The LSN pair goes into batches 14/15.  The tie pair goes into 12/13 with
 # the HIGHER batch_id in the LOWER batch index, so a comparator that merely
 # kept the later-scanned candidate would pick the wrong slot.
-$primary->safe_psql('postgres', qq(
+$primary->safe_psql(
+	'postgres', qq(
 	SELECT test_dwb_craft_batch(14, 501, $tlsn_relnum, 0, '$lsn_a', 'DWBLSNLOSER');
 	SELECT test_dwb_craft_batch(15, 502, $tlsn_relnum, 0, '$lsn_b', 'DWBLSNWINNER');
 	SELECT test_dwb_craft_batch(12, 601, $ttie_relnum, 0, '$insert_lsn', 'DWBTIEWINNER');
@@ -90,18 +92,19 @@ ok( $primary->log_contains(
 		$log_offset),
 	'on equal LSNs the higher batch_id won, against scan order');
 
-like(read_block($tlsn_file, 0), qr/DWBLSNWINNER/,
-	'winning image is on disk');
-unlike(read_block($tlsn_file, 0), qr/DWBLSNLOSER/,
-	'... and the losing image is not');
-like(read_block($ttie_file, 0), qr/DWBTIEWINNER/,
-	'winning tie image is on disk');
-unlike(read_block($ttie_file, 0), qr/DWBTIELOSER/,
-	'... and the losing tie image is not');
+like(read_block($tlsn_file, 0), qr/DWBLSNWINNER/, 'winning image is on disk');
+unlike(read_block($tlsn_file, 0),
+	qr/DWBLSNLOSER/, '... and the losing image is not');
+like(read_block($ttie_file, 0),
+	qr/DWBTIEWINNER/, 'winning tie image is on disk');
+unlike(read_block($ttie_file, 0),
+	qr/DWBTIELOSER/, '... and the losing tie image is not');
 
 is( $primary->safe_psql(
-		'postgres', 'SELECT count(*) FROM tlsn UNION ALL SELECT count(*) FROM ttie'),
-	"100\n100", 'both repaired pages read back fine');
+		'postgres',
+		'SELECT count(*) FROM tlsn UNION ALL SELECT count(*) FROM ttie'),
+	"100\n100",
+	'both repaired pages read back fine');
 
 # --- a crafted slot beyond minRecoveryPoint raises it on the standby ------
 
@@ -110,7 +113,8 @@ my $standby = PostgreSQL::Test::Cluster->new('dwb_craft_standby');
 $standby->init_from_backup($primary, 'bkp', has_streaming => 1);
 $standby->start;
 
-$primary->safe_psql('postgres', q(
+$primary->safe_psql(
+	'postgres', q(
 	CREATE TABLE tmrp AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $primary->safe_psql('postgres', 'CHECKPOINT');
@@ -120,7 +124,7 @@ $standby->safe_psql('postgres', 'CHECKPOINT');
 my $tmrp_relnum = $standby->safe_psql('postgres',
 	"SELECT relfilenode FROM pg_class WHERE relname = 'tmrp'");
 my $tmrp_file =
-  $standby->data_dir . '/'
+	$standby->data_dir . '/'
   . $standby->safe_psql('postgres', "SELECT pg_relation_filepath('tmrp')");
 
 # Hold replay while the primary moves ahead: the standby then holds
@@ -134,7 +138,8 @@ my $mrp_lsn =
 $primary->wait_for_catchup($standby, 'flush', $mrp_lsn);
 
 $standby->safe_psql('postgres',
-	"SELECT test_dwb_craft_batch(15, 700, $tmrp_relnum, 0, '$mrp_lsn', 'DWBMRPMARK')");
+	"SELECT test_dwb_craft_batch(15, 700, $tmrp_relnum, 0, '$mrp_lsn', 'DWBMRPMARK')"
+);
 $standby->stop('immediate');
 
 $log_offset = -s $standby->logfile;
@@ -148,11 +153,11 @@ ok( $standby->log_contains(
 		qr/raising minimum recovery point to $mrp_re to cover pages repaired from the double write buffer/,
 		$log_offset),
 	'minimum recovery point raised to the applied LSN');
-like(read_block($tmrp_file, 0), qr/DWBMRPMARK/,
-	'crafted image is on the standby disk');
+like(read_block($tmrp_file, 0),
+	qr/DWBMRPMARK/, 'crafted image is on the standby disk');
 
 $primary->wait_for_catchup($standby);
-is( $standby->safe_psql('postgres', 'SELECT count(*) FROM tmrp'),
+is($standby->safe_psql('postgres', 'SELECT count(*) FROM tmrp'),
 	'100', 'standby reads the repaired page fine');
 
 done_testing();

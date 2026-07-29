@@ -929,8 +929,8 @@ PostmasterMain(int argc, char *argv[])
 	ApplyLauncherRegister();
 
 	/*
-	 * Register the double write buffer retire workers, for the same
-	 * reason: the ring cannot circulate without them.
+	 * Register the double write buffer retire workers, for the same reason:
+	 * the ring cannot circulate without them.
 	 */
 	DWBRetireWorkersRegister();
 

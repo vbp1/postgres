@@ -27,7 +27,8 @@ autovacuum = off
 ));
 $node->start;
 
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE dwb_fpi AS
 		SELECT g AS id, repeat('f', 64) AS pad FROM generate_series(1, 100) g;
 ));
@@ -43,13 +44,16 @@ my $fpi_filenode =
 # stays meaningful.
 $node->safe_psql('postgres', 'CHECKPOINT');
 my $lsn0 = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
-$node->safe_psql('postgres', "UPDATE dwb_fpi SET pad = repeat('a', 64) WHERE id = 1");
+$node->safe_psql('postgres',
+	"UPDATE dwb_fpi SET pad = repeat('a', 64) WHERE id = 1");
 my $lsn1 = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 
 my ($waldump, $walerr) = run_command(
 	[
-		'pg_waldump', '--path' => $node->data_dir . '/pg_wal',
-		'--start' => $lsn0, '--end' => $lsn1
+		'pg_waldump',
+		'--path' => $node->data_dir . '/pg_wal',
+		'--start' => $lsn0,
+		'--end' => $lsn1
 	]);
 is($walerr, '', 'pg_waldump read the no-backup window cleanly');
 like($waldump, qr/Heap/, 'the WAL window covers the update');
@@ -65,13 +69,16 @@ $bk->query_safe('SET client_min_messages = warning');
 $bk->query_safe("SELECT pg_backup_start('dwb_fpi_probe', true)");
 
 my $lsn2 = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
-$node->safe_psql('postgres', "UPDATE dwb_fpi SET pad = repeat('b', 64) WHERE id = 2");
+$node->safe_psql('postgres',
+	"UPDATE dwb_fpi SET pad = repeat('b', 64) WHERE id = 2");
 my $lsn3 = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 
 ($waldump, $walerr) = run_command(
 	[
-		'pg_waldump', '--path' => $node->data_dir . '/pg_wal',
-		'--start' => $lsn2, '--end' => $lsn3
+		'pg_waldump',
+		'--path' => $node->data_dir . '/pg_wal',
+		'--start' => $lsn2,
+		'--end' => $lsn3
 	]);
 is($walerr, '', 'pg_waldump read the backup window cleanly');
 like(
@@ -85,7 +92,7 @@ $bk->quit;
 # --- the backup keeps pg_dwb as an empty directory ------------------------
 
 # guard against a vacuous emptiness assert: the source ring is non-empty
-ok(-f $node->data_dir . '/pg_dwb/control',
+ok( -f $node->data_dir . '/pg_dwb/control',
 	'the source cluster has ring files to exclude');
 
 my $backup_path = $node->backup_dir . '/content_check';
@@ -98,7 +105,9 @@ my ($out, $err) = run_command(
 		'--checkpoint' => 'fast'
 	]);
 ok(-f "$backup_path/PG_VERSION", 'backup completed');
-unlike($err, qr/WARNING|skipping special file/,
+unlike(
+	$err,
+	qr/WARNING|skipping special file/,
 	'pg_basebackup issued no warnings');
 ok(-d "$backup_path/pg_dwb", 'backup contains a pg_dwb directory');
 {
@@ -122,7 +131,7 @@ ok( !$restored->log_contains(
 		qr/discarding double write buffer ring contents/,
 		$restored_log_offset),
 	'... without claiming to discard the empty restored pg_dwb');
-is( $restored->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
+is($restored->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
 	'100', 'restored data is intact');
 $restored->stop;
 
@@ -138,7 +147,7 @@ $restored->stop;
 # pins that the wipe comes before any ring-state read.
 my $planted = PostgreSQL::Test::Cluster->new('dwb_planted');
 $planted->init_from_backup($node, 'content_check');
-ok(-f $planted->data_dir . '/backup_label',
+ok( -f $planted->data_dir . '/backup_label',
 	'the restore still carries backup_label');
 append_to_file($planted->data_dir . '/pg_dwb/control', 'torn by the tool');
 append_to_file($planted->data_dir . '/pg_dwb/batch_9999', 'foreign slots');
@@ -150,7 +159,8 @@ ok( $planted->log_contains(
 		$planted_log_offset),
 	'the restored ring is discarded');
 ok( !$planted->log_contains(
-		qr/double write buffer recovery:/, $planted_log_offset),
+		qr/double write buffer recovery:/,
+		$planted_log_offset),
 	'... without an apply-pass over it');
 ok( $planted->log_contains(
 		qr/ring opened: 16 batches of 16 pages, generation 1\b/,
@@ -158,7 +168,7 @@ ok( $planted->log_contains(
 	'... and a fresh ring is created cold');
 ok(!-f $planted->data_dir . '/pg_dwb/batch_9999',
 	'the foreign ring files are gone');
-is( $planted->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
+is($planted->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
 	'100', 'restored data is intact');
 
 # once the backup recovery is over the guard is gone: an ordinary crash
@@ -194,9 +204,9 @@ ok( $planted_fp->log_contains(
 	'a full_pages restore discards the planted ring too');
 ok(!-f $planted_fp->data_dir . '/pg_dwb/batch_9999',
 	'... removing the foreign files');
-ok( !$planted_fp->log_contains(qr/ring opened/, $planted_fp_log_offset),
+ok(!$planted_fp->log_contains(qr/ring opened/, $planted_fp_log_offset),
 	'... without creating a ring it will not use');
-is( $planted_fp->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
+is($planted_fp->safe_psql('postgres', 'SELECT count(*) FROM dwb_fpi'),
 	'100', 'restored data is intact under full_pages');
 $planted_fp->stop;
 
@@ -223,10 +233,13 @@ SKIP:
 			'--port' => $node->port,
 			'--checkpoint' => 'fast'
 		]);
-	ok(-f "$link_backup/PG_VERSION", 'backup of the symlinked ring completed');
-	unlike($err, qr/WARNING|skipping special file/,
+	ok(-f "$link_backup/PG_VERSION",
+		'backup of the symlinked ring completed');
+	unlike(
+		$err,
+		qr/WARNING|skipping special file/,
 		'no warnings for the symlinked pg_dwb');
-	ok(-d "$link_backup/pg_dwb" && !-l "$link_backup/pg_dwb",
+	ok( -d "$link_backup/pg_dwb" && !-l "$link_backup/pg_dwb",
 		'symlinked pg_dwb became a real directory in the backup');
 	opendir(my $dh, "$link_backup/pg_dwb") or die "opendir: $!";
 	my @entries = grep { !/^\.\.?$/ } readdir($dh);

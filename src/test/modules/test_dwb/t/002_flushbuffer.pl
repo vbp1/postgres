@@ -32,13 +32,14 @@ $node->safe_psql('postgres', 'CREATE EXTENSION test_dwb');
 
 # the workers start asynchronously once the server is up
 $node->poll_query_until('postgres',
-	"SELECT count(*) = 2 FROM pg_stat_activity WHERE backend_type = 'dwb retire worker'")
-  or die 'timed out waiting for the retire workers to start';
+	"SELECT count(*) = 2 FROM pg_stat_activity WHERE backend_type = 'dwb retire worker'"
+) or die 'timed out waiting for the retire workers to start';
 pass('both retire workers are running');
 
 # --- a real workload flows through the ring ------------------------------
 
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE dwb_t AS
 		SELECT g AS id, repeat('x', 300) AS filler
 		FROM generate_series(1, 50000) g;
@@ -46,13 +47,12 @@ $node->safe_psql('postgres', q(
 ));
 $node->safe_psql('postgres', 'CHECKPOINT');
 
-is( $node->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
 	'50000', 'workload survived the DWB write path');
 
 # The workload far exceeds shared_buffers, so evictions must have staged
 # real pages into the ring under the current generation.
-cmp_ok(
-	$node->safe_psql('postgres', 'SELECT test_dwb_ring_slots(true)'),
+cmp_ok($node->safe_psql('postgres', 'SELECT test_dwb_ring_slots(true)'),
 	'>', 0, 'real pages were staged into the ring');
 
 # --- the worker pool retires everything ----------------------------------
@@ -66,8 +66,10 @@ pass('retire workers returned the ring to all-free');
 
 is( $node->safe_psql(
 		'postgres',
-		"SELECT sum(writes) > 0 AND sum(fsyncs) > 0 FROM pg_stat_io WHERE object = 'dwb'"),
-	't', 'pg_stat_io shows double write buffer writes and fsyncs');
+		"SELECT sum(writes) > 0 AND sum(fsyncs) > 0 FROM pg_stat_io WHERE object = 'dwb'"
+	),
+	't',
+	'pg_stat_io shows double write buffer writes and fsyncs');
 
 # --- crash recovery: data intact, generation bumped ----------------------
 
@@ -79,7 +81,7 @@ $node->safe_psql('postgres',
 $node->stop('immediate');
 $node->start;
 
-is( $node->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
 	'50000', 'data intact after crash recovery');
 
 # --- unlogged relations bypass the double write buffer -------------------
@@ -90,7 +92,8 @@ is( $node->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
 # buffers.  The assertion reads the ring itself: a broken gate would leave
 # dwb_ul's tags in batch files, and no stray permanent-page flush can fake
 # that.
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE UNLOGGED TABLE dwb_ul AS
 		SELECT g AS id, repeat('u', 300) AS filler
 		FROM generate_series(1, 1000) g;
@@ -101,21 +104,25 @@ my $ul_filenode =
 my $t_filenode =
   $node->safe_psql('postgres', "SELECT pg_relation_filenode('dwb_t')");
 my $rel_pre = $node->safe_psql('postgres',
-	"SELECT COALESCE(sum(writes), 0) FROM pg_stat_io "
+		"SELECT COALESCE(sum(writes), 0) FROM pg_stat_io "
 	  . "WHERE object = 'relation' AND backend_type = 'checkpointer'");
 $node->restart;
 cmp_ok(
-	$node->safe_psql('postgres',
+	$node->safe_psql(
+		'postgres',
 		"SELECT COALESCE(sum(writes), 0) FROM pg_stat_io "
 		  . "WHERE object = 'relation' AND backend_type = 'checkpointer'"),
-	'>', $rel_pre, 'shutdown checkpoint flushed the unlogged pages');
-is( $node->safe_psql('postgres',
-		"SELECT test_dwb_ring_rel_slots($ul_filenode)"),
-	'0', 'no unlogged page ever entered the ring');
+	'>', $rel_pre,
+	'shutdown checkpoint flushed the unlogged pages');
+is( $node->safe_psql(
+		'postgres', "SELECT test_dwb_ring_rel_slots($ul_filenode)"),
+	'0',
+	'no unlogged page ever entered the ring');
 cmp_ok(
-	$node->safe_psql('postgres',
-		"SELECT test_dwb_ring_rel_slots($t_filenode)"),
-	'>', 0, 'permanent pages did enter the ring (control)');
+	$node->safe_psql(
+		'postgres', "SELECT test_dwb_ring_rel_slots($t_filenode)"),
+	'>', 0,
+	'permanent pages did enter the ring (control)');
 
 # --- the write path is self-sufficient without the worker pool -----------
 
@@ -127,7 +134,7 @@ $node->restart;
 $node->safe_psql('postgres',
 	"UPDATE dwb_t SET filler = repeat('n', 300) WHERE id % 5 = 0");
 $node->safe_psql('postgres', 'CHECKPOINT');
-is( $node->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM dwb_t'),
 	'50000', 'workload survived the no-pool write path');
 $node->poll_query_until('postgres',
 	"SELECT test_dwb_states() LIKE 'free=16 %'")

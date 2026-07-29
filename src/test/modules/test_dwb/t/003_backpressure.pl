@@ -46,7 +46,8 @@ $node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
 
 # Dirty pages for the checkpointer scenario, created while the ring is
 # still healthy and small enough to stay in shared_buffers.
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE dwb_dirty AS
 		SELECT g AS id, repeat('d', 300) AS filler
 		FROM generate_series(1, 1000) g;
@@ -66,7 +67,8 @@ cmp_ok($taken, '>', 0, 'ring exhausted by leaked refs');
 # The victim outgrows shared_buffers, so it must evict its own dirty pages
 # through the exhausted ring.  Its rollback drops its buffers unwritten,
 # leaving the pool clean for the sessions that follow.
-my ($rc, $out, $err) = $node->psql('postgres', q(
+my ($rc, $out, $err) = $node->psql(
+	'postgres', q(
 	CREATE TABLE dwb_victim AS
 		SELECT g AS id, repeat('v', 300) AS filler
 		FROM generate_series(1, 80000) g;
@@ -77,7 +79,7 @@ like(
 	qr/double write buffer retirement made no progress/,
 	'stall ERROR reported to the writer');
 
-is( $node->safe_psql('postgres', 'SELECT 1'),
+is($node->safe_psql('postgres', 'SELECT 1'),
 	'1', 'cluster alive after the writer ERROR');
 
 $node->safe_psql('postgres',
@@ -88,7 +90,7 @@ $node->safe_psql('postgres',
 # CASEs order the side effects before the state probe).
 $filler->quit;
 $node->poll_query_until('postgres',
-	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
+		"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
 	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
 	  . "test_dwb_states() LIKE 'free=16 %' END END")
   or die 'timed out waiting for the ring to drain after the ERROR scenario';
@@ -120,7 +122,7 @@ ok( $node->log_contains(
 		'double write buffer retirement made no progress', $log_offset),
 	'checkpointer stall escalated to the role-policy PANIC');
 
-is( $node->safe_psql('postgres', 'SELECT count(*) FROM dwb_dirty'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM dwb_dirty'),
 	'1000', 'data intact after crash recovery');
 
 # --- Stage A warning fires on the real clock ------------------------------
@@ -153,9 +155,10 @@ like(
 
 $filler->quit;
 $node->poll_query_until('postgres',
-	"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
+		"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
 	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
 	  . "test_dwb_states() LIKE 'free=16 %' END END")
-  or die 'timed out waiting for the ring to drain after the slow-warn scenario';
+  or die
+  'timed out waiting for the ring to drain after the slow-warn scenario';
 
 done_testing();

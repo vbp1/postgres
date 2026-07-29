@@ -44,17 +44,18 @@ log_min_messages = debug1
 ));
 $node->start;
 
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE thint AS SELECT g AS id FROM generate_series(1, 100) g;
 	CREATE TABLE told AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $node->safe_psql('postgres', 'CHECKPOINT');
 
 my $thint_file =
-  $node->data_dir . '/'
+	$node->data_dir . '/'
   . $node->safe_psql('postgres', "SELECT pg_relation_filepath('thint')");
 my $told_file =
-  $node->data_dir . '/'
+	$node->data_dir . '/'
   . $node->safe_psql('postgres', "SELECT pg_relation_filepath('told')");
 my $thint_relnum = $node->safe_psql('postgres',
 	"SELECT relfilenode FROM pg_class WHERE relname = 'thint'");
@@ -88,7 +89,7 @@ ok( $node->log_contains(
 ok( $node->log_contains(
 		qr/ring opened: 16 batches of 16 pages, generation 2\b/, $log_offset),
 	'generation bumped after the pass');
-is( $node->safe_psql('postgres', 'SELECT count(*) FROM thint'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM thint'),
 	'100', 'torn hint page is whole again');
 
 # --- a checksum-valid but stale page is repaired by its LSN --------------
@@ -117,9 +118,9 @@ ok( $node->log_contains(
 		qr!restoring page 0 of relation \d+/\d+/$told_relnum fork 0!,
 		$log_offset),
 	'... by its LSN — the page verified fine');
-is( $node->safe_psql(
-		'postgres', 'SELECT count(*) FROM told WHERE id > 1000'),
-	'50', 'stale page carries the update again');
+is( $node->safe_psql('postgres', 'SELECT count(*) FROM told WHERE id > 1000'),
+	'50',
+	'stale page carries the update again');
 
 # --- a repeated pass over the same ring is a no-op -----------------------
 
@@ -137,18 +138,19 @@ ok( $node->log_contains(
 		qr/double write buffer recovery: 0 of 1 candidate pages restored/,
 		$log_offset),
 	're-applied pass sees the same candidate and rewrites nothing');
-is( $node->safe_psql(
-		'postgres', 'SELECT count(*) FROM told WHERE id > 1000'),
-	'50', 'data intact after the repeated pass');
+is( $node->safe_psql('postgres', 'SELECT count(*) FROM told WHERE id > 1000'),
+	'50',
+	'data intact after the repeated pass');
 
 # --- a clean start skips the pass, but still bumps the generation --------
 
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE tstale AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $node->safe_psql('postgres', 'CHECKPOINT');
 my $tstale_file =
-  $node->data_dir . '/'
+	$node->data_dir . '/'
   . $node->safe_psql('postgres', "SELECT pg_relation_filepath('tstale')");
 $node->stop;
 
@@ -156,7 +158,7 @@ my $tstale_good = read_block($tstale_file, 0);
 
 $log_offset = -s $node->logfile;
 $node->start;
-ok( !$node->log_contains(qr/double write buffer recovery:/, $log_offset),
+ok(!$node->log_contains(qr/double write buffer recovery:/, $log_offset),
 	'clean start runs no apply-pass');
 ok( $node->log_contains(qr/ring opened: .* generation 4\b/, $log_offset),
 	'... yet the generation still moves, expiring the old slots');
@@ -175,12 +177,13 @@ ok( $node->log_contains(
 		qr/double write buffer recovery: 0 of 0 candidate pages restored/,
 		$log_offset),
 	'no current-generation candidates after the idle crash');
-is( read_block($tstale_file, 0), chr(0xAB) x 8192,
+is( read_block($tstale_file, 0),
+	chr(0xAB) x 8192,
 	'the stale slot was not applied to the corrupted page');
 
 # put the good page back so the cluster winds down healthy
 write_block($tstale_file, 0, $tstale_good);
-is( $node->safe_psql('postgres', 'SELECT count(*) FROM tstale'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM tstale'),
 	'100', 'page manually restored, cluster consistent');
 
 # --- the marker alone triggers the pass, not the pg_control state --------
@@ -190,12 +193,13 @@ is( $node->safe_psql('postgres', 'SELECT count(*) FROM tstale'),
 # Only the unset RING_CLEAN marker knows this ring was never retired — a
 # standby whose shutdown restartpoint was skipped leaves exactly this
 # combination, and the pass must key on the marker, not on pg_control.
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE tmark AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $node->safe_psql('postgres', 'CHECKPOINT');
 my $tmark_file =
-  $node->data_dir . '/'
+	$node->data_dir . '/'
   . $node->safe_psql('postgres', "SELECT pg_relation_filepath('tmark')");
 $node->stop('immediate');
 
@@ -218,7 +222,7 @@ ok( $node->log_contains(
 		qr/double write buffer recovery: 1 of 1 candidate pages restored/,
 		$log_offset),
 	'unretired ring is applied despite a clean pg_control');
-is( $node->safe_psql('postgres', 'SELECT count(*) FROM tmark'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM tmark'),
 	'100', 'torn page behind a clean shutdown is whole again');
 
 # --- a slot for a dropped relation is skipped ----------------------------
@@ -226,7 +230,8 @@ is( $node->safe_psql('postgres', 'SELECT count(*) FROM tmark'),
 # The relation's file may survive as an empty tombstone until the next
 # checkpoint, or be gone entirely; either way there is nothing to repair
 # and the pass must not trip over it.
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE tdrop AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $node->safe_psql('postgres', 'CHECKPOINT');
@@ -246,12 +251,13 @@ ok( $node->log_contains(
 # from its init record without reading it, and a stale slot must not
 # resurrect on it — the zeroed page's LSN 0 would lose the LSN comparison
 # that this skip protects.
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE tzero AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $node->safe_psql('postgres', 'CHECKPOINT');
 my $tzero_file =
-  $node->data_dir . '/'
+	$node->data_dir . '/'
   . $node->safe_psql('postgres', "SELECT pg_relation_filepath('tzero')");
 $node->stop('immediate');
 
@@ -264,12 +270,13 @@ ok( $node->log_contains(
 		qr/double write buffer recovery: 0 of 1 candidate pages restored/,
 		$log_offset),
 	'a zeroed page is not repaired from its slot');
-is( read_block($tzero_file, 0), "\0" x 8192,
+is( read_block($tzero_file, 0),
+	"\0" x 8192,
 	'... and stays zero for replay to drive');
 
 # put the good page back so the cluster winds down healthy
 write_block($tzero_file, 0, $tzero_good);
-is( $node->safe_psql('postgres', 'SELECT count(*) FROM tzero'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM tzero'),
 	'100', 'page manually restored, cluster consistent');
 
 done_testing();

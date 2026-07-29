@@ -37,12 +37,13 @@ bgwriter_lru_maxpages = 0
 ));
 $node->start;
 
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE tgeo AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $node->safe_psql('postgres', 'CHECKPOINT');
 my $tgeo_file =
-  $node->data_dir . '/'
+	$node->data_dir . '/'
   . $node->safe_psql('postgres', "SELECT pg_relation_filepath('tgeo')");
 
 # stale-page damage: put the pre-update image back after the crash, so the
@@ -69,6 +70,7 @@ ok( $node->log_contains(
 		qr/ring opened: 16 batches of 32 pages, generation 1\b/, $log_offset),
 	'... with a fresh generation');
 is( $node->safe_psql('postgres', 'SELECT count(*) FROM tgeo WHERE id > 1000'),
-	'50', 'the stale page carries the update again');
+	'50',
+	'the stale page carries the update again');
 
 done_testing();

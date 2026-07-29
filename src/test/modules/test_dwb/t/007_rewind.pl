@@ -27,7 +27,8 @@ autovacuum = off
 wal_keep_size = 64MB
 ));
 $node_a->start;
-$node_a->safe_psql('postgres', q(
+$node_a->safe_psql(
+	'postgres', q(
 	CREATE TABLE dwb_r AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 
@@ -80,7 +81,7 @@ command_fails_like(
 
 # leave proof on the target that the rewind, not a later cold start,
 # removed the ring files
-ok(-f $node_a->data_dir . '/pg_dwb/control',
+ok( -f $node_a->data_dir . '/pg_dwb/control',
 	'the target has ring files before the rewind');
 
 $node_b->stop('fast');
@@ -185,7 +186,8 @@ unless ($windows_os)
 
 command_ok([@rewind_from_b], 'pg_rewind from a stopped source succeeds');
 
-ok(-d $node_a->data_dir . '/pg_dwb', 'the target still has a pg_dwb directory');
+ok(-d $node_a->data_dir . '/pg_dwb',
+	'the target still has a pg_dwb directory');
 {
 	opendir(my $dh, $node_a->data_dir . '/pg_dwb') or die "opendir: $!";
 	my @entries = grep { !/^\.\.?$/ } readdir($dh);
@@ -215,13 +217,15 @@ ok( $node_a->log_contains(
 	'rewound node cold-started a fresh ring');
 
 $node_b->wait_for_catchup($node_a);
-is( $node_a->safe_psql('postgres', 'SELECT count(*) FROM dwb_r'),
+is($node_a->safe_psql('postgres', 'SELECT count(*) FROM dwb_r'),
 	'101', 'rewound node converged on the new primary timeline');
-is( $node_a->safe_psql('postgres',
-		'SELECT count(*) FROM dwb_r WHERE id = 200001'),
-	'0', 'the divergent row is gone');
-is( $node_a->safe_psql('postgres',
-		'SELECT count(*) FROM dwb_r WHERE id = 100001'),
-	'1', "the new primary's row is present");
+is( $node_a->safe_psql(
+		'postgres', 'SELECT count(*) FROM dwb_r WHERE id = 200001'),
+	'0',
+	'the divergent row is gone');
+is( $node_a->safe_psql(
+		'postgres', 'SELECT count(*) FROM dwb_r WHERE id = 100001'),
+	'1',
+	"the new primary's row is present");
 
 done_testing();

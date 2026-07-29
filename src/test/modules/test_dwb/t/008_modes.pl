@@ -25,8 +25,10 @@ sub wal_window
 	my $lsn1 = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 	my ($out, $err) = run_command(
 		[
-			'pg_waldump', '--path' => $node->data_dir . '/pg_wal',
-			'--start' => $lsn0, '--end' => $lsn1
+			'pg_waldump',
+			'--path' => $node->data_dir . '/pg_wal',
+			'--start' => $lsn0,
+			'--end' => $lsn1
 		]);
 	is($err, '', "pg_waldump read the window of: $stmt");
 	return $out;
@@ -37,11 +39,10 @@ sub wal_window
 $node->append_conf('postgresql.conf', 'io_torn_pages_protection = off');
 my $log_offset = (-s $node->logfile) // 0;
 $node->start;
-ok( $node->log_contains(
-		qr/torn page protection is disabled/, $log_offset),
+ok($node->log_contains(qr/torn page protection is disabled/, $log_offset),
 	'mode "off" announces itself');
 ok(!-d $node->data_dir . '/pg_dwb', 'mode "off" creates no ring');
-is( $node->safe_psql('postgres', 'SHOW full_page_writes'),
+is($node->safe_psql('postgres', 'SHOW full_page_writes'),
 	'on', 'the legacy GUC still reads on...');
 
 $node->safe_psql('postgres',
@@ -53,7 +54,8 @@ unlike($dump, qr/\bFPW\b/, '...but no page image is written');
 
 # --- mode "full_pages": the legacy GUC keeps its vanilla meaning ---------
 
-$node->append_conf('postgresql.conf', qq(
+$node->append_conf(
+	'postgresql.conf', qq(
 io_torn_pages_protection = full_pages
 full_page_writes = off
 ));
@@ -71,7 +73,8 @@ like($dump, qr/\bFPW\b/, 'full_pages + legacy on: page image written');
 
 # --- mode "double_writes": a SIGHUP of the legacy GUC is a no-op ---------
 
-$node->append_conf('postgresql.conf', qq(
+$node->append_conf(
+	'postgresql.conf', qq(
 io_torn_pages_protection = double_writes
 full_page_writes = on
 ));
@@ -92,8 +95,10 @@ unlike($dump, qr/\bFPW\b/, 'reloading the legacy GUC changes nothing');
 my $lsn_end = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 my ($out, $err) = run_command(
 	[
-		'pg_waldump', '--path' => $node->data_dir . '/pg_wal',
-		'--start' => $reload_lsn, '--end' => $lsn_end
+		'pg_waldump',
+		'--path' => $node->data_dir . '/pg_wal',
+		'--start' => $reload_lsn,
+		'--end' => $lsn_end
 	]);
 is($err, '', 'pg_waldump read the reload window cleanly');
 unlike($out, qr/FPW_CHANGE/,
@@ -106,7 +111,8 @@ unlike($out, qr/FPW_CHANGE/,
 # closed cleanly once.
 $node->stop('immediate');
 
-$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = full_pages');
 my $ret = $node->start(fail_ok => 1);
 is($ret, 0, 'crashed ring refuses a full_pages start');
 ok( $node->log_contains(
@@ -123,14 +129,15 @@ $node->append_conf('postgresql.conf',
 	'io_torn_pages_protection = double_writes');
 $log_offset = -s $node->logfile;
 $node->start;
-ok( $node->log_contains(qr/double write buffer recovery:/, $log_offset),
+ok($node->log_contains(qr/double write buffer recovery:/, $log_offset),
 	'the double_writes start runs the apply-pass');
 $node->stop;
 
-$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = full_pages');
 $log_offset = -s $node->logfile;
 $node->start;
-is( $node->safe_psql('postgres', 'SHOW io_torn_pages_protection'),
+is($node->safe_psql('postgres', 'SHOW io_torn_pages_protection'),
 	'full_pages', 'after a clean stop the mode change is legal');
 ok( !$node->log_contains(qr/ring opened/, $log_offset),
 	'... and the leftover ring stays closed');
@@ -146,7 +153,8 @@ $node->append_conf('postgresql.conf',
 $node->start;
 $node->stop('immediate');
 
-$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = full_pages');
 $ret = $node->start(fail_ok => 1);
 is($ret, 0, 'a crash after reopening the ring re-arms the guard');
 
@@ -162,7 +170,8 @@ $node->stop;
 # full_pages run (which touches neither the marker nor the generation)
 # must NOT re-arm the ring — an apply here would resurrect ancient
 # same-generation slots over pages torn long after the ring was closed.
-$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = full_pages');
 $node->start;
 $node->stop('immediate');
 
@@ -185,7 +194,8 @@ binmode $fh;
 print $fh "\x00" x 16;
 close $fh;
 
-$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = full_pages');
 $log_offset = -s $node->logfile;
 $ret = $node->start(fail_ok => 1);
 is($ret, 0, 'a corrupt ring control refuses a full_pages start');
@@ -197,7 +207,7 @@ ok( $node->log_contains(
 # the hint's recipe: removing pg_dwb unblocks the start
 rmtree($node->data_dir . '/pg_dwb');
 $node->start;
-is( $node->safe_psql('postgres', 'SHOW io_torn_pages_protection'),
+is($node->safe_psql('postgres', 'SHOW io_torn_pages_protection'),
 	'full_pages', 'removing pg_dwb unblocks the non-ring mode');
 
 # --- a crash under "off" is announced on the next protected start --------
@@ -209,7 +219,8 @@ $node->append_conf('postgresql.conf', 'io_torn_pages_protection = off');
 $node->restart;
 $node->stop('immediate');
 
-$node->append_conf('postgresql.conf', 'io_torn_pages_protection = full_pages');
+$node->append_conf('postgresql.conf',
+	'io_torn_pages_protection = full_pages');
 $log_offset = -s $node->logfile;
 $node->start;
 ok( $node->log_contains(
@@ -239,15 +250,14 @@ ok( $node->log_contains(
 		qr!FATAL: .* file "pg_dwb/control" requires format version at least 2, but this server supports 1!,
 		$log_offset),
 	'... naming the version gap');
-ok( !$node->log_contains(qr/could not be validated/, $log_offset),
+ok(!$node->log_contains(qr/could not be validated/, $log_offset),
 	'... and not the corrupt-ring advice');
 
 # the intact-but-unreadable ring can only be resolved by removal
 rmtree($node->data_dir . '/pg_dwb');
 $log_offset = -s $node->logfile;
 $node->start;
-ok( $node->log_contains(
-		qr/ring opened: .* generation 1\b/, $log_offset),
+ok( $node->log_contains(qr/ring opened: .* generation 1\b/, $log_offset),
 	'removing the newer ring unblocks a fresh double_writes start');
 
 # --- leftovers of an interrupted wipe are swept, not fatal ---------------
@@ -266,10 +276,9 @@ close $lf;
 
 $log_offset = -s $node->logfile;
 $node->start;
-ok( !$node->log_contains(qr/double write buffer recovery:/, $log_offset),
+ok(!$node->log_contains(qr/double write buffer recovery:/, $log_offset),
 	'no apply-pass over the swept leftovers');
-ok( $node->log_contains(
-		qr/ring opened: .* generation 1\b/, $log_offset),
+ok($node->log_contains(qr/ring opened: .* generation 1\b/, $log_offset),
 	'the interrupted-wipe state cold-starts a fresh ring');
 ok(!-e $leftover, 'the leftover batch file is gone');
 

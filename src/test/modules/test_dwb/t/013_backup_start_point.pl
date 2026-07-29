@@ -32,7 +32,8 @@ autovacuum = off
 ));
 $node->start;
 
-$node->safe_psql('postgres', q(
+$node->safe_psql(
+	'postgres', q(
 	CREATE TABLE dwb_bsp AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 
@@ -74,14 +75,15 @@ ok( $restored->log_contains(
 		qr/discarding double write buffer ring contents restored from a base backup/,
 		$log_offset),
 	'the label start discarded the copied ring');
-ok( !$restored->log_contains(
-		qr/double write buffer recovery:/, $log_offset),
+ok( !$restored->log_contains(qr/double write buffer recovery:/, $log_offset),
 	'... and ran no apply-pass');
 
 ok(!-f "$pgdata/backup_label", 'the failed recovery consumed backup_label');
 ok(-f "$pgdata/backup_label.old", '... renaming it out of the way');
 my ($cd, $cderr) = run_command([ 'pg_controldata', $pgdata ]);
-like($cd, qr/Backup start location:\s+(?!0\/0)\S/,
+like(
+	$cd,
+	qr/Backup start location:\s+(?!0\/0)\S/,
 	'pg_control still carries backupStartPoint');
 
 # --- second start: the backupStartPoint arm ------------------------------
@@ -96,8 +98,7 @@ ok( $restored->log_contains(
 		qr/discarding double write buffer ring contents restored from a base backup/,
 		$log_offset),
 	'backupStartPoint alone still discards the ring');
-ok( !$restored->log_contains(
-		qr/double write buffer recovery:/, $log_offset),
+ok( !$restored->log_contains(qr/double write buffer recovery:/, $log_offset),
 	'... and no apply-pass ran on the second start either');
 
 done_testing();

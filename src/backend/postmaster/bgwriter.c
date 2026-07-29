@@ -232,9 +232,9 @@ BackgroundWriterMain(const void *startup_data, size_t startup_data_len)
 		ProcessMainLoopInterrupts();
 
 		/*
-		 * Do one cycle of dirty-buffer writing.  While a double write
-		 * buffer stall has us paused (Stage A backpressure), sit the round
-		 * out instead of queueing more flushes behind an exhausted ring;
+		 * Do one cycle of dirty-buffer writing.  While a double write buffer
+		 * stall has us paused (Stage A backpressure), sit the round out
+		 * instead of queueing more flushes behind an exhausted ring;
 		 * user-facing paths keep their reserve, we retry after the delay.
 		 */
 		if (DWBIsEnabled() && DWBWritesPaused())

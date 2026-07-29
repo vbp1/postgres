@@ -26,12 +26,13 @@ my $old = PostgreSQL::Test::Cluster->new('dwb_upgrade_old');
 $old->init;
 $old->append_conf('postgresql.conf', $dwb_conf);
 $old->start;
-$old->safe_psql('postgres', q(
+$old->safe_psql(
+	'postgres', q(
 	CREATE TABLE dwb_up AS SELECT g AS id FROM generate_series(1, 100) g;
 ));
 $old->safe_psql('postgres', 'CHECKPOINT');
 $old->stop;
-ok(-f $old->data_dir . '/pg_dwb/control',
+ok( -f $old->data_dir . '/pg_dwb/control',
 	'the old cluster leaves a ring behind');
 
 my $new = PostgreSQL::Test::Cluster->new('dwb_upgrade_new');
@@ -51,7 +52,7 @@ command_ok(
 	],
 	'pg_upgrade from a double_writes cluster succeeds');
 
-ok(-f $old->data_dir . '/pg_dwb/control',
+ok( -f $old->data_dir . '/pg_dwb/control',
 	'the old ring stays with the old cluster');
 ok(!-d $new->data_dir . '/pg_dwb',
 	'nothing of the ring was shipped into the new cluster');
@@ -64,7 +65,7 @@ ok( $new->log_contains(
 		qr/double write buffer ring opened: 16 batches of 16 pages, generation 1\b/,
 		$log_offset),
 	'the upgraded cluster cold-starts a fresh ring');
-is( $new->safe_psql('postgres', 'SELECT count(*) FROM dwb_up'),
+is($new->safe_psql('postgres', 'SELECT count(*) FROM dwb_up'),
 	'100', 'the upgraded data is intact');
 
 done_testing();
