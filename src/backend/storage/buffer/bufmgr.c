@@ -4024,11 +4024,13 @@ BgBufferSync(WritebackContext *wb_context)
  * SyncOneBuffer would, plus BUF_BINNABLE when the buffer would have been
  * written — the caller collects those into a bin and flushes them through
  * the double write buffer as one batch (FlushBufferBin).  The bin flush
- * re-checks everything under the header lock, so a buffer that changes
- * between the peek and the flush is handled there: clean again is skipped,
- * recycled to unlogged goes to the per-page fallback, and a fresh pin or
- * usage bump is the same benign race SyncOneBuffer itself has between its
- * check and its write.
+ * re-checks validity, dirtiness and permanence under the header lock, so a
+ * buffer that changes between the peek and the flush is handled there:
+ * clean again is skipped, recycled to unlogged goes to the per-page
+ * fallback.  Pin and usage counts are not re-checked anywhere past this
+ * peek — a fresh pin or usage bump before the flush is the same benign
+ * race SyncOneBuffer itself has between its check and its write;
+ * skip_recently_used is an optimization, not a correctness contract.
  */
 static int
 BgSyncPeekBuffer(int buf_id)
@@ -4156,13 +4158,17 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
  * claimed without waiting fall back to the ordinary per-page SyncOneBuffer
  * path after the bin is done, when nothing is held.
  *
- * The caller pre-filters for BM_PERMANENT, but only as an optimization: the
+ * A caller may pre-filter for BM_PERMANENT (BufferSync does, the bgwriter's
+ * peek deliberately does not), but that is only ever an optimization: the
  * authoritative check is made here under the buffer header lock, because a
  * captured buffer can be recycled for an unlogged page before the bin
  * flushes (the same benign window BufferSync already tolerates for the
  * checkpoint-needed bit).  Non-permanent buffers go to the per-page
  * fallback, whose FlushBuffer skips both the WAL flush and the DWB for
- * them.  Returns the number of buffers written.
+ * them.  Pin counts and usage counts are NOT re-checked here — writing a
+ * buffer that became recently-used after the caller picked it is the same
+ * benign race the per-page paths have between their check and their write.
+ * Returns the number of buffers written.
  */
 static int
 FlushBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)

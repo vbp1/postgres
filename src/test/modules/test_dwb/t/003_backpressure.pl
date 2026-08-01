@@ -53,6 +53,88 @@ $node->safe_psql(
 		FROM generate_series(1, 1000) g;
 ));
 
+# --- the self-help sweep admits exactly one sweeper -----------------------
+
+# The dwb-self-sweep point sits INSIDE the trylock-guarded section, so a
+# process can only park there after winning DWBSelfSweepLock.  With the
+# ring exhausted and two writers stalled, exactly one may hold the gate:
+# the loser must be asleep in the ring wait, not sweeping.
+$node->safe_psql('postgres',
+	"SELECT injection_points_attach('dwb-self-sweep', 'wait')");
+
+my $filler = $node->background_psql('postgres');
+my $taken = $filler->query_safe('SELECT test_dwb_fill_ring()');
+cmp_ok($taken, '>', 0, 'ring exhausted for the sweep-gate scenario');
+
+# Two victims, each forced to evict dirty pages through the full ring.
+my $victim1 = $node->background_psql('postgres');
+$victim1->query_until(
+	qr/starting_victim1/, q(
+\echo starting_victim1
+CREATE TABLE dwb_sweep_v1 AS
+	SELECT g AS id, repeat('1', 300) AS filler
+	FROM generate_series(1, 80000) g;
+));
+$node->wait_for_event('client backend', 'dwb-self-sweep');
+
+my $victim2 = $node->background_psql('postgres');
+$victim2->query_until(
+	qr/starting_victim2/, q(
+\echo starting_victim2
+CREATE TABLE dwb_sweep_v2 AS
+	SELECT g AS id, repeat('2', 300) AS filler
+	FROM generate_series(1, 80000) g;
+));
+
+# The loser's sleep in the ring wait proves it took the trylock-failed
+# path: the winner's path parks at the injection point before any sleep.
+$node->wait_for_event('client backend', 'DwbFreeBatch');
+is( $node->safe_psql(
+		'postgres',
+		"SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'dwb-self-sweep'"
+	),
+	'1',
+	'exactly one process is inside the self-help sweep gate');
+
+# Detach BEFORE waking: the winner re-enters the gate on its retry loop,
+# and with the point still attached it would park again with no wakeup
+# left to release it.
+$node->safe_psql('postgres',
+	"SELECT injection_points_detach('dwb-self-sweep')");
+$node->safe_psql('postgres',
+	"SELECT injection_points_wakeup('dwb-self-sweep')");
+
+# Release the filler's leaked refs: the victims then finish on their own
+# (no worker pool, so they seal and retire synchronously as they write).
+# The abandoned batches need a seal/retire nudge from the poll, but the
+# ring must NOT be required to go idle here — the victims keep batches in
+# flight until they commit, so wait for their tables first.  pg_class only
+# shows them once the statements committed.
+$filler->quit;
+$node->poll_query_until('postgres',
+		"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
+	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
+	  . "count(*) = 2 END END FROM pg_class "
+	  . "WHERE relname IN ('dwb_sweep_v1', 'dwb_sweep_v2')")
+  or die 'timed out waiting for the sweep-gate victims to finish';
+is( $node->safe_psql(
+		'postgres',
+		'SELECT (SELECT count(*) FROM dwb_sweep_v1) + (SELECT count(*) FROM dwb_sweep_v2)'
+	),
+	'160000',
+	'both stalled victims completed after the ring drained');
+$victim1->quit;
+$victim2->quit;
+$node->safe_psql('postgres', 'DROP TABLE dwb_sweep_v1, dwb_sweep_v2');
+
+# With the victims gone the ring drains to idle for the next scenario.
+$node->poll_query_until('postgres',
+		"SELECT CASE WHEN test_dwb_force_seal() IS NOT NULL THEN "
+	  . "CASE WHEN test_dwb_retire() >= 0 THEN "
+	  . "test_dwb_states() LIKE 'free=16 %' END END")
+  or die
+  'timed out waiting for the ring to drain after the sweep-gate scenario';
+
 # --- ERROR in a non-critical writer keeps the cluster alive --------------
 
 # Attach while the ring is still healthy; the point only fires for a
@@ -60,8 +142,8 @@ $node->safe_psql(
 $node->safe_psql('postgres',
 	"SELECT injection_points_attach('dwb-force-stall', 'notice')");
 
-my $filler = $node->background_psql('postgres');
-my $taken = $filler->query_safe('SELECT test_dwb_fill_ring()');
+$filler = $node->background_psql('postgres');
+$taken = $filler->query_safe('SELECT test_dwb_fill_ring()');
 cmp_ok($taken, '>', 0, 'ring exhausted by leaked refs');
 
 # The victim outgrows shared_buffers, so it must evict its own dirty pages

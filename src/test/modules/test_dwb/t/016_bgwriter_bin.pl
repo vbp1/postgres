@@ -12,6 +12,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 my $node = PostgreSQL::Test::Cluster->new('dwb_bgwriter');
 $node->init;
@@ -39,25 +40,33 @@ $node->safe_psql(
 	INSERT INTO dwb_bgw SELECT g, repeat('b', 500) FROM generate_series(1, 20000) g;
 ));
 
+# Only the bgwriter's own writes may enter the average: drop what the
+# initial data load accumulated.
+$node->safe_psql('postgres', "SELECT pg_stat_reset_shared('io')");
+
 # The bgwriter's write volume per round depends on its allocation estimator,
-# so drive passes until its dwb statistics carry the proof; each pass is a
-# fresh burst of allocations.  writes >= 10 skips the noise of the first
-# few partial bins.
+# and its statistics reach the collector asynchronously: drive passes of
+# fresh allocations and poll between them until the dwb row carries the
+# proof.  writes >= 10 skips the noise of the first few partial bins.
 my $binned = 0;
-for my $pass (1 .. 8)
+OUTER: for my $pass (1 .. 8)
 {
 	$node->safe_psql('postgres',
 		"UPDATE dwb_bgw SET pad = repeat(chr(96 + $pass), 500)");
-	$binned = $node->safe_psql(
-		'postgres', q(
-		SELECT COALESCE(bool_or(
-				writes >= 10
-				AND (write_bytes::numeric / writes - 4096) / 8192 >= 4), false)
-		FROM pg_stat_io
-		WHERE backend_type = 'background writer' AND object = 'dwb'
-			AND context = 'normal'
-	));
-	last if $binned eq 't';
+	for my $probe (1 .. 25)
+	{
+		$binned = $node->safe_psql(
+			'postgres', q(
+			SELECT COALESCE(bool_or(
+					writes >= 10
+					AND (write_bytes::numeric / writes - 4096) / 8192 >= 4), false)
+			FROM pg_stat_io
+			WHERE backend_type = 'background writer' AND object = 'dwb'
+				AND context = 'normal'
+		));
+		last OUTER if $binned eq 't';
+		usleep(200_000);
+	}
 }
 is($binned, 't', 'bgwriter dwb batches average >= 4 slots, not one per page');
 

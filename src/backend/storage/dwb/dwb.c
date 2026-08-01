@@ -490,8 +490,12 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		 */
 		if (LWLockConditionalAcquire(DWBSelfSweepLock, LW_EXCLUSIVE))
 		{
-			int			swept = DWBRetireAllSync();
+			int			swept;
 
+			/* test hook: proves at most one waiter ever gets here at a time */
+			INJECTION_POINT("dwb-self-sweep", NULL);
+
+			swept = DWBRetireAllSync();
 			LWLockRelease(DWBSelfSweepLock);
 			if (swept > 0)
 				continue;
