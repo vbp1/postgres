@@ -475,14 +475,27 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 
 		/*
 		 * No usable FREE batch.  Help ourselves before waiting: sweep the
-		 * RETIRING batches synchronously.  Under normal operation the worker
-		 * pool keeps the ring ahead of the writers and this path is rare;
-		 * when it does run, the per-segment claim keeps us and the workers
-		 * from duplicating fsyncs.  This is also what keeps the ring alive
-		 * with dwb_retire_workers = 0 and in single-user mode.
+		 * RETIRING batches synchronously.  One sweeper at a time: with
+		 * thousands of writers parked on a full ring, a sweep by every waiter
+		 * is pure lock traffic — they hammer the per-batch publish locks
+		 * and the segment hash while losing every fsync claim to whoever got
+		 * there first (measured at ~half the CPU of a 104-core machine).  A
+		 * trylock loser skips straight to the sleep below and is woken
+		 * through cv_want_batch by the winner's frees; the winner still
+		 * shares the fsync work with the worker pool through the per-segment
+		 * claims.  The gate is an LWLock, not an atomic flag, so an ERROR
+		 * inside the sweep releases it in the unwind.  The self-help is also
+		 * what keeps the ring alive with dwb_retire_workers = 0 and in
+		 * single-user mode.
 		 */
-		if (DWBRetireAllSync() > 0)
-			continue;
+		if (LWLockConditionalAcquire(DWBSelfSweepLock, LW_EXCLUSIVE))
+		{
+			int			swept = DWBRetireAllSync();
+
+			LWLockRelease(DWBSelfSweepLock);
+			if (swept > 0)
+				continue;
+		}
 
 		pg_atomic_fetch_add_u64(&DWBCtl->ring_wait_retries, 1);
 		(void) ConditionVariableTimedSleep(&DWBCtl->cv_want_batch[wclass],

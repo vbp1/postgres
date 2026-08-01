@@ -79,18 +79,21 @@
 #define LocalBufHdrGetBlock(bufHdr) \
 	LocalBufferBlockPointers[-((bufHdr)->buf_id + 2)]
 
-/* Bits in SyncOneBuffer's return value */
+/* Bits in SyncOneBuffer's (and BgSyncPeekBuffer's) return value */
 #define BUF_WRITTEN				0x01
 #define BUF_REUSABLE			0x02
+#define BUF_BINNABLE			0x04	/* would-write candidate for the
+										 * vectored DWB flush bin */
 
 /*
- * Bin size cap for the vectored checkpoint flush (FlushCkptBufferBin): the
- * flush holds a pin, a shared content lock and BM_IO_IN_PROGRESS per bin
- * member at once, so the cap must leave MAX_SIMUL_LWLOCKS (200) plenty of
+ * Bin size cap for the vectored background flush (FlushBufferBin, used by
+ * the checkpointer's BufferSync and the bgwriter's LRU scan): the flush
+ * holds a pin, a shared content lock and BM_IO_IN_PROGRESS per bin member
+ * at once, so the cap must leave MAX_SIMUL_LWLOCKS (200) plenty of
  * headroom.  64 matches the default dwb_batch_pages; larger batch_pages
  * settings seal their batches at bin-sized fills.
  */
-#define CKPT_DWB_BIN_MAX		64
+#define DWB_FLUSH_BIN_MAX		64
 
 #define RELS_BSEARCH_THRESHOLD		20
 
@@ -530,8 +533,9 @@ static void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
 static void BufferSync(int flags);
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
-static int	FlushCkptBufferBin(const int *buf_ids, int nbuf,
-							   WritebackContext *wb_context);
+static int	FlushBufferBin(const int *buf_ids, int nbuf,
+						   WritebackContext *wb_context);
+static int	BgSyncPeekBuffer(int buf_id);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
 static void WaitIO(BufferDesc *buf);
@@ -3447,11 +3451,11 @@ BufferSync(int flags)
 	/*
 	 * With the double write buffer active, permanent buffers are flushed in
 	 * bins of up to a batch: one batch write and one fdatasync cover the
-	 * whole bin instead of one per page (see FlushCkptBufferBin).
+	 * whole bin instead of one per page (see FlushBufferBin).
 	 */
 	if (DWBIsEnabled() && !IsBootstrapProcessingMode())
 	{
-		dwb_bin_size = Min(dwb_batch_pages, CKPT_DWB_BIN_MAX);
+		dwb_bin_size = Min(dwb_batch_pages, DWB_FLUSH_BIN_MAX);
 		dwb_bin = palloc(dwb_bin_size * sizeof(int));
 	}
 
@@ -3600,8 +3604,8 @@ BufferSync(int flags)
 				dwb_bin[dwb_bin_n++] = buf_id;
 				if (dwb_bin_n == dwb_bin_size)
 				{
-					int			nw = FlushCkptBufferBin(dwb_bin, dwb_bin_n,
-														&wb_context);
+					int			nw = FlushBufferBin(dwb_bin, dwb_bin_n,
+													&wb_context);
 
 					PendingCheckpointerStats.buffers_written += nw;
 					num_written += nw;
@@ -3648,8 +3652,8 @@ BufferSync(int flags)
 	{
 		if (dwb_bin_n > 0)
 		{
-			int			nw = FlushCkptBufferBin(dwb_bin, dwb_bin_n,
-												&wb_context);
+			int			nw = FlushBufferBin(dwb_bin, dwb_bin_n,
+											&wb_context);
 
 			PendingCheckpointerStats.buffers_written += nw;
 			num_written += nw;
@@ -3726,6 +3730,11 @@ BgBufferSync(WritebackContext *wb_context)
 	int			num_to_scan;
 	int			num_written;
 	int			reusable_buffers;
+
+	/* Vectored DWB flush bin (bin_size stays 0 without the DWB) */
+	int			bin[DWB_FLUSH_BIN_MAX];
+	int			bin_n = 0;
+	int			bin_size = 0;
 
 	/* Variables for final smoothed_density update */
 	long		new_strategy_delta;
@@ -3907,11 +3916,38 @@ BgBufferSync(WritebackContext *wb_context)
 	num_written = 0;
 	reusable_buffers = reusable_buffers_est;
 
+	/*
+	 * With the double write buffer active, would-write buffers are collected
+	 * into bins and flushed as one batch each: one batch write and one
+	 * fdatasync cover the whole bin instead of one per page (the LRU scan's
+	 * scattered singleton writes otherwise degenerate to lone-writer batches;
+	 * see FlushBufferBin).
+	 */
+	if (DWBIsEnabled())
+		bin_size = Min(dwb_batch_pages, DWB_FLUSH_BIN_MAX);
+
 	/* Execute the LRU scan */
 	while (num_to_scan > 0 && reusable_buffers < upcoming_alloc_est)
 	{
-		int			sync_state = SyncOneBuffer(next_to_clean, true,
-											   wb_context);
+		int			sync_state;
+
+		if (bin_size > 0)
+			sync_state = BgSyncPeekBuffer(next_to_clean);
+		else
+			sync_state = SyncOneBuffer(next_to_clean, true, wb_context);
+
+		if (sync_state & BUF_BINNABLE)
+		{
+			bin[bin_n++] = next_to_clean;
+			reusable_buffers++;
+		}
+		else if (sync_state & BUF_WRITTEN)
+		{
+			reusable_buffers++;
+			num_written++;
+		}
+		else if (sync_state & BUF_REUSABLE)
+			reusable_buffers++;
 
 		if (++next_to_clean >= NBuffers)
 		{
@@ -3920,18 +3956,28 @@ BgBufferSync(WritebackContext *wb_context)
 		}
 		num_to_scan--;
 
-		if (sync_state & BUF_WRITTEN)
+		/*
+		 * Flush a full bin, and any partial one that already covers the
+		 * remaining write budget: the cap check below must see the true
+		 * written count, not a deferred bin.
+		 */
+		if (bin_n > 0 &&
+			(bin_n == bin_size ||
+			 num_written + bin_n >= bgwriter_lru_maxpages))
 		{
-			reusable_buffers++;
-			if (++num_written >= bgwriter_lru_maxpages)
-			{
-				PendingBgWriterStats.maxwritten_clean++;
-				break;
-			}
+			num_written += FlushBufferBin(bin, bin_n, wb_context);
+			bin_n = 0;
 		}
-		else if (sync_state & BUF_REUSABLE)
-			reusable_buffers++;
+
+		if (num_written >= bgwriter_lru_maxpages)
+		{
+			PendingBgWriterStats.maxwritten_clean++;
+			break;
+		}
 	}
+
+	if (bin_n > 0)
+		num_written += FlushBufferBin(bin, bin_n, wb_context);
 
 	PendingBgWriterStats.buf_written_clean += num_written;
 
@@ -3969,6 +4015,45 @@ BgBufferSync(WritebackContext *wb_context)
 
 	/* Return true if OK to hibernate */
 	return (bufs_to_lap == 0 && recent_alloc == 0);
+}
+
+/*
+ * BgSyncPeekBuffer -- the check half of SyncOneBuffer (with its
+ * skip_recently_used semantics) without the write.  Classifies a buffer for
+ * the bgwriter's vectored flush: returns BUF_REUSABLE exactly as
+ * SyncOneBuffer would, plus BUF_BINNABLE when the buffer would have been
+ * written — the caller collects those into a bin and flushes them through
+ * the double write buffer as one batch (FlushBufferBin).  The bin flush
+ * re-checks everything under the header lock, so a buffer that changes
+ * between the peek and the flush is handled there: clean again is skipped,
+ * recycled to unlogged goes to the per-page fallback, and a fresh pin or
+ * usage bump is the same benign race SyncOneBuffer itself has between its
+ * check and its write.
+ */
+static int
+BgSyncPeekBuffer(int buf_id)
+{
+	BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
+	int			result = 0;
+	uint32		buf_state;
+
+	buf_state = LockBufHdr(bufHdr);
+
+	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
+		BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
+		result |= BUF_REUSABLE;
+	else
+	{
+		/* recently used: not a replacement candidate, nothing to write */
+		UnlockBufHdr(bufHdr, buf_state);
+		return result;
+	}
+
+	if ((buf_state & BM_VALID) && (buf_state & BM_DIRTY))
+		result |= BUF_BINNABLE;
+
+	UnlockBufHdr(bufHdr, buf_state);
+	return result;
 }
 
 /*
@@ -4052,16 +4137,17 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 }
 
 /*
- * FlushCkptBufferBin -- flush a bin of checkpoint buffers through the
- * double write buffer as one batch.
+ * FlushBufferBin -- flush a bin of buffers through the double write buffer
+ * as one batch.  Serves both background flushers: the checkpointer's
+ * BufferSync and the bgwriter's LRU scan.
  *
  * The per-page write protocol cannot amortize the batch fdatasync for a
  * sequential stream: each page waits for its own batch copy to become
  * durable before its data-file write, and the lone-writer seal then closes
- * the batch over that single page — a checkpoint would pay one fdatasync
- * per page.  Here the whole bin is staged first, sealed and fdatasynced
- * once, and only then written to the data files (the vectored background
- * flush of the design, 3.4).
+ * the batch over that single page — a background flusher would pay one
+ * fdatasync per page.  Here the whole bin is staged first, sealed and
+ * fdatasynced once, and only then written to the data files (the vectored
+ * background flush of the design, 3.4).
  *
  * All lock acquisitions in the gather phase are non-blocking: waiting for a
  * content lock or for somebody's buffer I/O while already holding shared
@@ -4079,25 +4165,25 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
  * them.  Returns the number of buffers written.
  */
 static int
-FlushCkptBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
+FlushBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
 {
 	static char *bin_buf = NULL;
 
-	BufferDesc *bufs[CKPT_DWB_BIN_MAX];
-	XLogRecPtr	lsns[CKPT_DWB_BIN_MAX];
-	DWBSlotRef	refs[CKPT_DWB_BIN_MAX];
-	int			fb_ids[CKPT_DWB_BIN_MAX];
+	BufferDesc *bufs[DWB_FLUSH_BIN_MAX];
+	XLogRecPtr	lsns[DWB_FLUSH_BIN_MAX];
+	DWBSlotRef	refs[DWB_FLUSH_BIN_MAX];
+	int			fb_ids[DWB_FLUSH_BIN_MAX];
 	int			gathered = 0;
 	int			nfallback = 0;
 	int			written = 0;
 	XLogRecPtr	max_lsn = InvalidXLogRecPtr;
 	ErrorContextCallback errcallback;
 
-	Assert(nbuf > 0 && nbuf <= CKPT_DWB_BIN_MAX);
+	Assert(nbuf > 0 && nbuf <= DWB_FLUSH_BIN_MAX);
 
 	if (bin_buf == NULL)
 		bin_buf = MemoryContextAllocAligned(TopMemoryContext,
-											(Size) CKPT_DWB_BIN_MAX * BLCKSZ,
+											(Size) DWB_FLUSH_BIN_MAX * BLCKSZ,
 											PG_IO_ALIGN_SIZE, 0);
 
 	/* Phase 1: claim and copy what can be claimed without waiting */
