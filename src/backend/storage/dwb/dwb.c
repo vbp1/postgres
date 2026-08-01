@@ -211,38 +211,24 @@ DWBWritesPaused(void)
  * staging pool
  * ----------------------------------------------------------------
  */
+/*
+ * Non-blocking staging reservation: returns a buffer index, or -1 when the
+ * pool is empty.  Waiting for a buffer happens in DWBOpenNewBatch's outer
+ * loop, together with the wait for ring space: a would-be opener needs both
+ * resources and re-checks both conditions on every wake-up.
+ */
 static int
-DWBStagingAlloc(void)
+DWBStagingTryAlloc(void)
 {
-	int			idx;
-	DWBStallState stall;
+	int			idx = -1;
 
-	DWBStallInit(&stall);
-	for (;;)
+	SpinLockAcquire(&DWBCtl->staging_lock);
+	if (DWBCtl->staging_free != 0)
 	{
-		idx = -1;
-
-		SpinLockAcquire(&DWBCtl->staging_lock);
-		if (DWBCtl->staging_free != 0)
-		{
-			idx = pg_rightmost_one_pos32(DWBCtl->staging_free);
-			DWBCtl->staging_free &= ~(1U << idx);
-		}
-		SpinLockRelease(&DWBCtl->staging_lock);
-
-		if (idx >= 0)
-			break;
-
-		/*
-		 * A buffer frees once its leader finishes the image pwrite;
-		 * retirement broadcasts cv_free_batch too, so just re-check on every
-		 * wake-up.  The timeout only paces the stall clock.
-		 */
-		(void) ConditionVariableTimedSleep(&DWBCtl->cv_free_batch, 1000,
-										   WAIT_EVENT_DWB_FREE_BATCH);
-		DWBStallCheck(&stall);
+		idx = pg_rightmost_one_pos32(DWBCtl->staging_free);
+		DWBCtl->staging_free &= ~(1U << idx);
 	}
-	ConditionVariableCancelSleep();
+	SpinLockRelease(&DWBCtl->staging_lock);
 	return idx;
 }
 
@@ -252,7 +238,43 @@ DWBStagingRelease(int idx)
 	SpinLockAcquire(&DWBCtl->staging_lock);
 	DWBCtl->staging_free |= 1U << idx;
 	SpinLockRelease(&DWBCtl->staging_lock);
-	ConditionVariableBroadcast(&DWBCtl->cv_free_batch);
+
+	/* the freed buffer admits one more opener */
+	DWBWakeRingWaiters();
+}
+
+/*
+ * Wake one would-be batch opener of each writer class.  Called whenever a
+ * resource an opener may be waiting for appears: a staging buffer returns to
+ * the pool or a batch returns to FREE.  One targeted signal per class
+ * replaces a broadcast to every waiter, which collapses under thousands of
+ * ring-space waiters: each free event would wake them all just to re-queue
+ * on the condition variable's spinlock (3.6).  Signalling per class rather
+ * than once overall is what makes a wake-up impossible to lose across the
+ * class boundary, where the sliced reserves (dwb.h) may forbid the woken
+ * class to open.  A signal to an empty queue is a cheap no-op, every sleeper
+ * re-checks on a 1s timeout anyway, so over- and under-waking are both
+ * harmless.  Allocation-free: legal inside critical sections.
+ */
+void
+DWBWakeRingWaiters(void)
+{
+	for (int c = 0; c < DWB_NUM_WCLASSES; c++)
+		ConditionVariableSignal(&DWBCtl->cv_want_batch[c]);
+}
+
+/*
+ * After opening a fresh batch, wake enough same-class waiters to fill it.
+ * The opener consumes one slot itself, so batch_pages - 1 joiners are the
+ * most that can make progress; the rest keep sleeping until the next open.
+ * The pipeline is self-clocking: the writer that overflows this batch seals
+ * it and opens the next one while already awake, waking the next portion.
+ */
+static void
+DWBWakeJoiners(int wclass)
+{
+	for (int i = 0; i < dwb_batch_pages - 1; i++)
+		ConditionVariableSignal(&DWBCtl->cv_want_batch[wclass]);
 }
 
 /* ----------------------------------------------------------------
@@ -261,9 +283,42 @@ DWBStagingRelease(int idx)
  */
 
 /*
+ * Does open_batch_idx[wclass] still name the stale batch old_idx?  Comparing
+ * the index alone is not enough: the ring reuses indexes, so by the time a
+ * slow opener asks, old_idx may name a NEW live incarnation of the same slot
+ * (sealed, retired, freed and reopened behind its back), and replacing it
+ * would orphan that live batch together with its staging buffer.  SEAL_BIT
+ * plus the class bit disambiguate the incarnations: SEAL_BIT is set from
+ * SEAL through FREE and cleared only by the re-initialization in
+ * DWBOpenNewBatch (under DWBRingOpenLock), which also stamps the opening
+ * class — so the open batch needs replacing if and only if it is sealed or
+ * belongs to the other class (a reused index that the other class reopened
+ * while our pointer kept naming it).
+ *
+ * Callers outside DWBRingOpenLock use this as an opportunistic fast path;
+ * the opener re-checks under the lock before acting on the answer.
+ */
+static bool
+DWBOpenBatchIsStale(int wclass, uint32 old_idx)
+{
+	uint32		cur = pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]);
+	uint32		nsi;
+
+	if (cur != old_idx)
+		return false;			/* someone already replaced it */
+	if (cur == DWB_INVALID_BATCH)
+		return true;			/* nothing open yet */
+
+	nsi = pg_atomic_read_u32(&DWBCtl->batches[cur].next_slot_idx);
+	return (nsi & DWB_SEAL_BIT) ||
+		(nsi & DWB_WCLASS_BIT) != DWBWClassBit(wclass);
+}
+
+/*
  * Make open_batch_idx[wclass] point at an ALLOCATED batch, if it currently
  * points at old_idx (a sealed, foreign-class or invalid batch).  Serialized
- * by DWBRingOpenLock; sleeps on cv_free_batch when the whole ring is busy.
+ * by DWBRingOpenLock; sleeps on cv_want_batch[wclass] when the staging pool
+ * or the whole ring is busy.
  *
  * Ordering note for stale writers: a batch keeps SEAL_BIT in next_slot_idx
  * from its SEAL until we finish re-initializing it here, and the
@@ -288,47 +343,47 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		int			staging_idx;
 
 		/*
-		 * Reserve the staging buffer before taking the lock: the wait for a
-		 * free buffer can be long, and no sleeping (or interruptible) point
-		 * may exist below, where we hold DWBRingOpenLock with a batch already
-		 * taken out of DWB_FREE.
+		 * Fast path: if another opener already replaced the open batch, there
+		 * is nothing left to do here.  Checking this before the staging
+		 * reservation matters under pressure: every SEAL pushes all
+		 * concurrent same-class writers into this function at once, and all
+		 * but one of them only need to learn the new index — sending them
+		 * through the DWB_STAGING_BUFFERS-deep staging pool first would
+		 * serialize the whole herd on it.  The racy read is fine: whoever
+		 * proceeds re-checks under DWBRingOpenLock below.
 		 */
-		staging_idx = DWBStagingAlloc();
+		if (!DWBOpenBatchIsStale(wclass, old_idx))
+		{
+			ConditionVariableCancelSleep();
+			return;
+		}
+
+		/*
+		 * Try to become the opener.  The staging buffer is reserved before
+		 * taking the lock: no sleeping (or interruptible) point may exist
+		 * below, where we hold DWBRingOpenLock with a batch already taken out
+		 * of DWB_FREE.  An empty pool is waited out in this outer loop:
+		 * DWBStagingRelease signals cv_want_batch.
+		 */
+		staging_idx = DWBStagingTryAlloc();
+		if (staging_idx < 0)
+		{
+			(void) ConditionVariableTimedSleep(&DWBCtl->cv_want_batch[wclass],
+											   1000,
+											   WAIT_EVENT_DWB_FREE_BATCH);
+			DWBStallCheck(&stall);
+			continue;
+		}
 
 		LWLockAcquire(DWBRingOpenLock, LW_EXCLUSIVE);
 
-		/*
-		 * Someone else already replaced the open batch: done.  Comparing the
-		 * index alone is not enough: the ring reuses indexes, so by the time
-		 * a slow opener gets here, old_idx may name a NEW live incarnation of
-		 * the same slot (sealed, retired, freed and reopened behind our
-		 * back), and replacing it would orphan that live batch together with
-		 * its staging buffer.  SEAL_BIT plus the class bit disambiguate the
-		 * incarnations: SEAL_BIT is set from SEAL through FREE and cleared
-		 * only by the re-initialization below (under this same lock), which
-		 * also stamps the opening class — so the open batch needs replacing
-		 * if and only if it is sealed or belongs to the other class (a reused
-		 * index that the other class reopened while our pointer kept naming
-		 * it).
-		 */
+		/* authoritative staleness re-check under the lock */
+		if (!DWBOpenBatchIsStale(wclass, old_idx))
 		{
-			uint32		cur = pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]);
-			bool		stale = (cur == old_idx);
-
-			if (stale && cur != DWB_INVALID_BATCH)
-			{
-				uint32		nsi = pg_atomic_read_u32(&DWBCtl->batches[cur].next_slot_idx);
-
-				stale = (nsi & DWB_SEAL_BIT) ||
-					(nsi & DWB_WCLASS_BIT) != DWBWClassBit(wclass);
-			}
-			if (!stale)
-			{
-				LWLockRelease(DWBRingOpenLock);
-				DWBStagingRelease(staging_idx);
-				ConditionVariableCancelSleep();
-				return;
-			}
+			LWLockRelease(DWBRingOpenLock);
+			DWBStagingRelease(staging_idx);
+			ConditionVariableCancelSleep();
+			return;
 		}
 
 		/*
@@ -397,6 +452,9 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 
 			/* let retire workers re-time the force-seal deadline */
 			ConditionVariableBroadcast(&DWBCtl->cv_retire_wake);
+
+			/* wake enough same-class waiters to fill the new batch */
+			DWBWakeJoiners(wclass);
 			return;
 		}
 
@@ -414,7 +472,8 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		if (DWBRetireAllSync() > 0)
 			continue;
 
-		(void) ConditionVariableTimedSleep(&DWBCtl->cv_free_batch, 1000,
+		(void) ConditionVariableTimedSleep(&DWBCtl->cv_want_batch[wclass],
+										   1000,
 										   WAIT_EVENT_DWB_FREE_BATCH);
 		DWBStallCheck(&stall);
 	}
@@ -489,7 +548,7 @@ DWBSealBatch(int batch_idx)
 		batch->staging_idx = -1;
 		pg_atomic_write_u32(&batch->state, DWB_FREE);
 		pg_atomic_fetch_add_u64(&DWBCtl->freed_events, 1);
-		ConditionVariableBroadcast(&DWBCtl->cv_free_batch);
+		DWBWakeRingWaiters();
 		END_CRIT_SECTION();
 		return true;
 	}

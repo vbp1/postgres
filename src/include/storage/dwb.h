@@ -346,7 +346,13 @@ typedef struct DWCtl
 	pg_atomic_uint64 freed_events;	/* monotonic count of batches that reached
 									 * FREE; backpressure waiters treat a
 									 * change as retire progress */
-	ConditionVariable cv_free_batch;	/* broadcast on retire */
+	ConditionVariable cv_want_batch[DWB_NUM_WCLASSES];	/* per-class "want a
+														 * batch" queue: both
+														 * staging and
+														 * ring-space waiters
+														 * sleep here; woken by
+														 * targeted signals, not
+														 * broadcast (3.6) */
 	ConditionVariable cv_retire_wake;	/* wakes retire workers */
 	slock_t		staging_lock;	/* protects staging_free bitmap */
 	uint32		staging_free;	/* bitmap of free staging buffers */
@@ -391,6 +397,7 @@ extern DWBatchState DWBGetBatchState(int batch_idx);
 
 /* internal; exported for test_dwb's stale-open regression test */
 extern void DWBOpenNewBatch(int wclass, uint32 old_idx);
+extern void DWBWakeRingWaiters(void);
 
 /* dwb_retire.c — segment hash, retirement, worker pool */
 struct FileTag;					/* avoid dragging storage/sync.h in here */

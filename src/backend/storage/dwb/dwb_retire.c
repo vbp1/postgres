@@ -107,14 +107,14 @@ DWBFileTagFromSegRef(const DWSegRef *seg)
  */
 
 /*
- * Free a batch and wake everything that may be waiting for ring space.
- * The caller has already moved the state to DWB_FREE.
+ * Free a batch and wake one would-be opener per writer class.  The caller
+ * has already moved the state to DWB_FREE.
  */
 static void
 DWBNoteBatchFreed(void)
 {
 	pg_atomic_fetch_add_u64(&DWBCtl->freed_events, 1);
-	ConditionVariableBroadcast(&DWBCtl->cv_free_batch);
+	DWBWakeRingWaiters();
 }
 
 /*

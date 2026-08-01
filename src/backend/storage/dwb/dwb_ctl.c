@@ -92,7 +92,8 @@ DWBShmemInit(void)
 			pg_atomic_init_u32(&DWBCtl->open_batch_idx[i], DWB_INVALID_BATCH);
 		pg_atomic_init_u64(&DWBCtl->next_batch_id, 1);
 		pg_atomic_init_u64(&DWBCtl->freed_events, 0);
-		ConditionVariableInit(&DWBCtl->cv_free_batch);
+		for (int c = 0; c < DWB_NUM_WCLASSES; c++)
+			ConditionVariableInit(&DWBCtl->cv_want_batch[c]);
 		ConditionVariableInit(&DWBCtl->cv_retire_wake);
 		SpinLockInit(&DWBCtl->staging_lock);
 		DWBCtl->staging_free = (1U << DWB_STAGING_BUFFERS) - 1;
