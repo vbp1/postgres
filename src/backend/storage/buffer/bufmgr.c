@@ -4070,8 +4070,13 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
  * claimed without waiting fall back to the ordinary per-page SyncOneBuffer
  * path after the bin is done, when nothing is held.
  *
- * Caller guarantees every buffer is BM_PERMANENT (non-permanent checkpoint
- * buffers take the per-page path).  Returns the number of buffers written.
+ * The caller pre-filters for BM_PERMANENT, but only as an optimization: the
+ * authoritative check is made here under the buffer header lock, because a
+ * captured buffer can be recycled for an unlogged page before the bin
+ * flushes (the same benign window BufferSync already tolerates for the
+ * checkpoint-needed bit).  Non-permanent buffers go to the per-page
+ * fallback, whose FlushBuffer skips both the WAL flush and the DWB for
+ * them.  Returns the number of buffers written.
  */
 static int
 FlushCkptBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
@@ -4113,7 +4118,18 @@ FlushCkptBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
 			UnlockBufHdr(bufHdr, buf_state);
 			continue;
 		}
-		Assert(buf_state & BM_PERMANENT);
+		if (!(buf_state & BM_PERMANENT))
+		{
+			/*
+			 * Recycled for an unlogged page after the bin captured it, or a
+			 * shutdown checkpoint's unlogged buffer raced past the unlocked
+			 * pre-check.  Staging it would feed the DWB — and XLogFlush —
+			 * a fake unlogged LSN, so route it to the per-page path instead.
+			 */
+			UnlockBufHdr(bufHdr, buf_state);
+			fb_ids[nfallback++] = buf_ids[i];
+			continue;
+		}
 		PinBuffer_Locked(bufHdr);
 
 		if (!LWLockConditionalAcquire(BufferDescriptorGetContentLock(bufHdr),
