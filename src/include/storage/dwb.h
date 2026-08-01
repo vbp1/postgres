@@ -346,6 +346,13 @@ typedef struct DWCtl
 	pg_atomic_uint64 freed_events;	/* monotonic count of batches that reached
 									 * FREE; backpressure waiters treat a
 									 * change as retire progress */
+	pg_atomic_uint64 ring_wait_retries; /* monotonic count of DWBOpenNewBatch
+										 * iterations that went to sleep; a
+										 * parked waiter on an unchanged ring
+										 * must accrue these at the sleep
+										 * timeout pace, not spin (see the
+										 * silent-probe-release rule in
+										 * DWBStagingRelease) */
 	ConditionVariable cv_want_batch[DWB_NUM_WCLASSES];	/* per-class "want a
 														 * batch" queue: both
 														 * staging and

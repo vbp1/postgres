@@ -23,6 +23,10 @@ CREATE FUNCTION test_dwb_states()
 	RETURNS text STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION test_dwb_ring_wait_retries()
+	RETURNS bigint STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_dwb_leak(npages int, do_publish bool)
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;

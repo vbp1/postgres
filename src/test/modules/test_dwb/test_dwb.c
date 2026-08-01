@@ -338,6 +338,20 @@ test_dwb_ring_rel_slots(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(count_ring_slots(false, true, relnumber));
 }
 
+/*
+ * Cumulative count of DWBOpenNewBatch iterations that went to sleep.  The
+ * anti-spin regression in 003 asserts that a waiter parked on an unchanged
+ * full ring accrues these at the 1s sleep-timeout pace instead of busily
+ * rotating a wake token.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_ring_wait_retries);
+Datum
+test_dwb_ring_wait_retries(PG_FUNCTION_ARGS)
+{
+	check_dwb_enabled();
+	PG_RETURN_INT64((int64) pg_atomic_read_u64(&DWBCtl->ring_wait_retries));
+}
+
 PG_FUNCTION_INFO_V1(test_dwb_states);
 Datum
 test_dwb_states(PG_FUNCTION_ARGS)

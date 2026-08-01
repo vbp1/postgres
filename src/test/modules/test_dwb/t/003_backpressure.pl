@@ -148,8 +148,22 @@ $filler = $node->background_psql('postgres');
 $taken = $filler->query_safe('SELECT test_dwb_fill_ring()');
 cmp_ok($taken, '>', 0, 'ring exhausted for the slow-warn scenario');
 
+my $retries0 =
+  $node->safe_psql('postgres', 'SELECT test_dwb_ring_wait_retries()');
+
 ($rc, $out, $err) = $node->psql('postgres', 'SELECT test_dwb_cycle(1)');
 isnt($rc, 0, 'victim writer errors out on the real stall clock');
+
+# Anti-spin regression: nothing woke the victim during its ~1s of waiting
+# (no retire, no leader write), so its wait iterations must be paced by the
+# 1s sleep timeout — a handful, not the thousands a self-waking rotation of
+# the probe-released staging buffer would produce.
+my $retries1 =
+  $node->safe_psql('postgres', 'SELECT test_dwb_ring_wait_retries()');
+cmp_ok($retries1 - $retries0, '>=', 1,
+	'the stalled victim slept in the wait');
+cmp_ok($retries1 - $retries0,
+	'<=', 10, 'ring wait paced by the sleep timeout, not a busy rotation');
 like(
 	$err,
 	qr/double write buffer has no free batch after/,

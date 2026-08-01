@@ -232,29 +232,39 @@ DWBStagingTryAlloc(void)
 	return idx;
 }
 
+/*
+ * Return a staging buffer to the pool.  Deliberately silent: whether the
+ * return is a wake-worthy event depends on the caller.  A leader finishing
+ * its image pwrite adds capacity and wakes (DWBWakeRingWaiters); a would-be
+ * opener returning a probe-acquired buffer it could not use must NOT wake —
+ * under a full ring the wake token would then circulate forever through the
+ * waiters (each woken prober re-signals on its own release, and a
+ * timeout-woken process is even still queued on the condition variable, so
+ * it can pop itself), turning the paced 1s waits into a busy rotation of
+ * DWBRingOpenLock acquisitions.
+ */
 static void
 DWBStagingRelease(int idx)
 {
 	SpinLockAcquire(&DWBCtl->staging_lock);
 	DWBCtl->staging_free |= 1U << idx;
 	SpinLockRelease(&DWBCtl->staging_lock);
-
-	/* the freed buffer admits one more opener */
-	DWBWakeRingWaiters();
 }
 
 /*
- * Wake one would-be batch opener of each writer class.  Called whenever a
- * resource an opener may be waiting for appears: a staging buffer returns to
- * the pool or a batch returns to FREE.  One targeted signal per class
- * replaces a broadcast to every waiter, which collapses under thousands of
- * ring-space waiters: each free event would wake them all just to re-queue
- * on the condition variable's spinlock (3.6).  Signalling per class rather
- * than once overall is what makes a wake-up impossible to lose across the
- * class boundary, where the sliced reserves (dwb.h) may forbid the woken
- * class to open.  A signal to an empty queue is a cheap no-op, every sleeper
- * re-checks on a 1s timeout anyway, so over- and under-waking are both
- * harmless.  Allocation-free: legal inside critical sections.
+ * Wake one would-be batch opener of each writer class.  Called on real
+ * capacity transitions only — a leader finished its image pwrite (the
+ * staging buffer serves the next batch) or a batch returned to FREE — never
+ * on a probe-acquired staging buffer bouncing back unused (see
+ * DWBStagingRelease).  One targeted signal per class replaces a broadcast
+ * to every waiter, which collapses under thousands of ring-space waiters:
+ * each free event would wake them all just to re-queue on the condition
+ * variable's spinlock (3.6).  Signalling per class rather than once overall
+ * is what makes a wake-up impossible to lose across the class boundary,
+ * where the sliced reserves (dwb.h) may forbid the woken class to open.  A
+ * signal to an empty queue is a cheap no-op, every sleeper re-checks on a
+ * 1s timeout anyway, so over- and under-waking are both harmless.
+ * Allocation-free: legal inside critical sections.
  */
 void
 DWBWakeRingWaiters(void)
@@ -362,12 +372,14 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		 * Try to become the opener.  The staging buffer is reserved before
 		 * taking the lock: no sleeping (or interruptible) point may exist
 		 * below, where we hold DWBRingOpenLock with a batch already taken out
-		 * of DWB_FREE.  An empty pool is waited out in this outer loop:
-		 * DWBStagingRelease signals cv_want_batch.
+		 * of DWB_FREE.  An empty pool is waited out in this outer loop: a
+		 * leader wakes cv_want_batch when its image pwrite returns a buffer
+		 * to the pool.
 		 */
 		staging_idx = DWBStagingTryAlloc();
 		if (staging_idx < 0)
 		{
+			pg_atomic_fetch_add_u64(&DWBCtl->ring_wait_retries, 1);
 			(void) ConditionVariableTimedSleep(&DWBCtl->cv_want_batch[wclass],
 											   1000,
 											   WAIT_EVENT_DWB_FREE_BATCH);
@@ -472,6 +484,7 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		if (DWBRetireAllSync() > 0)
 			continue;
 
+		pg_atomic_fetch_add_u64(&DWBCtl->ring_wait_retries, 1);
 		(void) ConditionVariableTimedSleep(&DWBCtl->cv_want_batch[wclass],
 										   1000,
 										   WAIT_EVENT_DWB_FREE_BATCH);
@@ -665,6 +678,7 @@ DWBLeaderWriteBatch(int batch_idx)
 	/* image pwrite done — staging can serve the next batch */
 	DWBStagingRelease(batch->staging_idx);
 	batch->staging_idx = -1;
+	DWBWakeRingWaiters();
 
 	expected = DWB_WRITTEN;
 	if (!pg_atomic_compare_exchange_u32(&batch->state, &expected, DWB_FSYNCED))
