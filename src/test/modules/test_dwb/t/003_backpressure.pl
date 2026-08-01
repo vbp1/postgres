@@ -106,6 +106,12 @@ $filler = $node->background_psql('postgres');
 $taken = $filler->query_safe('SELECT test_dwb_fill_ring()');
 cmp_ok($taken, '>', 0, 'ring exhausted again for the checkpointer scenario');
 
+# An eviction fill stops at the bottom background slice, which is exactly
+# the checkpointer's guaranteed lane — consume it too, or the checkpoint
+# below would simply proceed through it instead of stalling.
+$taken = $filler->query_safe('SELECT test_dwb_fill_ring(true)');
+cmp_ok($taken, '>', 0, 'the background lane is consumed as well');
+
 $node->safe_psql('postgres',
 	"SELECT injection_points_attach('dwb-force-stall', 'notice')");
 

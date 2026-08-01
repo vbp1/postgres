@@ -51,6 +51,7 @@ tests += {
       't/012_apply_crafted.pl',
       't/013_backup_start_point.pl',
       't/014_pg_upgrade.pl',
+      't/015_vectored_flush.pl',
     ],
   },
 }

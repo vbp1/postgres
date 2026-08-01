@@ -332,18 +332,26 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
 		}
 
 		/*
-		 * Count FREE batches first: a background-class open must leave
-		 * DWB_EVICT_RESERVE of them for user evictions, so that a
-		 * checkpoint's BufferSync storm cannot eat the ring from under
-		 * latency-critical paths.  FREE->ALLOCATED happens only under
-		 * DWBRingOpenLock, and concurrent retirements only grow the count, so
-		 * the check cannot overestimate.
+		 * Count FREE batches first and apply the sliced reserves (see dwb.h):
+		 * the eviction class may not consume the bottom DWB_BG_RESERVE
+		 * batches, and the background class skips the middle
+		 * DWB_EVICT_RESERVE slice — it opens either above both slices or
+		 * inside its own bottom one.  Leaving a slice to the other class
+		 * alone would not be enough: under saturation the free count hovers
+		 * at the throttle line of the greedier class, and a rule that only
+		 * says "leave some behind" never lets the background stream reach a
+		 * batch at all.  FREE->ALLOCATED happens only under DWBRingOpenLock,
+		 * and concurrent retirements only grow the count, so the check cannot
+		 * overestimate.
 		 */
 		for (int i = 0; i < dwb_num_batches; i++)
 			if (pg_atomic_read_u32(&DWBCtl->batches[i].state) == DWB_FREE)
 				nfree++;
 
-		if (nfree > (wclass == DWB_WCLASS_BACKGROUND ? DWB_EVICT_RESERVE : 0))
+		if (wclass == DWB_WCLASS_BACKGROUND ?
+			(nfree >= 1 && (nfree > DWB_BG_RESERVE + DWB_EVICT_RESERVE ||
+							nfree <= DWB_BG_RESERVE)) :
+			nfree > DWB_BG_RESERVE)
 		{
 			for (int i = 0; i < dwb_num_batches; i++)
 			{
@@ -960,6 +968,48 @@ DWBStagePageWrite(const BufferTag *tag, const char *image,
 	DWBWaitBatchFsynced(ref);
 
 	INJECTION_POINT("dwb-after-batch-fsynced", NULL);
+}
+
+/*
+ * Steps 3-4 for a vectored caller: reserve and publish without waiting for
+ * durability.  A sequential stream gets no rendezvous from the per-page
+ * protocol — each page would seal and fdatasync a batch of its own — so the
+ * background flushers stage a whole bin of pages first and then make them
+ * durable in one place with DWBWaitStagedWrites (one batch write and one
+ * fdatasync per bin; see "vectored background flush" in 3.4 of the design).
+ */
+void
+DWBStagePageWriteNoWait(const BufferTag *tag, const char *image,
+						XLogRecPtr page_lsn, DWBSlotRef *ref)
+{
+	Assert(DWBCtl->ring_generation > 0);
+
+	DWBAcquireSlot(tag, DWBWriterClass(), true, ref);
+	DWBPublishImage(ref, image, page_lsn);
+}
+
+/*
+ * Step 5 for a vectored caller: seal every batch the bin's slots landed in
+ * and wait until they are all durable.  On return the caller may write the
+ * staged copies to the data files.
+ *
+ * Slots were acquired in order and a batch held by our refs cannot recycle,
+ * so slots of the same batch are consecutive and comparing with the previous
+ * ref finds every batch boundary (normally none: one bin, one batch).
+ */
+void
+DWBWaitStagedWrites(const DWBSlotRef *refs, int nrefs)
+{
+	for (int i = 0; i < nrefs; i++)
+		if (i == 0 || refs[i].batch_idx != refs[i - 1].batch_idx)
+			(void) DWBTrySealBatch(refs[i].batch_idx);
+
+	for (int i = 0; i < nrefs; i++)
+		if (i == 0 || refs[i].batch_idx != refs[i - 1].batch_idx)
+			DWBWaitBatchFsynced(&refs[i]);
+
+	if (nrefs > 0)
+		INJECTION_POINT("dwb-after-batch-fsynced", NULL);
 }
 
 /*

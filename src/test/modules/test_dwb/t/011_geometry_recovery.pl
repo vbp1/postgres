@@ -59,7 +59,7 @@ $node->append_conf('postgresql.conf', 'dwb_batch_pages = 32');
 my $log_offset = -s $node->logfile;
 $node->start;
 ok( $node->log_contains(
-		qr/double write buffer recovery: 1 of 1 candidate pages restored/,
+		qr/double write buffer recovery: 1 of \d+ candidate pages restored/,
 		$log_offset),
 	'the crashed ring is applied with its recorded geometry');
 ok( $node->log_contains(

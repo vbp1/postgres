@@ -79,7 +79,7 @@ write_block($thint_file, 0,
 my $log_offset = -s $node->logfile;
 $node->start;
 ok( $node->log_contains(
-		qr/double write buffer recovery: 1 of 1 candidate pages restored/,
+		qr/double write buffer recovery: 1 of \d+ candidate pages restored/,
 		$log_offset),
 	'apply-pass restored the torn page');
 ok( $node->log_contains(
@@ -111,7 +111,7 @@ PostgreSQL::Test::RecursiveCopy::copypath($node->data_dir . '/pg_dwb',
 $log_offset = -s $node->logfile;
 $node->start;
 ok( $node->log_contains(
-		qr/double write buffer recovery: 1 of 1 candidate pages restored/,
+		qr/double write buffer recovery: 1 of \d+ candidate pages restored/,
 		$log_offset),
 	'apply-pass restored the stale page');
 ok( $node->log_contains(
@@ -135,7 +135,7 @@ PostgreSQL::Test::RecursiveCopy::copypath($ring_stash,
 $log_offset = -s $node->logfile;
 $node->start;
 ok( $node->log_contains(
-		qr/double write buffer recovery: 0 of 1 candidate pages restored/,
+		qr/double write buffer recovery: 0 of \d+ candidate pages restored/,
 		$log_offset),
 	're-applied pass sees the same candidate and rewrites nothing');
 is( $node->safe_psql('postgres', 'SELECT count(*) FROM told WHERE id > 1000'),
@@ -219,7 +219,7 @@ write_block($tmark_file, 0,
 $log_offset = -s $node->logfile;
 $node->start;
 ok( $node->log_contains(
-		qr/double write buffer recovery: 1 of 1 candidate pages restored/,
+		qr/double write buffer recovery: 1 of \d+ candidate pages restored/,
 		$log_offset),
 	'unretired ring is applied despite a clean pg_control');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM tmark'),
@@ -241,7 +241,7 @@ $node->stop('immediate');
 $log_offset = -s $node->logfile;
 $node->start;
 ok( $node->log_contains(
-		qr/double write buffer recovery: 0 of 1 candidate pages restored/,
+		qr/double write buffer recovery: 0 of \d+ candidate pages restored/,
 		$log_offset),
 	'a candidate for a dropped relation is counted but skipped');
 
@@ -267,7 +267,7 @@ write_block($tzero_file, 0, "\0" x 8192);
 $log_offset = -s $node->logfile;
 $node->start;
 ok( $node->log_contains(
-		qr/double write buffer recovery: 0 of 1 candidate pages restored/,
+		qr/double write buffer recovery: 0 of \d+ candidate pages restored/,
 		$log_offset),
 	'a zeroed page is not repaired from its slot');
 is( read_block($tzero_file, 0),

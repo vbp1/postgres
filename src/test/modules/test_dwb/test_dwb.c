@@ -388,11 +388,11 @@ test_dwb_leak(PG_FUNCTION_ARGS)
  * Occupy the ring without blocking: acquire and publish slots until no
  * openable FREE batch remains and the open batch is full, keeping every ref
  * (the refs die with the session).  Sets up ring exhaustion for the
- * backpressure tests.  With background = true the slots are taken in the
- * BACKGROUND writer class, which must stop opening batches once only
- * DWB_EVICT_RESERVE FREE ones are left.  Meant for dwb_retire_workers = 0,
- * where nothing seals or retires behind our back.  Returns the number of
- * slots taken.
+ * backpressure tests.  The sliced reserves (dwb.h) shape where each class
+ * stops: an eviction fill may not consume the bottom DWB_BG_RESERVE FREE
+ * batches, a background fill from a fresh ring stops above the middle
+ * DWB_EVICT_RESERVE slice.  Meant for dwb_retire_workers = 0, where nothing
+ * seals or retires behind our back.  Returns the number of slots taken.
  */
 PG_FUNCTION_INFO_V1(test_dwb_fill_ring);
 Datum
@@ -400,7 +400,6 @@ test_dwb_fill_ring(PG_FUNCTION_ARGS)
 {
 	bool		background = PG_GETARG_BOOL(0);
 	int			wclass = background ? DWB_WCLASS_BACKGROUND : DWB_WCLASS_EVICTION;
-	int			reserve = background ? DWB_EVICT_RESERVE : 0;
 	int			taken = 0;
 	static char page[BLCKSZ];
 
@@ -409,6 +408,7 @@ test_dwb_fill_ring(PG_FUNCTION_ARGS)
 	for (;;)
 	{
 		int			nfree = 0;
+		bool		can_open;
 		uint32		open_idx;
 		BufferTag	tag;
 		DWBSlotRef	ref;
@@ -422,8 +422,12 @@ test_dwb_fill_ring(PG_FUNCTION_ARGS)
 		for (int i = 0; i < dwb_num_batches; i++)
 			if (DWBGetBatchState(i) == DWB_FREE)
 				nfree++;
+		can_open = background
+			? (nfree > DWB_BG_RESERVE + DWB_EVICT_RESERVE ||
+			   (nfree >= 1 && nfree <= DWB_BG_RESERVE))
+			: nfree > DWB_BG_RESERVE;
 		open_idx = pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]);
-		if (nfree <= reserve &&
+		if (!can_open &&
 			(open_idx == DWB_INVALID_BATCH ||
 			 (pg_atomic_read_u32(&DWBCtl->batches[open_idx].next_slot_idx) &
 			  (DWB_SEAL_BIT | DWB_IDX_MASK)) >= (uint32) dwb_batch_pages))

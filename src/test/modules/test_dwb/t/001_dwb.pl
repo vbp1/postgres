@@ -207,20 +207,27 @@ $node->restart;
 is($node->safe_psql('postgres', 'SELECT count(*) FROM dwb_repair'),
 	'100', 'torn block repaired from the batch copy (checksum-clean read)');
 
-# --- background writers leave the eviction reserve -----------------------
+# --- the sliced reserves shape who may open what --------------------------
 
-# DWB_EVICT_RESERVE = Max(2, 16/8) = 2 on this geometry: a background-class
-# writer must stop opening batches once only the reserve is left, while an
-# eviction-class writer may take the ring down to zero.
+# On this geometry DWB_BG_RESERVE = Max(1, 16/32) = 1 and DWB_EVICT_RESERVE
+# = Max(2, 16/8) = 2: a background-class writer filling a fresh ring stops
+# above the middle eviction slice, an eviction-class writer consumes
+# everything but the bottom background slice, and the background class can
+# still open that last batch — the starvation-proof lane of the
+# checkpointer.
 $bg = $node->background_psql('postgres');
 my $bg_taken = $bg->query_safe('SELECT test_dwb_fill_ring(true)');
 cmp_ok($bg_taken, '>', 0, 'background class filled the ring');
 like($node->safe_psql('postgres', 'SELECT test_dwb_states()'),
-	qr/free=2 /, 'background class stops at DWB_EVICT_RESERVE free batches');
+	qr/free=3 /, 'background fill stops above the eviction slice');
 my $ev_taken = $bg->query_safe('SELECT test_dwb_fill_ring(false)');
 cmp_ok($ev_taken, '>', 0, 'eviction class still opens batches');
 like($node->safe_psql('postgres', 'SELECT test_dwb_states()'),
-	qr/free=0 /, 'eviction class may take the ring to zero');
+	qr/free=1 /, 'eviction leaves the bottom background slice');
+my $lane_taken = $bg->query_safe('SELECT test_dwb_fill_ring(true)');
+cmp_ok($lane_taken, '>', 0, 'background class opens its reserved lane');
+like($node->safe_psql('postgres', 'SELECT test_dwb_states()'),
+	qr/free=0 /, '... consuming the ring fully');
 $bg->quit;
 $node->poll_query_until('postgres',
 		"SELECT CASE WHEN test_dwb_force_seal(false) IS NOT NULL THEN "

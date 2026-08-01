@@ -256,10 +256,18 @@ typedef struct DWSegEntry
 #define DWBSegBitmapWords() (((uint32) dwb_num_batches + 63) / 64)
 
 /*
- * FREE batches held back from background-class opens so that a checkpoint's
- * BufferSync storm can never eat the whole ring from under user evictions.
+ * Sliced reserves of FREE batches, by the free count F at open time: the
+ * bottom slice [1 .. DWB_BG_RESERVE] may be opened only by the background
+ * class, the middle slice (.. DWB_BG_RESERVE + DWB_EVICT_RESERVE] only by
+ * the eviction class, anything above by both.  The middle slice keeps a
+ * checkpoint's BufferSync storm from eating the ring from under user
+ * evictions; the bottom slice keeps a crowd of evicting backends from
+ * starving the checkpointer outright (each class needs just one open batch,
+ * so a non-empty bottom slice is a progress guarantee for the background
+ * stream).
  */
 #define DWB_EVICT_RESERVE		Max(2, dwb_num_batches / 8)
+#define DWB_BG_RESERVE			Max(1, dwb_num_batches / 32)
 
 /*
  * next_slot_idx encoding: 30-bit index + writer-class bit + seal sentinel.
@@ -366,6 +374,9 @@ extern void DWBShmemInit(void);
 /* dwb.c — write path */
 extern void DWBStagePageWrite(const BufferTag *tag, const char *image,
 							  XLogRecPtr page_lsn, DWBSlotRef *ref);
+extern void DWBStagePageWriteNoWait(const BufferTag *tag, const char *image,
+									XLogRecPtr page_lsn, DWBSlotRef *ref);
+extern void DWBWaitStagedWrites(const DWBSlotRef *refs, int nrefs);
 extern void DWBFinishPageWrite(const DWBSlotRef *ref);
 extern bool DWBWritesPaused(void);
 extern void DWBAcquireSlot(const BufferTag *tag, int wclass,
