@@ -256,6 +256,8 @@
 #dwb_max_segments = 4096		# segment hash capacity
 					# (change requires restart)
 #dwb_retire_workers = 1			# retire worker processes
+#dwb_retire_sync_method = syncfs	# syncfs where supported (Linux; the
+					# default there), fsync elsewhere
 					# (change requires restart)
 #dwb_batch_timeout_ms = 10ms		# force-seal an open batch after this time
 #dwb_retire_interval_ms = 50ms		# retire worker cycle

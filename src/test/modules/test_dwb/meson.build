@@ -53,6 +53,7 @@ tests += {
       't/014_pg_upgrade.pl',
       't/015_vectored_flush.pl',
       't/016_bgwriter_bin.pl',
+      't/017_syncfs_retire.pl',
     ],
   },
 }

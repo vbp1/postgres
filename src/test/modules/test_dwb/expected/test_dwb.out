@@ -36,3 +36,13 @@ SELECT test_dwb_states();
  free=16 allocated=0 sealed=0 written=0 fsynced=0 data_written=0 retiring=0
 (1 row)
 
+-- the cycles sealed deterministically: two overflow seals from the 40-page
+-- run (2 x 16 slots) and two forced tail seals (5 + 8 slots)
+SELECT wclass, reason, seals, pages FROM test_dwb_seal_stats()
+ WHERE seals > 0 ORDER BY wclass, reason;
+  wclass  |  reason  | seals | pages 
+----------+----------+-------+-------
+ eviction | forced   |     2 |    13
+ eviction | overflow |     2 |    32
+(2 rows)
+

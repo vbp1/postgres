@@ -452,6 +452,7 @@ static const struct config_enum_entry debug_logical_replication_streaming_option
 StaticAssertDecl(lengthof(ssl_protocol_versions_info) == (PG_TLS1_3_VERSION + 2),
 				 "array length mismatch");
 
+/* shared by recovery_init_sync_method and dwb_retire_sync_method */
 static const struct config_enum_entry recovery_init_sync_method_options[] = {
 	{"fsync", DATA_DIR_SYNC_METHOD_FSYNC, false},
 #ifdef HAVE_SYNCFS
@@ -5135,6 +5136,16 @@ struct config_enum ConfigureNamesEnum[] =
 		},
 		&dwb_on_stall,
 		DWB_ON_STALL_PANIC, dwb_on_stall_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dwb_retire_sync_method", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Selects how double write buffer retirement makes data files durable."),
+			gettext_noop("\"fsync\" syncs the touched data-file segments one by one; \"syncfs\" syncs their whole file systems per retire round.")
+		},
+		&dwb_retire_sync_method,
+		DWB_RETIRE_SYNC_METHOD_DEFAULT, recovery_init_sync_method_options,
 		NULL, NULL, NULL
 	},
 

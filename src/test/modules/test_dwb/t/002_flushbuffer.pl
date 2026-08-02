@@ -141,4 +141,14 @@ $node->poll_query_until('postgres',
   or die 'timed out waiting for the ring to drain without a worker pool';
 pass('ring drained to all-free without a worker pool');
 
+# The no-pool path seals every staged page right away through the
+# solo-stream fast seal; the seal accounting must attribute them to it.
+cmp_ok(
+	$node->safe_psql(
+		'postgres',
+		"SELECT seals FROM test_dwb_seal_stats() "
+		  . "WHERE wclass = 'eviction' AND reason = 'lone'"),
+	'>', 0,
+	'no-pool seals are accounted as lone-writer fast seals');
+
 done_testing();

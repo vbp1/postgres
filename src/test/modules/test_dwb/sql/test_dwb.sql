@@ -16,3 +16,8 @@ SELECT test_dwb_ring_slots(true);
 
 -- and the ring is fully retired again
 SELECT test_dwb_states();
+
+-- the cycles sealed deterministically: two overflow seals from the 40-page
+-- run (2 x 16 slots) and two forced tail seals (5 + 8 slots)
+SELECT wclass, reason, seals, pages FROM test_dwb_seal_stats()
+ WHERE seals > 0 ORDER BY wclass, reason;

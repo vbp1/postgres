@@ -24,6 +24,7 @@
 
 #include "access/xlogdefs.h"
 #include "catalog/pg_control.h"
+#include "common/file_utils.h"
 #include "port/pg_crc32c.h"
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h"
@@ -46,12 +47,28 @@ typedef enum
 	DWB_ON_STALL_PANIC,
 } DWBOnStall;
 
+/*
+ * GUC: dwb_retire_sync_method.  Shares the DataDirSyncMethod values of
+ * recovery_init_sync_method (common/file_utils.h): "fsync" retires by
+ * fsyncing each touched data-file segment, "syncfs" makes whole file
+ * systems durable per retire round.  syncfs is the default where the
+ * syscall exists: a shared random workload touches nearly every segment
+ * of a large table between rounds, and one syncfs replaces hundreds of
+ * per-segment fdatasync calls on the same file system.
+ */
+#ifdef HAVE_SYNCFS
+#define DWB_RETIRE_SYNC_METHOD_DEFAULT DATA_DIR_SYNC_METHOD_SYNCFS
+#else
+#define DWB_RETIRE_SYNC_METHOD_DEFAULT DATA_DIR_SYNC_METHOD_FSYNC
+#endif
+
 /* GUC variables (defined in dwb_ctl.c) */
 extern PGDLLIMPORT int io_torn_pages_protection;
 extern PGDLLIMPORT int dwb_num_batches;
 extern PGDLLIMPORT int dwb_batch_pages;
 extern PGDLLIMPORT int dwb_max_segments;
 extern PGDLLIMPORT int dwb_retire_workers;
+extern PGDLLIMPORT int dwb_retire_sync_method;
 extern PGDLLIMPORT int dwb_batch_timeout_ms;
 extern PGDLLIMPORT int dwb_retire_interval_ms;
 extern PGDLLIMPORT bool dwb_writeback;
@@ -77,6 +94,25 @@ extern PGDLLIMPORT int dwb_on_stall;
 #define DWB_NUM_WCLASSES		2
 #define DWB_WCLASS_EVICTION		0
 #define DWB_WCLASS_BACKGROUND	1
+
+/*
+ * Why a batch was sealed.  Purely diagnostic: per-class seal and page
+ * counters in DWCtl attribute batch turnover to its trigger, which is how
+ * a half-filled average (batch fsyncs paid for underfilled batches) is
+ * told apart from healthy overflow sealing.
+ */
+typedef enum DWBSealReason
+{
+	DWB_SEAL_OVERFLOW,			/* a reservation ran past the last slot */
+	DWB_SEAL_LONE,				/* solo-stream fast seal: a lone waiter, or
+								 * every page when there is no worker pool */
+	DWB_SEAL_WAIT_TIMEOUT,		/* a waiting writer hit dwb_batch_timeout_ms */
+	DWB_SEAL_WORKER_TIMEOUT,	/* a retire worker force-sealed on age */
+	DWB_SEAL_BIN,				/* a background bin flush sealed its batches */
+	DWB_SEAL_FORCED,			/* explicit DWBForceSealOpenBatch */
+} DWBSealReason;
+
+#define DWB_SEAL_NREASONS		(DWB_SEAL_FORCED + 1)
 
 #define DWB_DIR					"pg_dwb"
 #define DWB_CONTROL_FILE		DWB_DIR "/control"
@@ -353,6 +389,9 @@ typedef struct DWCtl
 										 * timeout pace, not spin (see the
 										 * silent-probe-release rule in
 										 * DWBStagingRelease) */
+	/* diagnostic seal accounting: [writer class][DWBSealReason] */
+	pg_atomic_uint64 seal_count[DWB_NUM_WCLASSES][DWB_SEAL_NREASONS];
+	pg_atomic_uint64 seal_pages[DWB_NUM_WCLASSES][DWB_SEAL_NREASONS];
 	ConditionVariable cv_want_batch[DWB_NUM_WCLASSES];	/* per-class "want a
 														 * batch" queue: both
 														 * staging and
@@ -399,7 +438,7 @@ extern void DWBPublishImage(const DWBSlotRef *ref, const char *image,
 extern void DWBWaitBatchFsynced(const DWBSlotRef *ref);
 extern void DWBReleaseSlot(const DWBSlotRef *ref);
 extern bool DWBForceSealOpenBatch(int wclass);
-extern bool DWBTrySealBatch(int batch_idx);
+extern bool DWBTrySealBatch(int batch_idx, DWBSealReason reason);
 extern DWBatchState DWBGetBatchState(int batch_idx);
 
 /* internal; exported for test_dwb's stale-open regression test */

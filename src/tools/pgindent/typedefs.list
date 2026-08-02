@@ -607,6 +607,7 @@ DWBControlFileData
 DWBOnStall
 DWBPendingRef
 DWBRetiringBatch
+DWBSealReason
 DWBSegSyncSnap
 DWBSlotRef
 DWBStallState

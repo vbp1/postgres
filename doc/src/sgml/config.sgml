@@ -3554,6 +3554,35 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-dwb-retire-sync-method" xreflabel="dwb_retire_sync_method">
+      <term><varname>dwb_retire_sync_method</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>dwb_retire_sync_method</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Selects how retirement makes the covered data files durable before
+        freeing a batch.  With <literal>fsync</literal> each touched
+        data-file segment is synced individually.  With
+        <literal>syncfs</literal> a retire round issues one
+        <function>syncfs()</function> call per file system holding data
+        files and then frees every batch whose data-file writes preceded
+        the round, which is much cheaper when a write-heavy workload
+        touches many segments between rounds.  <literal>syncfs</literal>
+        is only available on Linux and is the default there;
+        <literal>fsync</literal> is the default elsewhere.
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
+       </para>
+       <para>
+        The caveats of <function>syncfs</function> described under
+        <xref linkend="guc-recovery-init-sync-method"/> apply here as
+        well.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-dwb-batch-timeout-ms" xreflabel="dwb_batch_timeout_ms">
       <term><varname>dwb_batch_timeout_ms</varname> (<type>integer</type>)
       <indexterm>

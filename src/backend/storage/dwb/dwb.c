@@ -84,7 +84,7 @@ typedef struct DWBStallState
 
 static void DWBProcExit(int code, Datum arg);
 static void DWBLeaderWriteBatch(int batch_idx);
-static bool DWBSealBatch(int batch_idx);
+static bool DWBSealBatch(int batch_idx, DWBSealReason reason);
 static void DWBFinishBatchData(DWBatchCtl *batch);
 static void DWBAbandonRef(DWBPendingRef *pref);
 static void ResOwnerReleaseDWBRef(Datum res);
@@ -520,12 +520,13 @@ DWBOpenNewBatch(int wclass, uint32 old_idx)
  * the defensive capped_slots == 0 case — on return).
  */
 static bool
-DWBSealBatch(int batch_idx)
+DWBSealBatch(int batch_idx, DWBSealReason reason)
 {
 	DWBatchCtl *batch = &DWBCtl->batches[batch_idx];
 	uint32		prev;
 	uint32		capped;
 	uint32		expected;
+	int			wclass;
 
 	/*
 	 * Get everything the critical section below could fail at out of the way
@@ -561,6 +562,11 @@ DWBSealBatch(int batch_idx)
 	capped = Min(prev & DWB_IDX_MASK, (uint32) dwb_batch_pages);
 	pg_atomic_write_u32(&batch->capped_slots, capped);
 	pg_write_barrier();
+
+	/* diagnostic accounting: who seals, and how full the batches are */
+	wclass = (prev & DWB_WCLASS_BIT) ? DWB_WCLASS_BACKGROUND : DWB_WCLASS_EVICTION;
+	pg_atomic_fetch_add_u64(&DWBCtl->seal_count[wclass][reason], 1);
+	pg_atomic_fetch_add_u64(&DWBCtl->seal_pages[wclass][reason], capped);
 
 	expected = DWB_ALLOCATED;
 	if (!pg_atomic_compare_exchange_u32(&batch->state, &expected, DWB_SEALED))
@@ -721,7 +727,7 @@ DWBLeaderWriteBatch(int batch_idx)
  * and non-empty.
  */
 bool
-DWBTrySealBatch(int batch_idx)
+DWBTrySealBatch(int batch_idx, DWBSealReason reason)
 {
 	DWBatchCtl *batch = &DWBCtl->batches[batch_idx];
 	uint32		nsi = pg_atomic_read_u32(&batch->next_slot_idx);
@@ -733,7 +739,7 @@ DWBTrySealBatch(int batch_idx)
 		return false;			/* empty: sealing buys nothing */
 	if (pg_atomic_read_u32(&batch->state) != DWB_ALLOCATED)
 		return false;
-	return DWBSealBatch(batch_idx);
+	return DWBSealBatch(batch_idx, reason);
 }
 
 /*
@@ -827,7 +833,7 @@ DWBAcquireSlot(const BufferTag *tag, int wclass, bool use_resowner,
 		if (slot >= (uint32) dwb_batch_pages)
 		{
 			/* overflow: this writer seals and (if it wins) leads */
-			DWBSealBatch(idx);
+			DWBSealBatch(idx, DWB_SEAL_OVERFLOW);
 			DWBOpenNewBatch(wclass, idx);
 			continue;
 		}
@@ -932,7 +938,7 @@ DWBWaitBatchFsynced(const DWBSlotRef *ref)
 	 * the next batch — sealing is valid at any moment.
 	 */
 	if (pg_atomic_read_u32(&batch->ref_count) == 1)
-		(void) DWBTrySealBatch(ref->batch_idx);
+		(void) DWBTrySealBatch(ref->batch_idx, DWB_SEAL_LONE);
 
 	ConditionVariablePrepareToSleep(&batch->cv_state);
 	while (pg_atomic_read_u32(&batch->state) < DWB_FSYNCED)
@@ -940,7 +946,7 @@ DWBWaitBatchFsynced(const DWBSlotRef *ref)
 		if (ConditionVariableTimedSleep(&batch->cv_state,
 										dwb_batch_timeout_ms,
 										WAIT_EVENT_DWB_BATCH_FSYNC))
-			(void) DWBTrySealBatch(ref->batch_idx);
+			(void) DWBTrySealBatch(ref->batch_idx, DWB_SEAL_WAIT_TIMEOUT);
 	}
 	ConditionVariableCancelSleep();
 }
@@ -1005,7 +1011,7 @@ DWBForceSealOpenBatch(int wclass)
 
 	if (idx == DWB_INVALID_BATCH)
 		return false;
-	return DWBTrySealBatch((int) idx);
+	return DWBTrySealBatch((int) idx, DWB_SEAL_FORCED);
 }
 
 DWBatchState
@@ -1053,7 +1059,7 @@ DWBStagePageWrite(const BufferTag *tag, const char *image,
 	 * instead of paying dwb_batch_timeout_ms per page.
 	 */
 	if (dwb_retire_workers == 0 || !IsUnderPostmaster)
-		(void) DWBTrySealBatch(ref->batch_idx);
+		(void) DWBTrySealBatch(ref->batch_idx, DWB_SEAL_LONE);
 
 	DWBWaitBatchFsynced(ref);
 
@@ -1092,7 +1098,7 @@ DWBWaitStagedWrites(const DWBSlotRef *refs, int nrefs)
 {
 	for (int i = 0; i < nrefs; i++)
 		if (i == 0 || refs[i].batch_idx != refs[i - 1].batch_idx)
-			(void) DWBTrySealBatch(refs[i].batch_idx);
+			(void) DWBTrySealBatch(refs[i].batch_idx, DWB_SEAL_BIN);
 
 	for (int i = 0; i < nrefs; i++)
 		if (i == 0 || refs[i].batch_idx != refs[i - 1].batch_idx)

@@ -25,6 +25,7 @@ int			dwb_num_batches = 64;
 int			dwb_batch_pages = 64;
 int			dwb_max_segments = 4096;
 int			dwb_retire_workers = 1;
+int			dwb_retire_sync_method = DWB_RETIRE_SYNC_METHOD_DEFAULT;
 int			dwb_batch_timeout_ms = 10;
 int			dwb_retire_interval_ms = 50;
 bool		dwb_writeback = true;
@@ -93,6 +94,12 @@ DWBShmemInit(void)
 		pg_atomic_init_u64(&DWBCtl->next_batch_id, 1);
 		pg_atomic_init_u64(&DWBCtl->freed_events, 0);
 		pg_atomic_init_u64(&DWBCtl->ring_wait_retries, 0);
+		for (int c = 0; c < DWB_NUM_WCLASSES; c++)
+			for (int r = 0; r < DWB_SEAL_NREASONS; r++)
+			{
+				pg_atomic_init_u64(&DWBCtl->seal_count[c][r], 0);
+				pg_atomic_init_u64(&DWBCtl->seal_pages[c][r], 0);
+			}
 		for (int c = 0; c < DWB_NUM_WCLASSES; c++)
 			ConditionVariableInit(&DWBCtl->cv_want_batch[c]);
 		ConditionVariableInit(&DWBCtl->cv_retire_wake);

@@ -28,6 +28,12 @@
  * All of them share this accounting; duplicate fsyncs are wasted work at
  * worst, never a correctness problem.
  *
+ * With dwb_retire_sync_method = syncfs the worker pool and the self-help
+ * skip the per-segment protocol entirely: one syncfs() round makes every
+ * file system holding data files durable and frees all batches that were
+ * RETIRING when the round began (DWBRetireRoundSyncfs).  The checkpointer
+ * piggyback keeps using the per-segment accounting in both modes.
+ *
  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -38,8 +44,12 @@
  */
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "common/hashfn.h"
 #include "common/int.h"
+#include "common/relpath.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
 #include "postmaster/bgworker.h"
@@ -56,6 +66,7 @@
 
 static void DWBMaybeRemoveSegEntry(DWSegEntry *entry);
 static int	DWBRetireSweep(int worker_id);
+static int	DWBRetireRoundSyncfs(void);
 
 /*
  * Snapshot of one segment's back-references, taken before an fsync of that
@@ -531,16 +542,16 @@ DWBRetireSegment(const DWSegRef *seg)
 }
 
 /*
- * One retire sweep over all RETIRING batches, oldest first.  worker_id >= 0
- * restricts the sweep to that worker's segment partition; -1 sweeps
- * everything: the self-help of a writer stuck on a full ring
- * (DWBOpenNewBatch) and the synchronous retire in DWBFinishPageWrite when
- * there is no worker pool (dwb_retire_workers = 0, single-user mode).
- * Returns batches freed.
+ * Retire everything that can be retired right now.  Called by the self-help
+ * of a writer stuck on a full ring (DWBOpenNewBatch) and by the synchronous
+ * retire in DWBFinishPageWrite when there is no worker pool
+ * (dwb_retire_workers = 0, single-user mode).  Returns batches freed.
  */
 int
 DWBRetireAllSync(void)
 {
+	if (dwb_retire_sync_method == DATA_DIR_SYNC_METHOD_SYNCFS)
+		return DWBRetireRoundSyncfs();
 	return DWBRetireSweep(-1);
 }
 
@@ -557,6 +568,11 @@ dwb_retiring_batch_cmp(const void *a, const void *b)
 					  ((const DWBRetiringBatch *) b)->id);
 }
 
+/*
+ * One per-segment retire sweep over all RETIRING batches, oldest first.
+ * worker_id >= 0 restricts the sweep to that worker's segment partition;
+ * -1 sweeps everything.  Returns batches freed.
+ */
 static int
 DWBRetireSweep(int worker_id)
 {
@@ -600,6 +616,179 @@ DWBRetireSweep(int worker_id)
 
 	pfree(retiring);
 	pfree(segs);
+	return freed;
+}
+
+#ifdef HAVE_SYNCFS
+/*
+ * syncfs() one directory's file system.  Follows the vanilla data_sync_retry
+ * policy of DWBRetireSyncSegment: a failure PANICs by default, or WARNs and
+ * returns false under data_sync_retry = on so the caller retries the round
+ * later.  (The usual retry caveat applies doubly here: a second syncfs may
+ * report success after the kernel already dropped the dirty pages the first
+ * failure was about.)  missing_ok tolerates a dangling pg_tblspc entry: a
+ * vanished tablespace took its data files with it, so their writes are as
+ * moot as a dropped segment's on the per-segment path.
+ */
+static bool
+DWBSyncfsPath(const char *path, bool missing_ok)
+{
+	int			fd;
+
+	fd = OpenTransientFile(path, O_RDONLY);
+	if (fd < 0)
+	{
+		if (missing_ok && errno == ENOENT)
+			return true;
+		ereport(data_sync_elevel(WARNING),
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+		return false;
+	}
+	pgstat_report_wait_start(WAIT_EVENT_DWB_SYNCFS);
+	if (syncfs(fd) < 0)
+	{
+		pgstat_report_wait_end();
+		CloseTransientFile(fd);
+		ereport(data_sync_elevel(WARNING),
+				(errcode_for_file_access(),
+				 errmsg("could not synchronize file system for file \"%s\": %m",
+						path)));
+		return false;
+	}
+	pgstat_report_wait_end();
+	CloseTransientFile(fd);
+	return true;
+}
+#endif							/* HAVE_SYNCFS */
+
+/*
+ * Make every file system that can hold data files durable: the one under
+ * the data directory (the process is chdir'd into it) and each tablespace
+ * mount.  Returns true only if every syncfs succeeded — anything less and
+ * no batch may be freed on its account.  An unreadable pg_tblspc raises an
+ * ERROR (never a wrong free): the worker restarts, a self-helping writer
+ * aborts its statement.
+ */
+static bool
+DWBSyncfsAllFilesystems(void)
+{
+#ifdef HAVE_SYNCFS
+	DIR		   *dir;
+	struct dirent *de;
+	bool		ok = true;
+
+	if (!enableFsync)
+		return true;
+
+	if (!DWBSyncfsPath(".", false))
+		ok = false;
+
+	dir = AllocateDir(PG_TBLSPC_DIR);
+	while ((de = ReadDir(dir, PG_TBLSPC_DIR)) != NULL)
+	{
+		char		path[MAXPGPATH];
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		snprintf(path, MAXPGPATH, "%s/%s", PG_TBLSPC_DIR, de->d_name);
+		if (!DWBSyncfsPath(path, true))
+			ok = false;
+	}
+	FreeDir(dir);
+	return ok;
+#else
+	/* the GUC cannot be set to syncfs without HAVE_SYNCFS */
+	elog(PANIC, "syncfs is not supported on this platform");
+	return false;				/* keep the compiler happy */
+#endif
+}
+
+/*
+ * One wholesale retire round: syncfs the file systems and free every batch
+ * that was already RETIRING when the round began.  Returns batches freed.
+ *
+ * Correctness of the wholesale free: a batch observed RETIRING completed
+ * ALL its data-file writes before the last ref drop published it (write
+ * path steps 6-7), so those writes were submitted before syncfs() started
+ * and are durable when it returns.  A batch that reaches RETIRING while
+ * the syncfs runs is not on the list and waits for the next round.
+ *
+ * The per-segment accounting stays consistent with the concurrent
+ * checkpointer piggyback: each freed batch's bits are cleared under the
+ * same publish_lock + DWBSegHashLock the decrement path takes, and the
+ * (batch_idx, batch_id) snapshot re-check under publish_lock is the same
+ * ABA guard the snapshot protocol uses (batch_id is read racily here, like
+ * in DWBRetireSweep's collect; a torn read only makes the re-check skip).
+ */
+static int
+DWBRetireRoundSyncfs(void)
+{
+	DWBRetiringBatch *retiring;
+	int			nretiring = 0;
+	int			freed = 0;
+
+	retiring = palloc(dwb_num_batches * sizeof(DWBRetiringBatch));
+
+	for (int i = 0; i < dwb_num_batches; i++)
+	{
+		if (pg_atomic_read_u32(&DWBCtl->batches[i].state) == DWB_RETIRING)
+		{
+			retiring[nretiring].idx = i;
+			retiring[nretiring].id = DWBCtl->batches[i].batch_id;
+			nretiring++;
+		}
+	}
+
+	if (nretiring == 0 || !DWBSyncfsAllFilesystems())
+	{
+		pfree(retiring);
+		return 0;
+	}
+
+	for (int i = 0; i < nretiring; i++)
+	{
+		int			idx = retiring[i].idx;
+		DWBatchCtl *batch = &DWBCtl->batches[idx];
+
+		LWLockAcquire(&batch->publish_lock, LW_EXCLUSIVE);
+		if (batch->batch_id == retiring[i].id &&
+			pg_atomic_read_u32(&batch->state) == DWB_RETIRING)
+		{
+			uint32		expected = DWB_RETIRING;
+			uint64		bit = UINT64CONST(1) << (idx % 64);
+
+			LWLockAcquire(DWBSegHashLock, LW_EXCLUSIVE);
+			for (uint32 s = 0; s < batch->n_segs; s++)
+			{
+				DWSegEntry *entry;
+
+				entry = (DWSegEntry *) hash_search(DWSegmentHash,
+												   &batch->seg_set[s],
+												   HASH_FIND, NULL);
+				if (entry != NULL)
+				{
+					uint64		prev;
+
+					prev = pg_atomic_fetch_and_u64(&entry->batch_bitmap[idx / 64],
+												   ~bit);
+					if (prev & bit)
+						DWBMaybeRemoveSegEntry(entry);
+				}
+			}
+			LWLockRelease(DWBSegHashLock);
+
+			pg_atomic_write_u32(&batch->seg_pending_count, 0);
+			if (!pg_atomic_compare_exchange_u32(&batch->state, &expected,
+												DWB_FREE))
+				elog(PANIC, "DWB batch freed in unexpected state %u", expected);
+			DWBNoteBatchFreed();
+			freed++;
+		}
+		LWLockRelease(&batch->publish_lock);
+	}
+
+	pfree(retiring);
 	return freed;
 }
 
@@ -715,12 +904,15 @@ DWBRetireWorkerMain(Datum main_arg)
 
 			age_ms = TimestampDifferenceMilliseconds(batch->open_time, now);
 			if (age_ms >= dwb_batch_timeout_ms)
-				(void) DWBTrySealBatch(i);
+				(void) DWBTrySealBatch(i, DWB_SEAL_WORKER_TIMEOUT);
 			else if (dwb_batch_timeout_ms - age_ms < timeout)
 				timeout = dwb_batch_timeout_ms - age_ms;
 		}
 
-		(void) DWBRetireSweep(my_id);
+		if (dwb_retire_sync_method == DATA_DIR_SYNC_METHOD_SYNCFS)
+			(void) DWBRetireRoundSyncfs();
+		else
+			(void) DWBRetireSweep(my_id);
 
 		(void) ConditionVariableTimedSleep(&DWBCtl->cv_retire_wake,
 										   Max(timeout, 1),

@@ -22,6 +22,7 @@
 #include "catalog/pg_tablespace_d.h"
 #include "common/relpath.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
@@ -78,7 +79,7 @@ stage_one_page(const BufferTag *tag, const char *image, XLogRecPtr page_lsn,
 {
 	DWBAcquireSlot(tag, DWB_WCLASS_EVICTION, use_resowner, ref);
 	DWBPublishImage(ref, image, page_lsn);
-	if (!DWBTrySealBatch(ref->batch_idx))
+	if (!DWBTrySealBatch(ref->batch_idx, DWB_SEAL_FORCED))
 		ereport(ERROR, (errmsg("could not seal the batch under test")));
 	DWBWaitBatchFsynced(ref);
 }
@@ -350,6 +351,45 @@ test_dwb_ring_wait_retries(PG_FUNCTION_ARGS)
 {
 	check_dwb_enabled();
 	PG_RETURN_INT64((int64) pg_atomic_read_u64(&DWBCtl->ring_wait_retries));
+}
+
+/*
+ * Cumulative seal accounting: one row per (writer class, seal reason) with
+ * the number of seal wins and the sum of slots the sealed batches carried.
+ * pages/seals is the average fill a reason is responsible for.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_seal_stats);
+Datum
+test_dwb_seal_stats(PG_FUNCTION_ARGS)
+{
+	static const char *const wclass_names[DWB_NUM_WCLASSES] = {
+		"eviction", "background",
+	};
+	static const char *const reason_names[DWB_SEAL_NREASONS] = {
+		"overflow", "lone", "wait_timeout", "worker_timeout", "bin", "forced",
+	};
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	check_dwb_enabled();
+	InitMaterializedSRF(fcinfo, 0);
+
+	for (int c = 0; c < DWB_NUM_WCLASSES; c++)
+		for (int r = 0; r < DWB_SEAL_NREASONS; r++)
+		{
+			Datum		values[4];
+			bool		nulls[4] = {0};
+
+			values[0] = CStringGetTextDatum(wclass_names[c]);
+			values[1] = CStringGetTextDatum(reason_names[r]);
+			values[2] = Int64GetDatum(
+									  (int64) pg_atomic_read_u64(&DWBCtl->seal_count[c][r]));
+			values[3] = Int64GetDatum(
+									  (int64) pg_atomic_read_u64(&DWBCtl->seal_pages[c][r]));
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								 values, nulls);
+		}
+
+	return (Datum) 0;
 }
 
 PG_FUNCTION_INFO_V1(test_dwb_states);
@@ -722,7 +762,7 @@ test_dwb_fill_segments(PG_FUNCTION_ARGS)
 			DWBPublishImage(&refs[i], page, (XLogRecPtr) 0x7000000 + nsegs);
 			nsegs++;
 		}
-		if (!DWBTrySealBatch(refs[0].batch_idx))
+		if (!DWBTrySealBatch(refs[0].batch_idx, DWB_SEAL_FORCED))
 			ereport(ERROR, (errmsg("could not seal a segment-fill batch")));
 		DWBWaitBatchFsynced(&refs[0]);
 		for (int i = 0; i < dwb_batch_pages; i++)

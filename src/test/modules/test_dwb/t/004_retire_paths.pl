@@ -26,6 +26,7 @@ dwb_num_batches = 64
 dwb_batch_pages = 64
 dwb_max_segments = 1024
 dwb_retire_workers = 0
+dwb_retire_sync_method = fsync
 bgwriter_lru_maxpages = 0
 checkpoint_timeout = 1h
 autovacuum = off

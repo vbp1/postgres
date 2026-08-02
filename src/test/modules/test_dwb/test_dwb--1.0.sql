@@ -27,6 +27,11 @@ CREATE FUNCTION test_dwb_ring_wait_retries()
 	RETURNS bigint STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION test_dwb_seal_stats(
+	OUT wclass text, OUT reason text, OUT seals bigint, OUT pages bigint)
+	RETURNS SETOF record STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_dwb_leak(npages int, do_publish bool)
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
