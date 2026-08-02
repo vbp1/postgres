@@ -61,6 +61,7 @@
 #include "storage/md.h"
 #include "storage/sync.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -728,6 +729,28 @@ DWBRetireRoundSyncfs(void)
 	int			nretiring = 0;
 	int			freed = 0;
 
+	/*
+	 * One round at a time: every retire worker wakes on the same broadcast,
+	 * and the ring-full self-help can race the pool, but concurrent rounds
+	 * would only duplicate a whole-file-system syncfs.  A loser returns at
+	 * once — the winner's round covers everything that was RETIRING when it
+	 * collected, and batches published after that wake the pool again.  The
+	 * collect below runs under the lock, so no process can free a batch some
+	 * other round's syncfs did not cover.  An ERROR inside the round (e.g. an
+	 * unreadable pg_tblspc) releases the gate in the unwind.
+	 */
+	if (!LWLockConditionalAcquire(DWBSyncfsRoundLock, LW_EXCLUSIVE))
+		return 0;
+
+	/*
+	 * Test hook: proves the gate admits one process at a time.  Sits before
+	 * the collect, so a batch published while a test holds a round parked
+	 * here is still picked up once the round resumes.  NB: parking here
+	 * freezes ALL wholesale retirement, so a test must not generate ring
+	 * traffic while the point is armed.
+	 */
+	INJECTION_POINT("dwb-syncfs-round", NULL);
+
 	retiring = palloc(dwb_num_batches * sizeof(DWBRetiringBatch));
 
 	for (int i = 0; i < dwb_num_batches; i++)
@@ -742,6 +765,7 @@ DWBRetireRoundSyncfs(void)
 
 	if (nretiring == 0 || !DWBSyncfsAllFilesystems())
 	{
+		LWLockRelease(DWBSyncfsRoundLock);
 		pfree(retiring);
 		return 0;
 	}
@@ -788,6 +812,7 @@ DWBRetireRoundSyncfs(void)
 		LWLockRelease(&batch->publish_lock);
 	}
 
+	LWLockRelease(DWBSyncfsRoundLock);
 	pfree(retiring);
 	return freed;
 }

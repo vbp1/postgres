@@ -367,6 +367,7 @@ AioWorkerSubmissionQueue	"Waiting to access AIO worker submission queue."
 DWBRingOpen	"Waiting to open a new double write buffer batch."
 DWBSegHash	"Waiting to read or update the double write buffer segment hash table."
 DWBSelfSweep	"Waiting to run the double write buffer self-help retirement sweep."
+DWBSyncfsRound	"Waiting to run a wholesale double write buffer retirement round."
 
 #
 # END OF PREDEFINED LWLOCKS (DO NOT CHANGE THIS LINE)
