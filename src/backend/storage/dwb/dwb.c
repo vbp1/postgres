@@ -568,6 +568,17 @@ DWBSealBatch(int batch_idx, DWBSealReason reason)
 	pg_atomic_fetch_add_u64(&DWBCtl->seal_count[wclass][reason], 1);
 	pg_atomic_fetch_add_u64(&DWBCtl->seal_pages[wclass][reason], capped);
 
+	/*
+	 * An overflow seal marks the class as HOT: writers are streaming in
+	 * faster than a batch fills, so a lone writer in a fresh batch must not
+	 * fast-seal it (see DWBWaitBatchFsynced).  Stamped again after the leader
+	 * write below: the hot window has to survive a slow batch fdatasync, or
+	 * the first writer after it would find a stale stamp.
+	 */
+	if (reason == DWB_SEAL_OVERFLOW)
+		pg_atomic_write_u64(&DWBCtl->last_overflow_seal[wclass],
+							(uint64) GetCurrentTimestamp());
+
 	expected = DWB_ALLOCATED;
 	if (!pg_atomic_compare_exchange_u32(&batch->state, &expected, DWB_SEALED))
 		elog(PANIC, "DWB batch %d sealed in unexpected state %u",
@@ -601,6 +612,11 @@ DWBSealBatch(int batch_idx, DWBSealReason reason)
 	DWBLeaderWriteBatch(batch_idx);
 
 	END_CRIT_SECTION();
+
+	/* the hot window starts over once the overflow's fdatasync is done */
+	if (reason == DWB_SEAL_OVERFLOW)
+		pg_atomic_write_u64(&DWBCtl->last_overflow_seal[wclass],
+							(uint64) GetCurrentTimestamp());
 
 	if (pg_atomic_fetch_sub_u32(&batch->ref_count, 1) == 1)
 		DWBFinishBatchData(batch);
@@ -912,6 +928,27 @@ DWBPublishImage(const DWBSlotRef *ref, const char *image, XLogRecPtr page_lsn)
 }
 
 /*
+ * Is the writer class's demand hot — was its last overflow seal younger
+ * than the rendezvous window?  Hot only when the clock reads at or past
+ * the stamp: a stamp from the future (a backward system-clock step) must
+ * read as QUIET, or the immediate lone seal would stay disabled until the
+ * clock catches up, taxing every write of a sequential stream with the
+ * timeout.  Exported for the test module, which plants a future stamp to
+ * pin exactly that branch.
+ */
+bool
+DWBClassIsHot(int wclass)
+{
+	TimestampTz stamp;
+	TimestampTz now;
+
+	stamp = (TimestampTz) pg_atomic_read_u64(&DWBCtl->last_overflow_seal[wclass]);
+	now = GetCurrentTimestamp();
+	return now >= stamp &&
+		!TimestampDifferenceExceeds(stamp, now, dwb_batch_timeout_ms);
+}
+
+/*
  * Wait until the batch's DWB copy is durable.  The caller holds a batch
  * ref, so the batch cannot be retired or reused under us.
  *
@@ -936,9 +973,28 @@ DWBWaitBatchFsynced(const DWBSlotRef *ref)
 	 * seal right away; under concurrency ref_count > 1 keeps the rendezvous
 	 * window open for the timeout.  A racing second writer merely bounces to
 	 * the next batch — sealing is valid at any moment.
+	 *
+	 * The fast seal only applies while the class is QUIET.  Under a dense
+	 * concurrent stream the FIRST writer of every freshly opened batch also
+	 * finds ref_count == 1 — it published within microseconds and nobody
+	 * joined yet — and fast-sealing there halves the ring into one-page
+	 * batches (54% of eviction batches at 1.33 slots, measured).  A class
+	 * whose last overflow seal is younger than the rendezvous window is
+	 * clearly hot: skip the fast seal and let the batch fill.  If the stream
+	 * dies right here, the timeout seal below and the retire workers'
+	 * force-seal still fire after dwb_batch_timeout_ms.  The class bit of a
+	 * held-ref batch is stable (reopen is fenced by the ref); the stamp is
+	 * advisory, so a stale read just mis-decides one seal.
 	 */
 	if (pg_atomic_read_u32(&batch->ref_count) == 1)
-		(void) DWBTrySealBatch(ref->batch_idx, DWB_SEAL_LONE);
+	{
+		int			wclass;
+
+		wclass = (pg_atomic_read_u32(&batch->next_slot_idx) & DWB_WCLASS_BIT) ?
+			DWB_WCLASS_BACKGROUND : DWB_WCLASS_EVICTION;
+		if (!DWBClassIsHot(wclass))
+			(void) DWBTrySealBatch(ref->batch_idx, DWB_SEAL_LONE);
+	}
 
 	ConditionVariablePrepareToSleep(&batch->cv_state);
 	while (pg_atomic_read_u32(&batch->state) < DWB_FSYNCED)

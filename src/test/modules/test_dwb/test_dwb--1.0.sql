@@ -32,6 +32,18 @@ CREATE FUNCTION test_dwb_seal_stats(
 	RETURNS SETOF record STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION test_dwb_stage_lone_wait()
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_overflow_lone_wait()
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_set_overflow_stamp(delta_ms int)
+	RETURNS bool STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_dwb_leak(npages int, do_publish bool)
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;

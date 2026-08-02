@@ -32,6 +32,7 @@
 #include "storage/sync.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
+#include "utils/timestamp.h"
 #include "varatt.h"
 
 PG_MODULE_MAGIC;
@@ -769,6 +770,87 @@ test_dwb_fill_segments(PG_FUNCTION_ARGS)
 			DWBReleaseSlot(&refs[i]);
 	}
 	PG_RETURN_INT32(nsegs);
+}
+
+/*
+ * Acquire and publish ONE synthetic page and enter the fsync wait WITHOUT
+ * sealing first: the only SQL driver of the lone-writer fast-seal path
+ * (stage_one_page force-seals and never reaches it).  In a quiet class the
+ * wait returns through the immediate lone seal; in a hot one it sleeps
+ * until the timeout seal.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_stage_lone_wait);
+Datum
+test_dwb_stage_lone_wait(PG_FUNCTION_ARGS)
+{
+	BufferTag	tag = make_tag(1, 93000, 0);
+	DWBSlotRef	ref;
+	static char page[BLCKSZ];
+
+	check_dwb_enabled();
+
+	memset(page, 'Q', BLCKSZ);
+	DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &ref);
+	DWBPublishImage(&ref, page, (XLogRecPtr) 0xA000000);
+	DWBWaitBatchFsynced(&ref);
+	DWBReleaseSlot(&ref);
+	PG_RETURN_VOID();
+}
+
+/*
+ * Plant the eviction class's last-overflow-seal stamp delta_ms from now.
+ * A positive delta puts the stamp in the FUTURE — the backward-clock-step
+ * shape that DWBClassIsHot must read as quiet.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_set_overflow_stamp);
+Datum
+test_dwb_set_overflow_stamp(PG_FUNCTION_ARGS)
+{
+	int32		delta_ms = PG_GETARG_INT32(0);
+	TimestampTz stamp;
+
+	check_dwb_enabled();
+	stamp = GetCurrentTimestamp() + (TimestampTz) delta_ms * 1000;
+	pg_atomic_write_u64(&DWBCtl->last_overflow_seal[DWB_WCLASS_EVICTION],
+						(uint64) stamp);
+	PG_RETURN_BOOL(DWBClassIsHot(DWB_WCLASS_EVICTION));
+}
+
+/*
+ * The hot-window driver: fill and overflow one batch in this backend — the
+ * overflow seal runs the leader write and the batch fdatasync synchronously
+ * right here and leaves the extra slot in the next batch — then IMMEDIATELY
+ * enter the fsync wait on that next-batch ref while its ref_count is 1.
+ * The stamp-to-check gap is a few in-process reads after the overflow's
+ * fdatasync (the post-write re-stamp), so the hot suppression must turn
+ * the would-be lone seal into the waiter's timeout seal.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_overflow_lone_wait);
+Datum
+test_dwb_overflow_lone_wait(PG_FUNCTION_ARGS)
+{
+	DWBSlotRef	refs[DWB_BATCH_MAX_PAGES + 1];
+	static char page[BLCKSZ];
+	int			npages;
+
+	check_dwb_enabled();
+	npages = dwb_batch_pages + 1;
+
+	for (int i = 0; i < npages; i++)
+	{
+		BufferTag	tag = make_tag(1, (Oid) (93100 + i), 0);
+
+		memset(page, 'H', BLCKSZ);
+		DWBAcquireSlot(&tag, DWB_WCLASS_EVICTION, false, &refs[i]);
+		DWBPublishImage(&refs[i], page, (XLogRecPtr) 0xB000000 + i);
+	}
+	if (refs[npages - 1].batch_idx == refs[0].batch_idx)
+		ereport(ERROR,
+				(errmsg("overflow did not move the extra slot to a fresh batch")));
+
+	DWBWaitBatchFsynced(&refs[npages - 1]);
+	wait_and_release(refs, npages);
+	PG_RETURN_VOID();
 }
 
 PG_FUNCTION_INFO_V1(test_dwb_force_seal);

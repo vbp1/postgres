@@ -3593,7 +3593,12 @@ include_dir 'conf.d'
        <para>
         Maximum time an open batch may collect pages before it is sealed
         and written even if not full, bounding the latency a lone page
-        flush can spend waiting for company.
+        flush can spend waiting for company.  A lone page flush seals its
+        batch immediately while its writer class is quiet; after a recent
+        full-batch seal — the sign of a dense concurrent stream — it waits
+        out this window instead, letting the batch fill.  With
+        <xref linkend="guc-dwb-retire-workers"/> set to 0 and in
+        single-user mode a lone flush always seals immediately.
         If this value is specified without units, it is taken as milliseconds.
         The default is 10 milliseconds.
         This parameter can only be set in the <filename>postgresql.conf</filename>

@@ -101,6 +101,8 @@ DWBShmemInit(void)
 				pg_atomic_init_u64(&DWBCtl->seal_pages[c][r], 0);
 			}
 		for (int c = 0; c < DWB_NUM_WCLASSES; c++)
+			pg_atomic_init_u64(&DWBCtl->last_overflow_seal[c], 0);
+		for (int c = 0; c < DWB_NUM_WCLASSES; c++)
 			ConditionVariableInit(&DWBCtl->cv_want_batch[c]);
 		ConditionVariableInit(&DWBCtl->cv_retire_wake);
 		SpinLockInit(&DWBCtl->staging_lock);

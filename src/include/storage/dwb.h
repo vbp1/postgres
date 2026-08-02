@@ -392,6 +392,14 @@ typedef struct DWCtl
 	/* diagnostic seal accounting: [writer class][DWBSealReason] */
 	pg_atomic_uint64 seal_count[DWB_NUM_WCLASSES][DWB_SEAL_NREASONS];
 	pg_atomic_uint64 seal_pages[DWB_NUM_WCLASSES][DWB_SEAL_NREASONS];
+
+	/*
+	 * TimestampTz of the class's last overflow seal: the "demand is hot"
+	 * marker that suppresses the lone-writer fast seal (see
+	 * DWBWaitBatchFsynced).  Advisory — read and written without barriers;
+	 * a stale value mis-decides at most one seal in either direction.
+	 */
+	pg_atomic_uint64 last_overflow_seal[DWB_NUM_WCLASSES];
 	ConditionVariable cv_want_batch[DWB_NUM_WCLASSES];	/* per-class "want a
 														 * batch" queue: both
 														 * staging and
@@ -439,6 +447,7 @@ extern void DWBWaitBatchFsynced(const DWBSlotRef *ref);
 extern void DWBReleaseSlot(const DWBSlotRef *ref);
 extern bool DWBForceSealOpenBatch(int wclass);
 extern bool DWBTrySealBatch(int batch_idx, DWBSealReason reason);
+extern bool DWBClassIsHot(int wclass);
 extern DWBatchState DWBGetBatchState(int batch_idx);
 
 /* internal; exported for test_dwb's stale-open regression test */
