@@ -2237,6 +2237,19 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"dwb_cleaner_workers", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Number of double write buffer cleaner worker processes."),
+			gettext_noop("The pool executes the flush bins the background "
+						 "writer's LRU scan produces, so the scan's issue rate "
+						 "is not capped by one process. The workers consume "
+						 "\"max_worker_processes\" slots. 0 disables the pool "
+						 "and the background writer flushes its bins itself.")
+		},
+		&dwb_cleaner_workers,
+		0, 0, 64,
+		NULL, NULL, NULL
+	},
+	{
 		{"dwb_batch_timeout_ms", PGC_SIGHUP, WAL_SETTINGS,
 			gettext_noop("Maximum time an open double write buffer batch may wait before being sealed."),
 			NULL,

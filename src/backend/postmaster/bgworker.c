@@ -129,6 +129,9 @@ static const struct
 		"DWBRetireWorkerMain", DWBRetireWorkerMain
 	},
 	{
+		"DWBCleanerWorkerMain", DWBCleanerWorkerMain
+	},
+	{
 		"ApplyWorkerMain", ApplyWorkerMain
 	},
 	{

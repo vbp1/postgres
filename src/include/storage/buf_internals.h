@@ -434,6 +434,14 @@ extern void IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_co
 extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
 										  IOContext io_context, BufferTag *tag);
 
+/*
+ * The vectored DWB flush of one bin of buffers; exported for the cleaner
+ * worker pool (dwb_cleaner.c), which executes the bgwriter's queued bins
+ * in opportunistic mode.
+ */
+extern int	FlushBufferBin(const int *buf_ids, int nbuf, bool opportunistic,
+						   WritebackContext *wb_context);
+
 /* solely to make it easier to write tests */
 extern bool StartBufferIO(BufferDesc *buf, bool forInput, bool nowait);
 extern void TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits,

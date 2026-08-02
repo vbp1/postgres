@@ -1082,14 +1082,18 @@ DWBGetBatchState(int batch_idx)
  */
 
 /*
- * The checkpointer's BufferSync and the bgwriter's flush rounds form the
- * background stream; everything else — ordinary backend evictions above
- * all — is the latency-critical class with first claim on FREE batches.
+ * The checkpointer's BufferSync, the bgwriter's flush rounds and the
+ * cleaner worker pool executing the bgwriter's bins form the background
+ * stream; everything else — ordinary backend evictions above all — is
+ * the latency-critical class with first claim on FREE batches.  Cleaners
+ * are ordinary background workers, invisible to MyBackendType, hence the
+ * process-local flag.
  */
 static int
 DWBWriterClass(void)
 {
-	if (MyBackendType == B_CHECKPOINTER || MyBackendType == B_BG_WRITER)
+	if (MyBackendType == B_CHECKPOINTER || MyBackendType == B_BG_WRITER ||
+		DWBAmCleanerWorker)
 		return DWB_WCLASS_BACKGROUND;
 	return DWB_WCLASS_EVICTION;
 }

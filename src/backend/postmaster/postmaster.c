@@ -934,6 +934,9 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	DWBRetireWorkersRegister();
 
+	/* And the double write buffer cleaner pool feeding off the bgwriter. */
+	DWBCleanerWorkersRegister();
+
 	/*
 	 * process any libraries that should be preloaded at postmaster start
 	 */

@@ -3554,6 +3554,42 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-dwb-cleaner-workers" xreflabel="dwb_cleaner_workers">
+      <term><varname>dwb_cleaner_workers</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_cleaner_workers</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Number of background workers that execute the flush bins produced
+        by the background writer's LRU scan.  Each bin is one double write
+        buffer batch write followed by its sync and the data-file writes;
+        a single background writer executing them serially cannot clean
+        more than a few thousand pages per second, and backends then evict
+        dirty buffers themselves at full double write buffer latency.
+        With a pool the scan keeps running in the background writer while
+        the bins are executed concurrently, and backends find clean
+        buffers instead.  The workers consume
+        <xref linkend="guc-max-worker-processes"/> slots.  Setting it to 0
+        (the default) disables the pool and the background writer flushes
+        its bins itself.
+        This parameter can only be set at server start.
+       </para>
+       <para>
+        The pool scales execution only; how much the LRU scan issues per
+        round is still governed by
+        <xref linkend="guc-bgwriter-lru-maxpages"/>,
+        <xref linkend="guc-bgwriter-delay"/> and
+        <xref linkend="guc-bgwriter-lru-multiplier"/>.  With their default
+        values the pool mostly idles, so raise them together with this
+        setting.  Pages written by the pool are counted in
+        <structname>pg_stat_bgwriter</structname>.<structfield>buffers_clean</structfield>
+        as if the background writer had written them itself.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-dwb-retire-sync-method" xreflabel="dwb_retire_sync_method">
       <term><varname>dwb_retire_sync_method</varname> (<type>enum</type>)
       <indexterm>

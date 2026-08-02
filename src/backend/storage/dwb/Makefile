@@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	dwb.o \
+	dwb_cleaner.o \
 	dwb_ctl.o \
 	dwb_file.o \
 	dwb_recovery.o \

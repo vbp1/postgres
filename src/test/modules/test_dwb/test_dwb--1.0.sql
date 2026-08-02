@@ -104,3 +104,21 @@ CREATE FUNCTION test_dwb_craft_batch(batch_idx int, batch_id int8,
 CREATE FUNCTION test_dwb_set_control_min_version(min_version int)
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_cleaner_counters(
+	OUT enqueued bigint, OUT written bigint, OUT skipped bigint,
+	OUT self_flushes bigint, OUT queued int)
+	RETURNS record STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_pin_block(rel regclass, blkno int)
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_unpin_block()
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_enqueue_block(rel regclass, blkno int)
+	RETURNS bool STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;

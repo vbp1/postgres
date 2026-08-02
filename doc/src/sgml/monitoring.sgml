@@ -3067,7 +3067,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <structfield>buffers_clean</structfield> <type>bigint</type>
       </para>
       <para>
-       Number of buffers written by the background writer
+       Number of buffers written by the background writer's LRU cleaning,
+       including buffers its scan handed to the cleaner worker pool
+       (see <xref linkend="guc-dwb-cleaner-workers"/>)
       </para></entry>
      </row>
 
@@ -3077,7 +3079,8 @@ description | Waiting for a newly initialized WAL file to reach durable storage
       </para>
       <para>
        Number of times the background writer stopped a cleaning
-       scan because it had written too many buffers
+       scan because it had issued too many buffers, counting both its own
+       writes and bins handed to the cleaner worker pool
       </para></entry>
      </row>
 

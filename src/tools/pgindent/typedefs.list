@@ -603,6 +603,8 @@ DSMRegistryEntry
 DWBAppliedFork
 DWBApplyCandidate
 DWBBatchHeader
+DWBCleanerBin
+DWBCleanerCtl
 DWBControlFileData
 DWBOnStall
 DWBPendingRef

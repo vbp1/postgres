@@ -85,16 +85,6 @@
 #define BUF_BINNABLE			0x04	/* would-write candidate for the
 										 * vectored DWB flush bin */
 
-/*
- * Bin size cap for the vectored background flush (FlushBufferBin, used by
- * the checkpointer's BufferSync and the bgwriter's LRU scan): the flush
- * holds a pin, a shared content lock and BM_IO_IN_PROGRESS per bin member
- * at once, so the cap must leave MAX_SIMUL_LWLOCKS (200) plenty of
- * headroom.  64 matches the default dwb_batch_pages; larger batch_pages
- * settings seal their batches at bin-sized fills.
- */
-#define DWB_FLUSH_BIN_MAX		64
-
 #define RELS_BSEARCH_THRESHOLD		20
 
 /*
@@ -533,8 +523,6 @@ static void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
 static void BufferSync(int flags);
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
-static int	FlushBufferBin(const int *buf_ids, int nbuf,
-						   WritebackContext *wb_context);
 static int	BgSyncPeekBuffer(int buf_id);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
@@ -3605,7 +3593,7 @@ BufferSync(int flags)
 				if (dwb_bin_n == dwb_bin_size)
 				{
 					int			nw = FlushBufferBin(dwb_bin, dwb_bin_n,
-													&wb_context);
+													false, &wb_context);
 
 					PendingCheckpointerStats.buffers_written += nw;
 					num_written += nw;
@@ -3653,7 +3641,7 @@ BufferSync(int flags)
 		if (dwb_bin_n > 0)
 		{
 			int			nw = FlushBufferBin(dwb_bin, dwb_bin_n,
-											&wb_context);
+											false, &wb_context);
 
 			PendingCheckpointerStats.buffers_written += nw;
 			num_written += nw;
@@ -3729,12 +3717,14 @@ BgBufferSync(WritebackContext *wb_context)
 	/* Variables for the scanning loop proper */
 	int			num_to_scan;
 	int			num_written;
+	int			num_issued;
 	int			reusable_buffers;
 
 	/* Vectored DWB flush bin (bin_size stays 0 without the DWB) */
 	int			bin[DWB_FLUSH_BIN_MAX];
 	int			bin_n = 0;
 	int			bin_size = 0;
+	bool		use_cleaners;
 
 	/* Variables for final smoothed_density update */
 	long		new_strategy_delta;
@@ -3748,6 +3738,16 @@ BgBufferSync(WritebackContext *wb_context)
 
 	/* Report buffer alloc counts to pgstat */
 	PendingBgWriterStats.buf_alloc += recent_alloc;
+
+	/*
+	 * Fold the cleaner pool's completed writes into buf_written_clean:
+	 * pg_stat_bgwriter keeps counting pages written by LRU cleaning no matter
+	 * which process executed the write.
+	 */
+	use_cleaners = DWBCleanersActive();
+	if (use_cleaners)
+		PendingBgWriterStats.buf_written_clean +=
+			DWBCleanerFetchPoolWritten();
 
 	/*
 	 * If we're not running the LRU scan, just stop after doing the stats
@@ -3914,6 +3914,7 @@ BgBufferSync(WritebackContext *wb_context)
 
 	num_to_scan = bufs_to_lap;
 	num_written = 0;
+	num_issued = 0;
 	reusable_buffers = reusable_buffers_est;
 
 	/*
@@ -3921,7 +3922,12 @@ BgBufferSync(WritebackContext *wb_context)
 	 * into bins and flushed as one batch each: one batch write and one
 	 * fdatasync cover the whole bin instead of one per page (the LRU scan's
 	 * scattered singleton writes otherwise degenerate to lone-writer batches;
-	 * see FlushBufferBin).
+	 * see FlushBufferBin).  With a cleaner pool the bins are handed to the
+	 * pool's queue instead, and only when that fails (queue full: the pool is
+	 * the bottleneck) flushed here.  The bgwriter_lru_maxpages budget caps
+	 * the pages ISSUED per round — queued and self-written together —
+	 * while buf_written_clean counts actual writes only (the pool's
+	 * completions are folded in at the top of the next round).
 	 */
 	if (DWBIsEnabled())
 		bin_size = Min(dwb_batch_pages, DWB_FLUSH_BIN_MAX);
@@ -3945,6 +3951,7 @@ BgBufferSync(WritebackContext *wb_context)
 		{
 			reusable_buffers++;
 			num_written++;
+			num_issued++;
 		}
 		else if (sync_state & BUF_REUSABLE)
 			reusable_buffers++;
@@ -3958,18 +3965,28 @@ BgBufferSync(WritebackContext *wb_context)
 
 		/*
 		 * Flush a full bin, and any partial one that already covers the
-		 * remaining write budget: the cap check below must see the true
-		 * written count, not a deferred bin.
+		 * remaining issue budget: the cap check below must see the true
+		 * issued count, not a deferred bin.
 		 */
 		if (bin_n > 0 &&
 			(bin_n == bin_size ||
-			 num_written + bin_n >= bgwriter_lru_maxpages))
+			 num_issued + bin_n >= bgwriter_lru_maxpages))
 		{
-			num_written += FlushBufferBin(bin, bin_n, wb_context);
+			if (use_cleaners && DWBCleanerEnqueueBin(bin, bin_n))
+				num_issued += bin_n;
+			else
+			{
+				int			nw = FlushBufferBin(bin, bin_n, false, wb_context);
+
+				num_written += nw;
+				num_issued += nw;
+				if (use_cleaners)
+					DWBCleanerCountSelfFlush();
+			}
 			bin_n = 0;
 		}
 
-		if (num_written >= bgwriter_lru_maxpages)
+		if (num_issued >= bgwriter_lru_maxpages)
 		{
 			PendingBgWriterStats.maxwritten_clean++;
 			break;
@@ -3977,7 +3994,19 @@ BgBufferSync(WritebackContext *wb_context)
 	}
 
 	if (bin_n > 0)
-		num_written += FlushBufferBin(bin, bin_n, wb_context);
+	{
+		if (use_cleaners && DWBCleanerEnqueueBin(bin, bin_n))
+			num_issued += bin_n;
+		else
+		{
+			int			nw = FlushBufferBin(bin, bin_n, false, wb_context);
+
+			num_written += nw;
+			num_issued += nw;
+			if (use_cleaners)
+				DWBCleanerCountSelfFlush();
+		}
+	}
 
 	PendingBgWriterStats.buf_written_clean += num_written;
 
@@ -4169,9 +4198,25 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
  * buffer that became recently-used after the caller picked it is the same
  * benign race the per-page paths have between their check and their write.
  * Returns the number of buffers written.
+ *
+ * All of the above describes the mandatory mode (opportunistic = false):
+ * the caller's bins are fresh and every member must be flushed or handed
+ * to the blocking per-page fallback — checkpointer semantics.  The
+ * cleaner worker pool executes bins that sat in a queue for arbitrarily
+ * long, so it passes opportunistic = true: each member is reclassified
+ * under the buffer header lock with the LRU-candidate predicate of the
+ * scan that produced it (unpinned, unused, valid, dirty — see
+ * BgSyncPeekBuffer), and a member that fails the predicate, lost
+ * BM_PERMANENT, or cannot be claimed without waiting is dropped instead
+ * of written: the page stays dirty for the next scan pass or checkpoint,
+ * and the cleaner never blocks on somebody's content lock or I/O.  In
+ * this mode every bin member ends up either written (counted in the
+ * return value) or dropped, so callers derive the skip count as
+ * nbuf minus the result.
  */
-static int
-FlushBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
+int
+FlushBufferBin(const int *buf_ids, int nbuf, bool opportunistic,
+			   WritebackContext *wb_context)
 {
 	static char *bin_buf = NULL;
 
@@ -4204,6 +4249,14 @@ FlushBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
 		buf_state = LockBufHdr(bufHdr);
+		if (opportunistic &&
+			(BUF_STATE_GET_REFCOUNT(buf_state) != 0 ||
+			 BUF_STATE_GET_USAGECOUNT(buf_state) != 0))
+		{
+			/* a stale claim: the buffer became hot since it was queued */
+			UnlockBufHdr(bufHdr, buf_state);
+			continue;
+		}
 		if (!(buf_state & BM_VALID) || !(buf_state & BM_DIRTY))
 		{
 			/* clean already: nothing to do */
@@ -4219,7 +4272,8 @@ FlushBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
 			 * a fake unlogged LSN, so route it to the per-page path instead.
 			 */
 			UnlockBufHdr(bufHdr, buf_state);
-			fb_ids[nfallback++] = buf_ids[i];
+			if (!opportunistic)
+				fb_ids[nfallback++] = buf_ids[i];
 			continue;
 		}
 		PinBuffer_Locked(bufHdr);
@@ -4228,7 +4282,8 @@ FlushBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
 									  LW_SHARED))
 		{
 			UnpinBuffer(bufHdr);
-			fb_ids[nfallback++] = buf_ids[i];
+			if (!opportunistic)
+				fb_ids[nfallback++] = buf_ids[i];
 			continue;
 		}
 		if (!StartBufferIO(bufHdr, false, true))
@@ -4236,11 +4291,13 @@ FlushBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
 			/*
 			 * Either somebody else's I/O is in flight (fall back per-page:
 			 * SyncOneBuffer may wait and rechecks dirtiness) or the buffer
-			 * went clean; the fallback handles both.
+			 * went clean; the fallback handles both.  The opportunistic
+			 * caller waits for neither and leaves the page to a later pass.
 			 */
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
-			fb_ids[nfallback++] = buf_ids[i];
+			if (!opportunistic)
+				fb_ids[nfallback++] = buf_ids[i];
 			continue;
 		}
 
@@ -4345,6 +4402,7 @@ FlushBufferBin(const int *buf_ids, int nbuf, WritebackContext *wb_context)
 	}
 
 	/* Phase 5: per-page fallback for the contended buffers, nothing held */
+	Assert(!opportunistic || nfallback == 0);
 	for (int i = 0; i < nfallback; i++)
 	{
 		if (SyncOneBuffer(fb_ids[i], false, wb_context) & BUF_WRITTEN)

@@ -68,6 +68,7 @@ extern PGDLLIMPORT int dwb_num_batches;
 extern PGDLLIMPORT int dwb_batch_pages;
 extern PGDLLIMPORT int dwb_max_segments;
 extern PGDLLIMPORT int dwb_retire_workers;
+extern PGDLLIMPORT int dwb_cleaner_workers;
 extern PGDLLIMPORT int dwb_retire_sync_method;
 extern PGDLLIMPORT int dwb_batch_timeout_ms;
 extern PGDLLIMPORT int dwb_retire_interval_ms;
@@ -94,6 +95,18 @@ extern PGDLLIMPORT int dwb_on_stall;
 #define DWB_NUM_WCLASSES		2
 #define DWB_WCLASS_EVICTION		0
 #define DWB_WCLASS_BACKGROUND	1
+
+/*
+ * Bin size cap for the vectored background flush (FlushBufferBin, used by
+ * the checkpointer's BufferSync, the bgwriter's LRU scan and the cleaner
+ * worker pool): the flush holds a pin, a shared content lock and
+ * BM_IO_IN_PROGRESS per bin member at once, so the cap must leave
+ * MAX_SIMUL_LWLOCKS (200) plenty of headroom.  64 matches the default
+ * dwb_batch_pages; larger batch_pages settings seal their batches at
+ * bin-sized fills.  Shared here because the cleaner work queue stores
+ * bins of this size.
+ */
+#define DWB_FLUSH_BIN_MAX		64
 
 /*
  * Why a batch was sealed.  Purely diagnostic: per-class seal and page
@@ -423,6 +436,49 @@ typedef struct DWBSlotRef
 	uint64		batch_id;
 } DWBSlotRef;
 
+/*
+ * Work queue between the bgwriter's LRU scan and the cleaner worker pool
+ * (dwb_cleaner.c).  An entry is one flush bin: buffer ids the scan
+ * classified as cold dirty candidates.  Entries are hints, not
+ * obligations — every claim is reclassified under the buffer header lock
+ * right before the write (FlushBufferBin's opportunistic mode), so a
+ * stale entry is skipped, never wrongly written, and the queue needs no
+ * draining on shutdown: whatever it held stays dirty and is covered by
+ * the next checkpoint.
+ *
+ * In error-free operation every accepted page ends up counted as either
+ * written or skipped, so enqueued_pages = pool_written_total +
+ * skipped_pages once the queue is empty.  A worker error mid-bin
+ * abandons the bin's remainder — those pages stay dirty and are simply
+ * rescanned later, but they leave the counters short of the identity.
+ */
+typedef struct DWBCleanerBin
+{
+	int			nbuf;
+	int			buf_ids[DWB_FLUSH_BIN_MAX];
+} DWBCleanerBin;
+
+typedef struct DWBCleanerCtl
+{
+	/* counters are monotonic except pool_written, which bgwriter drains */
+	pg_atomic_uint64 enqueued_pages;	/* pages ever accepted into the queue */
+	pg_atomic_uint64 pool_written;	/* pages written by cleaners since the
+									 * bgwriter last folded them into
+									 * buf_written_clean */
+	pg_atomic_uint64 pool_written_total;	/* same, never reset (tests,
+											 * diagnostics) */
+	pg_atomic_uint64 skipped_pages; /* stale claims dropped by
+									 * reclassification */
+	pg_atomic_uint64 self_flushes;	/* bins the bgwriter flushed itself
+									 * because the queue was full or busy */
+	ConditionVariable cv_work;	/* one targeted signal per enqueued bin */
+	int			capacity;
+	/* head/nqueued and the bins are protected by DWBCleanerQueueLock */
+	int			head;
+	int			nqueued;
+	DWBCleanerBin bins[FLEXIBLE_ARRAY_MEMBER];	/* capacity entries */
+} DWBCleanerCtl;
+
 extern PGDLLIMPORT DWCtl *DWBCtl;
 extern PGDLLIMPORT char *DWBStagingBase;
 extern PGDLLIMPORT HTAB *DWSegmentHash;
@@ -462,6 +518,18 @@ extern int	DWBSegmentFsyncEnd(bool synced);
 extern int	DWBRetireAllSync(void);
 extern void DWBRetireWorkersRegister(void);
 pg_noreturn extern void DWBRetireWorkerMain(Datum main_arg);
+
+/* dwb_cleaner.c — bgwriter bin queue and the cleaner worker pool */
+extern PGDLLIMPORT DWBCleanerCtl *DWBCleanerQueue;
+extern PGDLLIMPORT bool DWBAmCleanerWorker;
+extern Size DWBCleanerShmemSize(void);
+extern void DWBCleanerShmemInit(void);
+extern bool DWBCleanersActive(void);
+extern bool DWBCleanerEnqueueBin(const int *buf_ids, int nbuf);
+extern uint64 DWBCleanerFetchPoolWritten(void);
+extern void DWBCleanerCountSelfFlush(void);
+extern void DWBCleanerWorkersRegister(void);
+pg_noreturn extern void DWBCleanerWorkerMain(Datum main_arg);
 
 /* dwb_file.c */
 extern void DWBCreateRing(void);

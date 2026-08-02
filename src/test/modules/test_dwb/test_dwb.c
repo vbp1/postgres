@@ -19,19 +19,27 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "access/htup_details.h"
+#include "access/relation.h"
+#include "access/xact.h"
 #include "catalog/pg_tablespace_d.h"
 #include "common/relpath.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/buf_internals.h"
+#include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "storage/dwb.h"
 #include "storage/fd.h"
+#include "storage/lwlock.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
+#include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "varatt.h"
 
@@ -1075,4 +1083,189 @@ test_dwb_set_control_min_version(PG_FUNCTION_ARGS)
 	DWBWriteControlFile(&control);
 
 	PG_RETURN_VOID();
+}
+
+/* ----------------------------------------------------------------
+ * cleaner worker pool helpers
+ * ----------------------------------------------------------------
+ */
+
+static void
+check_cleaners_enabled(void)
+{
+	check_dwb_enabled();
+	if (!DWBCleanersActive())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the cleaner pool is not configured"),
+				 errhint("Set \"dwb_cleaner_workers\" above 0.")));
+}
+
+/*
+ * Counters of the cleaner work queue: enqueued/written/skipped pages,
+ * bgwriter self-flushed bins, bins currently queued.  The written count
+ * is the never-reset total (the drainable one feeds pg_stat_bgwriter).
+ */
+PG_FUNCTION_INFO_V1(test_dwb_cleaner_counters);
+Datum
+test_dwb_cleaner_counters(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[5];
+	bool		nulls[5] = {0};
+	int			queued;
+
+	check_cleaners_enabled();
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	LWLockAcquire(DWBCleanerQueueLock, LW_SHARED);
+	queued = DWBCleanerQueue->nqueued;
+	LWLockRelease(DWBCleanerQueueLock);
+
+	values[0] = Int64GetDatum(
+							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->enqueued_pages));
+	values[1] = Int64GetDatum(
+							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->pool_written_total));
+	values[2] = Int64GetDatum(
+							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->skipped_pages));
+	values[3] = Int64GetDatum(
+							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->self_flushes));
+	values[4] = Int32GetDatum(queued);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * Resolve (relation, block) to the buffer currently holding it.  The
+ * transient pin is dropped before returning; the id is a hint exactly
+ * like a queued bin entry.
+ */
+static int
+lookup_block_buf_id(Oid relid, BlockNumber blkno)
+{
+	Relation	rel;
+	Buffer		buf;
+	int			buf_id;
+
+	rel = relation_open(relid, AccessShareLock);
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+	buf_id = buf - 1;
+	ReleaseBuffer(buf);
+	/* keep the relation lock till end of transaction */
+	relation_close(rel, NoLock);
+	return buf_id;
+}
+
+/*
+ * Pin one block for the rest of the current transaction (the pin is
+ * registered with the top transaction's resource owner, so it survives
+ * statement end).  The deterministic way to make a queued page "hot":
+ * an open cursor does not promise which buffer it pins.  Pair with
+ * test_dwb_unpin_block in the SAME transaction; at transaction end the
+ * owner releases the pin itself and the callback below drops the stale
+ * reference, so a commit or rollback with the pin still "held" leaves
+ * the helpers reusable (the commit prints the owner's leak warning).
+ */
+static Buffer test_pinned_buf = InvalidBuffer;
+static bool test_pin_callback_registered = false;
+
+static void
+test_dwb_pin_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			test_pinned_buf = InvalidBuffer;
+			break;
+		default:
+			break;
+	}
+}
+
+PG_FUNCTION_INFO_V1(test_dwb_pin_block);
+Datum
+test_dwb_pin_block(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	BlockNumber blkno = (BlockNumber) PG_GETARG_INT32(1);
+	Relation	rel;
+	ResourceOwner oldowner;
+
+	if (BufferIsValid(test_pinned_buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a block is already pinned")));
+
+	if (!test_pin_callback_registered)
+	{
+		RegisterXactCallback(test_dwb_pin_xact_callback, NULL);
+		test_pin_callback_registered = true;
+	}
+
+	rel = relation_open(relid, AccessShareLock);
+	oldowner = CurrentResourceOwner;
+	CurrentResourceOwner = TopTransactionResourceOwner;
+	test_pinned_buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno,
+										 RBM_NORMAL, NULL);
+	CurrentResourceOwner = oldowner;
+	relation_close(rel, NoLock);
+
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(test_dwb_unpin_block);
+Datum
+test_dwb_unpin_block(PG_FUNCTION_ARGS)
+{
+	ResourceOwner oldowner;
+
+	if (!BufferIsValid(test_pinned_buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no block is pinned")));
+
+	oldowner = CurrentResourceOwner;
+	CurrentResourceOwner = TopTransactionResourceOwner;
+	ReleaseBuffer(test_pinned_buf);
+	CurrentResourceOwner = oldowner;
+	test_pinned_buf = InvalidBuffer;
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Hand a one-entry bin naming (relation, block) straight to the cleaner
+ * queue, bypassing the bgwriter's scan: the deterministic driver for the
+ * stale-claim scenarios.  Returns whether the queue accepted it.
+ *
+ * The lookup's own transient pin bumps the usage count, which would make
+ * every claim read as hot, so the count is zeroed after the pin drops —
+ * the same cooling the clock hand performs when it sweeps past.  A page
+ * some other session holds pinned stays hot through its refcount.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_enqueue_block);
+Datum
+test_dwb_enqueue_block(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	BlockNumber blkno = (BlockNumber) PG_GETARG_INT32(1);
+	int			buf_id;
+	BufferDesc *bufHdr;
+	uint32		buf_state;
+
+	check_cleaners_enabled();
+
+	buf_id = lookup_block_buf_id(relid, blkno);
+	bufHdr = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(bufHdr);
+	buf_state &= ~BUF_USAGECOUNT_MASK;
+	UnlockBufHdr(bufHdr, buf_state);
+
+	PG_RETURN_BOOL(DWBCleanerEnqueueBin(&buf_id, 1));
 }

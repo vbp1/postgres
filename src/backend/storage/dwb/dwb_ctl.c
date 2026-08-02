@@ -25,6 +25,7 @@ int			dwb_num_batches = 64;
 int			dwb_batch_pages = 64;
 int			dwb_max_segments = 4096;
 int			dwb_retire_workers = 1;
+int			dwb_cleaner_workers = 0;
 int			dwb_retire_sync_method = DWB_RETIRE_SYNC_METHOD_DEFAULT;
 int			dwb_batch_timeout_ms = 10;
 int			dwb_retire_interval_ms = 50;
@@ -72,6 +73,7 @@ DWBShmemSize(void)
 	size = add_size(DWBCtlSize(), DWBStagingSize());
 	size = add_size(size, hash_estimate_size(dwb_max_segments,
 											 DWBSegEntrySize()));
+	size = add_size(size, DWBCleanerShmemSize());
 	return size;
 }
 
@@ -144,4 +146,6 @@ DWBShmemInit(void)
 									  &info,
 									  HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
 	}
+
+	DWBCleanerShmemInit();
 }

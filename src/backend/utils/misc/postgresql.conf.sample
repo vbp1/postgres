@@ -257,6 +257,9 @@
 					# (change requires restart)
 #dwb_retire_workers = 1			# retire worker processes
 					# (change requires restart)
+#dwb_cleaner_workers = 0		# cleaner worker processes executing the
+					# background writer's flush bins
+					# (change requires restart)
 #dwb_retire_sync_method = syncfs	# syncfs where supported (Linux; the
 					# default there), fsync elsewhere
 #dwb_batch_timeout_ms = 10ms		# force-seal an open batch after this time
