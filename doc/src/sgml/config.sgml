@@ -3570,7 +3570,10 @@ include_dir 'conf.d'
         dirty buffers themselves at full double write buffer latency.
         With a pool the scan keeps running in the background writer while
         the bins are executed concurrently, and backends find clean
-        buffers instead.  The workers consume
+        buffers instead.  The background writer then writes no data pages
+        itself: when the pool falls momentarily behind, the scan pauses
+        instead of writing and resumes as soon as a worker frees queue
+        space.  The workers consume
         <xref linkend="guc-max-worker-processes"/> slots.  Setting it to 0
         (the default) disables the pool and the background writer flushes
         its bins itself.

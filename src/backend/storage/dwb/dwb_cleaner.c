@@ -20,9 +20,12 @@
  * shutdown and no meaning to queue contents after a crash: whatever was
  * queued is still dirty and the next checkpoint covers it.
  *
- * Backpressure is the enqueue failing (queue full, or its lock busy):
- * the bgwriter then flushes the bin itself, which is exactly the
- * pool-less behavior.
+ * Backpressure is the enqueue refusing a full queue: the bgwriter keeps
+ * the bin, stops scanning and re-offers it next round.  With an active
+ * pool the bgwriter never writes data pages itself — a scan stalled
+ * behind serial batch fsyncs starves the pool of fresh bins and lets
+ * the strategy clock hand catch the scan point, pushing evictions onto
+ * the backends.
  *
  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -57,15 +60,13 @@ DWBCleanerCtl *DWBCleanerQueue = NULL;
 bool		DWBAmCleanerWorker = false;
 
 /*
- * Enough slack that a full pool finding the queue drained refills before
- * the bgwriter's next round, small enough that entries stay fresh: stale
- * claims are safe but wasted scan work.
+ * Queue capacity in bins.  A fixed burst absorber, deliberately not
+ * scaled by the worker count: at observed pool drain rates even a full
+ * queue empties in tens of milliseconds, so entries stay fresh, while a
+ * queue sized to the pool would overflow on demand bursts exactly when
+ * the scan must not stall.  64 bins is ~17 kB of shared memory.
  */
-static int
-DWBCleanerQueueCapacity(void)
-{
-	return Max(8, 2 * dwb_cleaner_workers);
-}
+#define DWB_CLEANER_QUEUE_CAPACITY	64
 
 Size
 DWBCleanerShmemSize(void)
@@ -74,7 +75,7 @@ DWBCleanerShmemSize(void)
 		return 0;
 
 	return add_size(offsetof(DWBCleanerCtl, bins),
-					mul_size(DWBCleanerQueueCapacity(),
+					mul_size(DWB_CLEANER_QUEUE_CAPACITY,
 							 sizeof(DWBCleanerBin)));
 }
 
@@ -96,9 +97,9 @@ DWBCleanerShmemInit(void)
 		pg_atomic_init_u64(&DWBCleanerQueue->pool_written, 0);
 		pg_atomic_init_u64(&DWBCleanerQueue->pool_written_total, 0);
 		pg_atomic_init_u64(&DWBCleanerQueue->skipped_pages, 0);
-		pg_atomic_init_u64(&DWBCleanerQueue->self_flushes, 0);
+		pg_atomic_init_u64(&DWBCleanerQueue->deferred_bins, 0);
 		ConditionVariableInit(&DWBCleanerQueue->cv_work);
-		DWBCleanerQueue->capacity = DWBCleanerQueueCapacity();
+		DWBCleanerQueue->capacity = DWB_CLEANER_QUEUE_CAPACITY;
 	}
 }
 
@@ -112,9 +113,10 @@ DWBCleanersActive(void)
 }
 
 /*
- * Hand one bin to the pool.  Never waits: a busy queue lock or a full
- * queue returns false and the caller decides what to do with the bin
- * (the bgwriter flushes it itself and counts that as a self-flush).
+ * Hand one bin to the pool.  The queue lock is taken unconditionally —
+ * the critical section is one bin copy — so a false return means
+ * exactly one thing: the queue is full.  The caller keeps the bin and
+ * re-offers it later (the bgwriter counts the refusal as a deferral).
  */
 bool
 DWBCleanerEnqueueBin(const int *buf_ids, int nbuf)
@@ -125,8 +127,7 @@ DWBCleanerEnqueueBin(const int *buf_ids, int nbuf)
 	Assert(ctl != NULL);
 	Assert(nbuf > 0 && nbuf <= DWB_FLUSH_BIN_MAX);
 
-	if (!LWLockConditionalAcquire(DWBCleanerQueueLock, LW_EXCLUSIVE))
-		return false;
+	LWLockAcquire(DWBCleanerQueueLock, LW_EXCLUSIVE);
 	if (ctl->nqueued == ctl->capacity)
 	{
 		LWLockRelease(DWBCleanerQueueLock);
@@ -181,14 +182,15 @@ DWBCleanerFetchPoolWritten(void)
 }
 
 /*
- * The bgwriter reports a bin it had to flush itself after a failed
- * enqueue.  Counted at the flush, not inside the failed enqueue: a
- * refused test claim flushes nothing.
+ * The bgwriter counts a bin the pool's queue refused; the bin itself is
+ * carried over to the next round, so this is a pure saturation gauge —
+ * nothing gets written on this path.  Counted by the bgwriter, not
+ * inside the failed enqueue: a refused test claim defers nothing.
  */
 void
-DWBCleanerCountSelfFlush(void)
+DWBCleanerCountDeferral(void)
 {
-	pg_atomic_fetch_add_u64(&DWBCleanerQueue->self_flushes, 1);
+	pg_atomic_fetch_add_u64(&DWBCleanerQueue->deferred_bins, 1);
 }
 
 /*

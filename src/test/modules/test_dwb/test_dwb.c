@@ -1103,8 +1103,9 @@ check_cleaners_enabled(void)
 
 /*
  * Counters of the cleaner work queue: enqueued/written/skipped pages,
- * bgwriter self-flushed bins, bins currently queued.  The written count
- * is the never-reset total (the drainable one feeds pg_stat_bgwriter).
+ * bins the bgwriter deferred against a full queue, bins currently
+ * queued.  The written count is the never-reset total (the drainable
+ * one feeds pg_stat_bgwriter).
  */
 PG_FUNCTION_INFO_V1(test_dwb_cleaner_counters);
 Datum
@@ -1131,7 +1132,7 @@ test_dwb_cleaner_counters(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum(
 							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->skipped_pages));
 	values[3] = Int64GetDatum(
-							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->self_flushes));
+							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->deferred_bins));
 	values[4] = Int32GetDatum(queued);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));

@@ -7,7 +7,7 @@
 # right before the write — so the scenarios here drive the queue with
 # deterministic one-page claims: a cold dirty page is written, a pinned
 # page and an already-clean page are skipped, a full queue makes the
-# bgwriter flush bins itself.
+# bgwriter defer its bin and pause the scan instead of writing.
 
 use strict;
 use warnings FATAL => 'all';
@@ -56,10 +56,10 @@ $node->safe_psql('postgres', 'CHECKPOINT');
 # holds it, so this claim must be written.  The system is quiet after
 # the checkpoint, so background-class DWB pages can only come from the
 # cleaner executing this claim — pinned by the class-page growth with
-# the self-flush counter standing still (nothing for the bgwriter to
-# flush itself).
+# the deferral counter standing still (the queue was never full, so the
+# bgwriter had nothing to defer and writes nothing itself anyway).
 my $written_before = counter('written');
-my $self_before = counter('self_flushes');
+my $deferred_before = counter('deferred');
 my $bg_pages_before = $node->safe_psql('postgres',
 	"SELECT sum(pages) FROM test_dwb_seal_stats() WHERE wclass = 'background'"
 );
@@ -81,8 +81,8 @@ $node->poll_query_until(
 	SELECT sum(pages) > $bg_pages_before FROM test_dwb_seal_stats()
 	WHERE wclass = 'background'
 )) or die 'timed out waiting for the background-class DWB batch';
-is(counter('self_flushes'), $self_before,
-	'the background-class write was the cleaner, not a bgwriter self-flush');
+is(counter('deferred'), $deferred_before,
+	'the background-class write was the cleaner, with no deferrals');
 
 # --- a claim on a page that became hot is skipped ------------------------
 
@@ -164,13 +164,17 @@ $node->poll_query_until(
 )) or die 'timed out waiting for the cleaner pg_stat_io dwb rows';
 pass('the cleaners show their DWB writes in pg_stat_io');
 
-# --- a full queue makes the enqueue fail and the bgwriter clean solo -----
+# --- a full queue makes the bgwriter defer bins, never write them --------
 
 SKIP:
 {
-	skip 'injection points not supported by this build', 4
+	skip 'injection points not supported by this build', 8
 	  unless defined $ENV{enable_injection_points}
 	  && $ENV{enable_injection_points} eq 'yes';
+
+	my $bgw_io_before = $node->safe_psql('postgres',
+		"SELECT coalesce(sum(writes), 0) FROM pg_stat_io WHERE object = 'dwb' AND backend_type = 'background writer'"
+	);
 
 	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
 	$node->safe_psql('postgres',
@@ -191,30 +195,31 @@ SKIP:
 	)) or die 'timed out waiting for both cleaners to park at the point';
 	pass('both cleaners parked at the injection point');
 
-	# Capacity is Max(8, 2 * workers) = 8 bins; nine claims into a parked
-	# queue must overflow it (the bgwriter may race a bin or two in, so
-	# the accepted count is bounded, not exact).  A refused test claim
-	# flushes nothing and must NOT move the self-flush counter — that is
-	# the bgwriter's own bookkeeping, checked right below.
+	# Capacity is a fixed 64 bins, two of which the wake-up claims hold;
+	# 67 claims into a parked queue must overflow it (the bgwriter may
+	# race bins in as well, so the accepted count is bounded, not exact).
+	# A refused test claim defers nothing — the deferral counter is the
+	# bgwriter's own bookkeeping, checked right below.
 	$node->safe_psql(
 		'postgres', q(
 		CREATE TABLE t_fill AS
 			SELECT g AS id, repeat('x', 800) AS filler
-			FROM generate_series(1, 80) g;
+			FROM generate_series(1, 800) g;
 	));
 	my $accepted = 0;
-	for my $blk (0 .. 8)
+	for my $blk (0 .. 66)
 	{
 		$accepted++
 		  if $node->safe_psql('postgres',
 			"SELECT test_dwb_enqueue_block('t_fill', $blk)") eq 't';
 	}
-	cmp_ok($accepted, '<=', 8,
+	cmp_ok($accepted, '<=', 62,
 		'the queue turned the overflow claims away at its capacity');
 
-	# With the pool parked and the queue full, the bgwriter keeps cleaning
-	# alone: its enqueues fail and it flushes the bins itself.
-	my $self_before = counter('self_flushes');
+	# With the pool parked and the queue full, the bgwriter defers: each
+	# refused bin bumps the counter, the bin is carried over, nothing is
+	# written by the bgwriter itself (checked once the dust settles).
+	my $deferred_solo = counter('deferred');
 	$node->safe_psql(
 		'postgres', q(
 		CREATE TABLE t_solo AS
@@ -223,9 +228,26 @@ SKIP:
 		UPDATE t_solo SET filler = repeat('z', 800) WHERE id % 3 = 0;
 	));
 	$node->poll_query_until('postgres',
-		"SELECT self_flushes > $self_before FROM test_dwb_cleaner_counters()")
-	  or die 'timed out waiting for the bgwriter to self-flush bins';
-	pass('the bgwriter self-flushed bins while the pool was parked');
+		"SELECT deferred > $deferred_solo FROM test_dwb_cleaner_counters()")
+	  or die 'timed out waiting for the bgwriter to defer bins';
+	pass('the bgwriter deferred bins while the pool was parked');
+
+	# Disabling the LRU scan must stop the deferral stream: the carried
+	# bin is dropped, the queue is no longer polled.  The workers are
+	# still parked, so nothing else can move the counter.
+	$node->append_conf('postgresql.conf', 'bgwriter_lru_maxpages = 0');
+	$node->reload;
+	my ($def_prev, $def_now) = (-1, -2);
+	my $deadline = time() + 30;
+	while (time() < $deadline)
+	{
+		$def_now = counter('deferred');
+		last if $def_now == $def_prev;
+		$def_prev = $def_now;
+		sleep 1;
+	}
+	is(counter('deferred'), $def_now,
+		'the deferral stream stopped once the scan was disabled');
 
 	# Detach BEFORE waking: a woken worker loops back to the point, and
 	# with it still attached it would park again with no wakeup left.
@@ -235,7 +257,7 @@ SKIP:
 	# and its eventual FATAL exit would touch the detached segment.
 	$node->safe_psql('postgres',
 		"SELECT injection_points_detach('dwb-cleaner-loop')");
-	my $deadline = time() + 30;
+	$deadline = time() + 30;
 	while (time() < $deadline)
 	{
 		last
@@ -251,6 +273,39 @@ SKIP:
 		),
 		'0',
 		'both cleaners left the injection point');
+
+	# The released pool drains the queue, but the disabled scan feeds it
+	# nothing: enqueued freezes even under a dirty workload (the dropped
+	# carry-over never lands either — it would show up right here).
+	$node->poll_query_until('postgres',
+		'SELECT queued = 0 FROM test_dwb_cleaner_counters()')
+	  or die 'timed out waiting for the released pool to drain the queue';
+	my $enq_frozen = counter('enqueued');
+	$node->safe_psql('postgres',
+		"UPDATE t_solo SET filler = repeat('w', 800) WHERE id % 4 = 0");
+	sleep 2;
+	is(counter('enqueued'), $enq_frozen,
+		'a disabled scan feeds the pool nothing');
+
+	# By now seconds have passed since the deferral workload, well past
+	# the statistics flush interval: had the bgwriter written any bin
+	# itself, its pg_stat_io row would show it.
+	is( $node->safe_psql(
+			'postgres',
+			"SELECT coalesce(sum(writes), 0) FROM pg_stat_io WHERE object = 'dwb' AND backend_type = 'background writer'"
+		),
+		$bgw_io_before,
+		'the bgwriter wrote no bins itself throughout');
+
+	# Re-enabling the scan resumes the feed.
+	$node->append_conf('postgresql.conf', 'bgwriter_lru_maxpages = 1000');
+	$node->reload;
+	$node->safe_psql('postgres',
+		"UPDATE t_solo SET filler = repeat('v', 800) WHERE id % 5 = 0");
+	$node->poll_query_until('postgres',
+		"SELECT enqueued > $enq_frozen FROM test_dwb_cleaner_counters()")
+	  or die 'timed out waiting for the re-enabled scan to feed the pool';
+	pass('the re-enabled scan resumed feeding the pool');
 }
 
 # --- the queue drains and the counters reconcile -------------------------
@@ -269,7 +324,7 @@ pass('the drained queue reconciles: enqueued = written + skipped');
 # With the queue drained and the system quiet, let buffers_clean settle
 # (pending folds of the workload above trickle in with the bgwriter's
 # reporting), then drive exactly one pool write and pin the attribution:
-# buffers_clean grows while the self-flush counter stands still, and the
+# buffers_clean grows while the deferral counter stands still, and the
 # worker's pg_stat_io row reflects the new write too (that the report is
 # forced, not merely allowed by the stats interval, has its own
 # injection-point scenario below).
@@ -283,7 +338,7 @@ while (time() < $deadline)
 	$bclean_prev = $bclean_base;
 	sleep 1;
 }
-my $self_base = counter('self_flushes');
+my $deferred_base = counter('deferred');
 my $io_base = $node->safe_psql('postgres',
 	"SELECT sum(writes) FROM pg_stat_io WHERE object = 'dwb' AND backend_type = 'background worker'"
 );
@@ -300,7 +355,7 @@ $node->poll_query_until(
 	'postgres', qq(
 	SELECT buffers_clean > $bclean_base FROM pg_stat_bgwriter
 )) or die 'timed out waiting for the pool write to reach buffers_clean';
-is(counter('self_flushes'), $self_base,
+is(counter('deferred'), $deferred_base,
 	'the buffers_clean growth came through the pool fold alone');
 $node->poll_query_until(
 	'postgres', qq(

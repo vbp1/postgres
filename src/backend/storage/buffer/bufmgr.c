@@ -3720,11 +3720,17 @@ BgBufferSync(WritebackContext *wb_context)
 	int			num_issued;
 	int			reusable_buffers;
 
-	/* Vectored DWB flush bin (bin_size stays 0 without the DWB) */
-	int			bin[DWB_FLUSH_BIN_MAX];
-	int			bin_n = 0;
+	/*
+	 * Vectored DWB flush bin (bin_size stays 0 without the DWB).  The bin is
+	 * static so that a bin refused by a full cleaner queue survives the round
+	 * and is re-offered at the top of the next one.
+	 */
+	static int	bin[DWB_FLUSH_BIN_MAX];
+	static int	bin_n = 0;
 	int			bin_size = 0;
 	bool		use_cleaners;
+	bool		bin_deferred = false;
+	bool		skip_scan = false;
 
 	/* Variables for final smoothed_density update */
 	long		new_strategy_delta;
@@ -3757,6 +3763,13 @@ BgBufferSync(WritebackContext *wb_context)
 	if (bgwriter_lru_maxpages <= 0)
 	{
 		saved_info_valid = false;
+
+		/*
+		 * A disabled scan feeds the pool nothing; a bin carried over from
+		 * before the disable was only ever a hint, so drop it — the pages
+		 * stay dirty for later scans, backends or the next checkpoint.
+		 */
+		bin_n = 0;
 		return true;
 	}
 
@@ -3922,18 +3935,51 @@ BgBufferSync(WritebackContext *wb_context)
 	 * into bins and flushed as one batch each: one batch write and one
 	 * fdatasync cover the whole bin instead of one per page (the LRU scan's
 	 * scattered singleton writes otherwise degenerate to lone-writer batches;
-	 * see FlushBufferBin).  With a cleaner pool the bins are handed to the
-	 * pool's queue instead, and only when that fails (queue full: the pool is
-	 * the bottleneck) flushed here.  The bgwriter_lru_maxpages budget caps
-	 * the pages ISSUED per round — queued and self-written together —
+	 * see FlushBufferBin).  With a cleaner pool the bgwriter writes nothing
+	 * itself: bins are handed to the pool's queue, and a refused bin (queue
+	 * full: the pool is saturated) is carried over to the next round while
+	 * the scan ends early — scanning further ahead would only produce bins
+	 * nobody can drain, and flushing here would stall the scan behind serial
+	 * batch fsyncs, starving the pool of fresh bins until the strategy clock
+	 * hand catches the scan point and evictions land on the backends.  The
+	 * bgwriter_lru_maxpages budget caps the pages ISSUED per round — bins
+	 * accepted by the queue, plus everything written in pool-less mode —
 	 * while buf_written_clean counts actual writes only (the pool's
 	 * completions are folded in at the top of the next round).
 	 */
 	if (DWBIsEnabled())
 		bin_size = Min(dwb_batch_pages, DWB_FLUSH_BIN_MAX);
 
+	/*
+	 * Offer a bin carried over from a deferred round before scanning anew.
+	 * Refused again: no scan this round, the queue is simply polled once per
+	 * bgwriter_delay while the pool is saturated.  Accepted: it spends this
+	 * round's issue budget, and a budget shrunk below the bin size meanwhile
+	 * (SIGHUP) ends the round before any scanning.
+	 */
+	if (use_cleaners && bin_n > 0)
+	{
+		if (DWBCleanerEnqueueBin(bin, bin_n))
+		{
+			num_issued += bin_n;
+			bin_n = 0;
+			if (num_issued >= bgwriter_lru_maxpages)
+			{
+				PendingBgWriterStats.maxwritten_clean++;
+				skip_scan = true;
+			}
+		}
+		else
+		{
+			DWBCleanerCountDeferral();
+			bin_deferred = true;
+			skip_scan = true;
+		}
+	}
+
 	/* Execute the LRU scan */
-	while (num_to_scan > 0 && reusable_buffers < upcoming_alloc_est)
+	while (!skip_scan && num_to_scan > 0 &&
+		   reusable_buffers < upcoming_alloc_est)
 	{
 		int			sync_state;
 
@@ -3972,18 +4018,29 @@ BgBufferSync(WritebackContext *wb_context)
 			(bin_n == bin_size ||
 			 num_issued + bin_n >= bgwriter_lru_maxpages))
 		{
-			if (use_cleaners && DWBCleanerEnqueueBin(bin, bin_n))
-				num_issued += bin_n;
+			if (use_cleaners)
+			{
+				if (DWBCleanerEnqueueBin(bin, bin_n))
+				{
+					num_issued += bin_n;
+					bin_n = 0;
+				}
+				else
+				{
+					/* queue full: carry the bin over, end the round */
+					DWBCleanerCountDeferral();
+					bin_deferred = true;
+					break;
+				}
+			}
 			else
 			{
 				int			nw = FlushBufferBin(bin, bin_n, false, wb_context);
 
 				num_written += nw;
 				num_issued += nw;
-				if (use_cleaners)
-					DWBCleanerCountSelfFlush();
+				bin_n = 0;
 			}
-			bin_n = 0;
 		}
 
 		if (num_issued >= bgwriter_lru_maxpages)
@@ -3993,18 +4050,25 @@ BgBufferSync(WritebackContext *wb_context)
 		}
 	}
 
-	if (bin_n > 0)
+	if (bin_n > 0 && !bin_deferred)
 	{
-		if (use_cleaners && DWBCleanerEnqueueBin(bin, bin_n))
-			num_issued += bin_n;
+		if (use_cleaners)
+		{
+			if (DWBCleanerEnqueueBin(bin, bin_n))
+			{
+				num_issued += bin_n;
+				bin_n = 0;
+			}
+			else
+				DWBCleanerCountDeferral();	/* carry the bin over */
+		}
 		else
 		{
 			int			nw = FlushBufferBin(bin, bin_n, false, wb_context);
 
 			num_written += nw;
 			num_issued += nw;
-			if (use_cleaners)
-				DWBCleanerCountSelfFlush();
+			bin_n = 0;
 		}
 	}
 
@@ -4042,8 +4106,8 @@ BgBufferSync(WritebackContext *wb_context)
 #endif
 	}
 
-	/* Return true if OK to hibernate */
-	return (bufs_to_lap == 0 && recent_alloc == 0);
+	/* Return true if OK to hibernate; a carried bin is pending work */
+	return (bufs_to_lap == 0 && recent_alloc == 0 && bin_n == 0);
 }
 
 /*

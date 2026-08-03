@@ -469,8 +469,8 @@ typedef struct DWBCleanerCtl
 											 * diagnostics) */
 	pg_atomic_uint64 skipped_pages; /* stale claims dropped by
 									 * reclassification */
-	pg_atomic_uint64 self_flushes;	/* bins the bgwriter flushed itself
-									 * because the queue was full or busy */
+	pg_atomic_uint64 deferred_bins; /* bins refused by a full queue and
+									 * carried over by the bgwriter */
 	ConditionVariable cv_work;	/* one targeted signal per enqueued bin */
 	int			capacity;
 	/* head/nqueued and the bins are protected by DWBCleanerQueueLock */
@@ -527,7 +527,7 @@ extern void DWBCleanerShmemInit(void);
 extern bool DWBCleanersActive(void);
 extern bool DWBCleanerEnqueueBin(const int *buf_ids, int nbuf);
 extern uint64 DWBCleanerFetchPoolWritten(void);
-extern void DWBCleanerCountSelfFlush(void);
+extern void DWBCleanerCountDeferral(void);
 extern void DWBCleanerWorkersRegister(void);
 pg_noreturn extern void DWBCleanerWorkerMain(Datum main_arg);
 

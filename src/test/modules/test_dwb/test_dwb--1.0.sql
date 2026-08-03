@@ -107,7 +107,7 @@ CREATE FUNCTION test_dwb_set_control_min_version(min_version int)
 
 CREATE FUNCTION test_dwb_cleaner_counters(
 	OUT enqueued bigint, OUT written bigint, OUT skipped bigint,
-	OUT self_flushes bigint, OUT queued int)
+	OUT deferred bigint, OUT queued int)
 	RETURNS record STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
