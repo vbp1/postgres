@@ -256,6 +256,15 @@ my ($waldump, $walerr) = run_command(
 		'--start' => $tl2_start,
 		'--end' => $tl2_end
 	]);
+# pg_current_wal_lsn() above may land exactly on a WAL page boundary
+# while concurrent records (imageless FPI_FOR_HINT from the count(*)
+# checks) are still being inserted: the write position advances in
+# whole pages.
+# pg_waldump then skips the page header to the first whole record and
+# reports that with a benign informational line on stderr.  Tolerate
+# exactly that line; anything else on stderr is still a real failure.
+$walerr =~
+  s/^pg_waldump: first record is after \S+, at \S+, skipping over \d+ bytes?\n?//;
 is($walerr, '', 'pg_waldump read the post-promotion window cleanly');
 like($waldump, qr/Heap/, 'the window covers the post-promotion update');
 unlike($waldump, qr/\bFPW\b/, 'no full-page images after promotion');
