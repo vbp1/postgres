@@ -147,9 +147,12 @@ int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
 /*
  * Number of WAL insertion locks to use. A higher value allows more insertions
  * to happen concurrently, but adds some CPU overhead to flushing the WAL,
- * which needs to iterate all the locks.
+ * which needs to iterate all the locks.  Raised from 8 for double_writes
+ * workloads: with full-page images gone the record stream is made of many
+ * small records, so high-connection benchmarks bottleneck on insertion-slot
+ * contention well before the WAL device saturates.
  */
-#define NUM_XLOGINSERT_LOCKS  8
+#define NUM_XLOGINSERT_LOCKS  32
 
 /*
  * Max distance from last checkpoint, before triggering a new xlog-based
