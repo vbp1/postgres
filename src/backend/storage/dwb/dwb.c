@@ -1082,18 +1082,24 @@ DWBGetBatchState(int batch_idx)
  */
 
 /*
- * The checkpointer's BufferSync, the bgwriter's flush rounds and the
- * cleaner worker pool executing the bgwriter's bins form the background
+ * The checkpointer's BufferSync, the bgwriter's flush rounds, the
+ * cleaner worker pool executing the bgwriter's bins and autovacuum
+ * workers flushing their private ring strategy form the background
  * stream; everything else — ordinary backend evictions above all — is
- * the latency-critical class with first claim on FREE batches.  Cleaners
- * are ordinary background workers, invisible to MyBackendType, hence the
+ * the latency-critical class with first claim on FREE batches.
+ * Autovacuum belongs there because it is a scheduled sequential writer:
+ * in a busy class its pages ride the pool's bin batches instead of
+ * sealing one-page batches of their own, and in a cold class the
+ * lone-writer fast seal keeps its per-page latency unchanged.  Manual
+ * VACUUM stays with its client backend's class.  Cleaners are ordinary
+ * background workers, invisible to MyBackendType, hence the
  * process-local flag.
  */
 static int
 DWBWriterClass(void)
 {
 	if (MyBackendType == B_CHECKPOINTER || MyBackendType == B_BG_WRITER ||
-		DWBAmCleanerWorker)
+		MyBackendType == B_AUTOVAC_WORKER || DWBAmCleanerWorker)
 		return DWB_WCLASS_BACKGROUND;
 	return DWB_WCLASS_EVICTION;
 }
