@@ -1112,8 +1112,8 @@ Datum
 test_dwb_cleaner_counters(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[5];
-	bool		nulls[5] = {0};
+	Datum		values[6];
+	bool		nulls[6] = {0};
 	int			queued;
 
 	check_cleaners_enabled();
@@ -1134,6 +1134,8 @@ test_dwb_cleaner_counters(PG_FUNCTION_ARGS)
 	values[3] = Int64GetDatum(
 							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->deferred_bins));
 	values[4] = Int32GetDatum(queued);
+	values[5] = Int64GetDatum(
+							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->pressure_naps));
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

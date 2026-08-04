@@ -3573,7 +3573,12 @@ include_dir 'conf.d'
         buffers instead.  The background writer then writes no data pages
         itself: when the pool falls momentarily behind, the scan pauses
         instead of writing and resumes as soon as a worker frees queue
-        space.  The workers consume
+        space.  The checkpointer also defers to a loaded pool: while the
+        pool's queue is hot, checkpoint writes pause within a small,
+        bounded slice of the
+        <xref linkend="guc-checkpoint-completion-target"/> slack, so
+        checkpoint traffic lands in the quieter moments of the write
+        window.  The workers consume
         <xref linkend="guc-max-worker-processes"/> slots.  Setting it to 0
         (the default) disables the pool and the background writer flushes
         its bins itself.

@@ -471,6 +471,10 @@ typedef struct DWBCleanerCtl
 									 * reclassification */
 	pg_atomic_uint64 deferred_bins; /* bins refused by a full queue and
 									 * carried over by the bgwriter */
+	pg_atomic_uint64 pressure_naps; /* checkpointer naps taken only because
+									 * the queue was hot */
+	pg_atomic_uint32 depth;		/* lock-free mirror of nqueued for the
+								 * checkpointer's advisory pressure check */
 	ConditionVariable cv_work;	/* one targeted signal per enqueued bin */
 	int			capacity;
 	/* head/nqueued and the bins are protected by DWBCleanerQueueLock */
@@ -528,6 +532,8 @@ extern bool DWBCleanersActive(void);
 extern bool DWBCleanerEnqueueBin(const int *buf_ids, int nbuf);
 extern uint64 DWBCleanerFetchPoolWritten(void);
 extern void DWBCleanerCountDeferral(void);
+extern bool DWBCleanerQueueHot(void);
+extern void DWBCleanerCountPressureNap(void);
 extern void DWBCleanerWorkersRegister(void);
 pg_noreturn extern void DWBCleanerWorkerMain(Datum main_arg);
 

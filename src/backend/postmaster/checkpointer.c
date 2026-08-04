@@ -52,6 +52,7 @@
 #include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
+#include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -163,7 +164,7 @@ static pg_time_t last_xlog_switch_time;
 
 static void ProcessCheckpointerInterrupts(void);
 static void CheckArchiveTimeout(void);
-static bool IsCheckpointOnSchedule(double progress);
+static bool IsCheckpointOnSchedule(double progress, double slack);
 static bool ImmediateCheckpointRequested(void);
 static bool CompactCheckpointerRequestQueue(void);
 static void UpdateSharedMemoryConfig(void);
@@ -772,6 +773,7 @@ void
 CheckpointWriteDelay(int flags, double progress)
 {
 	static int	absorb_counter = WRITES_PER_ABSORB;
+	bool		nap;
 
 	/* Do nothing if checkpoint is being executed by non-checkpointer process */
 	if (!AmCheckpointerProcess())
@@ -780,12 +782,38 @@ CheckpointWriteDelay(int flags, double progress)
 	/*
 	 * Perform the usual duties and take a nap, unless we're behind schedule,
 	 * in which case we just try to catch up as quickly as possible.
+	 *
+	 * Under double_writes an active cleaner pool competes with us for the
+	 * ring and the array; while its bin queue is hot we keep napping a little
+	 * past the schedule, spending a bounded slice of the completion-target
+	 * slack so our writes land in the quieter phases of the window.  The
+	 * margin is recomputed from the live target on every check (it is
+	 * SIGHUP-reloadable mid checkpoint) and caps the extra schedule lag; once
+	 * it is used up, pacing is the stock behavior no matter the pressure.
 	 */
+	nap = false;
 	if (!(flags & CHECKPOINT_IMMEDIATE) &&
 		!ShutdownXLOGPending &&
 		!ShutdownRequestPending &&
-		!ImmediateCheckpointRequested() &&
-		IsCheckpointOnSchedule(progress))
+		!ImmediateCheckpointRequested())
+	{
+		if (IsCheckpointOnSchedule(progress, 0.0))
+			nap = true;
+		else
+		{
+			double		margin = Min(0.05,
+									 (1.0 - CheckPointCompletionTarget) / 2.0);
+
+			if (margin > 0.0 && DWBCleanerQueueHot() &&
+				IsCheckpointOnSchedule(progress, margin))
+			{
+				DWBCleanerCountPressureNap();
+				nap = true;
+			}
+		}
+	}
+
+	if (nap)
 	{
 		if (ConfigReloadPending)
 		{
@@ -839,7 +867,7 @@ CheckpointWriteDelay(int flags, double progress)
  * than the elapsed time/segments.
  */
 static bool
-IsCheckpointOnSchedule(double progress)
+IsCheckpointOnSchedule(double progress, double slack)
 {
 	XLogRecPtr	recptr;
 	struct timeval now;
@@ -848,8 +876,12 @@ IsCheckpointOnSchedule(double progress)
 
 	Assert(ckpt_active);
 
-	/* Scale progress according to checkpoint_completion_target. */
-	progress *= CheckPointCompletionTarget;
+	/*
+	 * Scale progress according to checkpoint_completion_target.  The slack
+	 * term is added after the scaling: it grants the caller that much extra
+	 * elapsed fraction before the answer flips to "behind".
+	 */
+	progress = progress * CheckPointCompletionTarget + slack;
 
 	/*
 	 * Check against the cached value first. Only do the more expensive

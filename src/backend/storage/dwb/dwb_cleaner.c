@@ -98,6 +98,8 @@ DWBCleanerShmemInit(void)
 		pg_atomic_init_u64(&DWBCleanerQueue->pool_written_total, 0);
 		pg_atomic_init_u64(&DWBCleanerQueue->skipped_pages, 0);
 		pg_atomic_init_u64(&DWBCleanerQueue->deferred_bins, 0);
+		pg_atomic_init_u64(&DWBCleanerQueue->pressure_naps, 0);
+		pg_atomic_init_u32(&DWBCleanerQueue->depth, 0);
 		ConditionVariableInit(&DWBCleanerQueue->cv_work);
 		DWBCleanerQueue->capacity = DWB_CLEANER_QUEUE_CAPACITY;
 	}
@@ -138,6 +140,7 @@ DWBCleanerEnqueueBin(const int *buf_ids, int nbuf)
 	bin->nbuf = nbuf;
 	memcpy(bin->buf_ids, buf_ids, nbuf * sizeof(int));
 	ctl->nqueued++;
+	pg_atomic_write_u32(&ctl->depth, ctl->nqueued);
 	LWLockRelease(DWBCleanerQueueLock);
 
 	pg_atomic_fetch_add_u64(&ctl->enqueued_pages, nbuf);
@@ -161,10 +164,38 @@ DWBCleanerDequeueBin(DWBCleanerBin *bin)
 		*bin = ctl->bins[ctl->head];
 		ctl->head = (ctl->head + 1) % ctl->capacity;
 		ctl->nqueued--;
+		pg_atomic_write_u32(&ctl->depth, ctl->nqueued);
 		got = true;
 	}
 	LWLockRelease(DWBCleanerQueueLock);
 	return got;
+}
+
+/*
+ * Advisory pressure signal for the checkpointer: is the bin queue at
+ * least half full?  Reads only the lock-free depth mirror — a stale
+ * answer merely shifts one 100ms pacing decision, so no lock is taken;
+ * nqueued itself stays under DWBCleanerQueueLock.
+ */
+bool
+DWBCleanerQueueHot(void)
+{
+	DWBCleanerCtl *ctl = DWBCleanerQueue;
+
+	if (ctl == NULL || !DWBCleanersActive())
+		return false;
+	return pg_atomic_read_u32(&ctl->depth) >= ctl->capacity / 2;
+}
+
+/*
+ * Count a checkpointer nap taken only because the queue was hot (the
+ * base schedule check alone would have kept writing).
+ */
+void
+DWBCleanerCountPressureNap(void)
+{
+	if (DWBCleanerQueue != NULL)
+		pg_atomic_fetch_add_u64(&DWBCleanerQueue->pressure_naps, 1);
 }
 
 /*

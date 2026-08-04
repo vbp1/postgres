@@ -55,6 +55,8 @@ tests += {
       't/016_bgwriter_bin.pl',
       't/017_syncfs_retire.pl',
       't/018_cleaners.pl',
+      't/019_autovacuum_class.pl',
+      't/020_ckpt_yield.pl',
     ],
   },
 }
