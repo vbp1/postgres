@@ -161,6 +161,34 @@ static int	publish_hand = 0;
 static uint64 my_drop_epoch = 0;
 
 /*
+ * Worker-private: relation sizes this worker has measured.
+ *
+ * smgr keeps such a cache too, but hands it out only to the startup process
+ * (smgrnblocks_cached(), "due to lack of a shared invalidation mechanism for
+ * changes in file size").  This pool has that mechanism — the drop epoch —
+ * so it can keep its own answers, and it has to: measuring walks the segment
+ * chain, which on a terabyte relation is a thousand file opens, and paying
+ * that per request leaves a worker doing nothing else.
+ *
+ * A remembered size is only ever too small, never too large: within an epoch
+ * no relation lost blocks, so the entry is trusted for "the block is inside
+ * the relation" and re-measured for anything else.  Direct-mapped and small
+ * on purpose — replay works through a handful of relations at a time.
+ */
+#define XLOGWARM_SIZES	16
+
+typedef struct XLogWarmSize
+{
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber nblocks;
+	uint64		epoch;
+	bool		valid;
+}			XLogWarmSize;
+
+static XLogWarmSize my_sizes[XLOGWARM_SIZES];
+
+/*
  * Worker-private: the slot this worker holds, or -1.  Read on the way out to
  * hand the slot back, so a worker that is signalled away does not take a slot
  * of the ring with it.
@@ -504,6 +532,7 @@ XLogWarmDoOne(XLogWarmSlot * slot, uint64 request_id,
 			  RelFileLocator rlocator, ForkNumber forknum, BlockNumber blkno)
 {
 	SMgrRelation smgr;
+	XLogWarmSize *size;
 	Buffer		buffer = InvalidBuffer;
 	uint32		expected;
 	bool		failed = false;
@@ -529,27 +558,62 @@ XLogWarmDoOne(XLogWarmSlot * slot, uint64 request_id,
 		if (XLogWarmQueue->drop_epoch != my_drop_epoch)
 		{
 			smgrreleaseall();
+			memset(my_sizes, 0, sizeof(my_sizes));
 			my_drop_epoch = XLogWarmQueue->drop_epoch;
 		}
 
 		smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
 
 		/*
-		 * Re-check what the prefetcher checked when it published: the
-		 * relation may have been dropped or truncated since.  Both answers
-		 * come from smgr's cache, so this is cheap.
+		 * Is the block still there?  Replay may have dropped or truncated the
+		 * relation between publication and now — the ordinary outcome of
+		 * running ahead of it, and the outcome the interlock guarantees for a
+		 * request that gets here after a drop.
+		 *
+		 * Asking outright costs more than it looks: smgrexists() closes the
+		 * fork first (mdexists() skips that only in the startup process) and
+		 * smgrnblocks() then walks the segment chain from the beginning, so
+		 * on a terabyte relation one question is a thousand file opens.  The
+		 * answer is therefore remembered per epoch, and only the first
+		 * request for a fork, or one that lands past a remembered end, pays
+		 * for asking again.
 		 */
-		if (!smgrexists(smgr, forknum) ||
-			blkno >= smgrnblocks(smgr, forknum))
+		size = &my_sizes[rlocator.relNumber % XLOGWARM_SIZES];
+
+		if (!size->valid || size->epoch != my_drop_epoch ||
+			size->forknum != forknum ||
+			!RelFileLocatorEquals(size->rlocator, rlocator))
 		{
-			/*
-			 * Replay dropped or truncated the relation between publication
-			 * and now — the ordinary outcome of running ahead of it, and
-			 * the outcome the interlock guarantees for a read that starts
-			 * after a drop.
-			 */
-			failed = true;
-			pg_atomic_fetch_add_u64(&XLogWarmQueue->vanished, 1);
+			if (!smgrexists(smgr, forknum))
+			{
+				failed = true;
+				pg_atomic_fetch_add_u64(&XLogWarmQueue->vanished, 1);
+			}
+			else
+			{
+				size->rlocator = rlocator;
+				size->forknum = forknum;
+				size->nblocks = smgrnblocks(smgr, forknum);
+				size->epoch = my_drop_epoch;
+				size->valid = true;
+			}
+		}
+
+		if (!failed && blkno >= size->nblocks)
+		{
+			/* the remembered size may simply predate an extension */
+			size->nblocks = smgrnblocks(smgr, forknum);
+
+			if (blkno >= size->nblocks)
+			{
+				failed = true;
+				pg_atomic_fetch_add_u64(&XLogWarmQueue->vanished, 1);
+			}
+		}
+
+		if (failed)
+		{
+			/* the block is gone; there is nothing to warm */
 		}
 		else if (BufferIsValid(buffer = LookupSharedBuffer(smgr, forknum, blkno)))
 		{
