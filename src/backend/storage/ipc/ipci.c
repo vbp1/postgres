@@ -39,6 +39,7 @@
 #include "replication/walsender.h"
 #include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
+#include "access/xlogwarm.h"
 #include "storage/dwb.h"
 #include "storage/dsm.h"
 #include "storage/dsm_registry.h"
@@ -116,6 +117,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, DSMRegistryShmemSize());
 	size = add_size(size, BufferManagerShmemSize());
 	size = add_size(size, DWBShmemSize());
+	size = add_size(size, XLogWarmShmemSize());
 	size = add_size(size, LockManagerShmemSize());
 	size = add_size(size, PredicateLockShmemSize());
 	size = add_size(size, ProcGlobalShmemSize());
@@ -296,6 +298,7 @@ CreateOrAttachShmemStructs(void)
 	MultiXactShmemInit();
 	BufferManagerShmemInit();
 	DWBShmemInit();
+	XLogWarmShmemInit();
 
 	/*
 	 * Set up lock manager

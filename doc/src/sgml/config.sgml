@@ -4361,6 +4361,58 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-replay-warm-workers" xreflabel="replay_warm_workers">
+      <term><varname>replay_warm_workers</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>replay_warm_workers</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Number of background workers that read the blocks recovery is about to
+        modify into shared buffers, ahead of replay.  The default is 0, which
+        disables the pool; recovery then relies on
+        <xref linkend="guc-recovery-prefetch"/> advising the operating system
+        and reads the blocks in the startup process itself.
+       </para>
+       <para>
+        This matters most when the WAL stream carries no full-page images,
+        which is the case on a standby of a cluster running
+        <xref linkend="guc-io-torn-pages-protection"/> set to
+        <literal>double_writes</literal>: every replayed record then needs its
+        page fetched, and doing that from the single replay process can make
+        it the limit on how fast the standby keeps up.  With the pool enabled
+        that fetching, including its checksum verification and its buffer
+        allocation, happens in the workers instead.
+       </para>
+       <para>
+        The workers take slots from
+        <xref linkend="guc-max-worker-processes"/>, take no database
+        connection, and start with the postmaster, so they also serve crash
+        recovery.  Their requests are advisory throughout: anything they do
+        not get to in time is simply read by the replay process, as it would
+        be with the pool disabled.  This parameter can only be set at server
+        start.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-replay-warm-queue-size" xreflabel="replay_warm_queue_size">
+      <term><varname>replay_warm_queue_size</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>replay_warm_queue_size</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        How many block requests the pool enabled by
+        <xref linkend="guc-replay-warm-workers"/> can hold at once, which also
+        bounds how far ahead of replay the server looks for blocks to warm.
+        The default is 256.  This parameter can only be set at server start.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-wal-decode-buffer-size" xreflabel="wal_decode_buffer_size">
       <term><varname>wal_decode_buffer_size</varname> (<type>integer</type>)
       <indexterm>

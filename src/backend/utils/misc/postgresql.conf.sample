@@ -298,6 +298,10 @@
 #recovery_prefetch = try	# prefetch pages referenced in the WAL?
 #wal_decode_buffer_size = 512kB	# lookahead window used for prefetching
 				# (change requires restart)
+#replay_warm_workers = 0	# workers reading pages ahead of replay
+				# (change requires restart)
+#replay_warm_queue_size = 256	# block requests the warm pool can hold
+				# (change requires restart)
 
 # - Archiving -
 

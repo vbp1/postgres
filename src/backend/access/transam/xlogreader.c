@@ -1786,6 +1786,9 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk->has_data = ((fork_flags & BKPBLOCK_HAS_DATA) != 0);
 
 			blk->prefetch_buffer = InvalidBuffer;
+			blk->warm_slot = XLOGWARM_NO_SLOT;
+			blk->warm_request = 0;
+			blk->warm_hint = false;
 
 			COPY_HEADER_FIELD(&blk->data_len, sizeof(uint16));
 			/* cross-check that the HAS_DATA flag is set iff data_length > 0 */

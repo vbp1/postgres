@@ -64,6 +64,7 @@ LOGICAL_APPLY_MAIN	"Waiting in main loop of logical replication apply process."
 LOGICAL_LAUNCHER_MAIN	"Waiting in main loop of logical replication launcher process."
 LOGICAL_PARALLEL_APPLY_MAIN	"Waiting in main loop of logical replication parallel apply process."
 RECOVERY_WAL_STREAM	"Waiting in main loop of startup process for WAL to arrive, during streaming recovery."
+REPLAY_WARM_MAIN	"Waiting in main loop of a replay warm worker."
 REPLICATION_SLOTSYNC_MAIN	"Waiting in main loop of slot sync worker."
 REPLICATION_SLOTSYNC_SHUTDOWN	"Waiting for slot sync worker to shut down."
 SYSLOGGER_MAIN	"Waiting in main loop of syslogger process."
@@ -370,6 +371,7 @@ DWBSegHash	"Waiting to read or update the double write buffer segment hash table
 DWBSelfSweep	"Waiting to run the double write buffer self-help retirement sweep."
 DWBSyncfsRound	"Waiting to run a wholesale double write buffer retirement round."
 DWBCleanerQueue	"Waiting to access the double write buffer cleaner work queue."
+ReplayWarmRead	"Waiting for replay prefetch workers to finish reading pages of a relation being dropped or truncated."
 
 #
 # END OF PREDEFINED LWLOCKS (DO NOT CHANGE THIS LINE)

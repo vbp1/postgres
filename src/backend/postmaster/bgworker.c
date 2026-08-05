@@ -21,6 +21,7 @@
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
+#include "access/xlogwarm.h"
 #include "storage/dwb.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -130,6 +131,9 @@ static const struct
 	},
 	{
 		"DWBCleanerWorkerMain", DWBCleanerWorkerMain
+	},
+	{
+		"XLogWarmWorkerMain", XLogWarmWorkerMain
 	},
 	{
 		"ApplyWorkerMain", ApplyWorkerMain

@@ -36,7 +36,8 @@ OBJS = \
 	xlogreader.o \
 	xlogrecovery.o \
 	xlogstats.o \
-	xlogutils.o
+	xlogutils.o \
+	xlogwarm.o
 
 include $(top_srcdir)/src/backend/common.mk
 

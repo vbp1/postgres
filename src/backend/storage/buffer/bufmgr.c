@@ -561,14 +561,22 @@ static int	ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
 
 
 /*
- * Implementation of PrefetchBuffer() for shared buffers.
+ * Look up a shared buffer without touching storage.
+ *
+ * Returns the buffer the block was found in, or InvalidBuffer.  As with
+ * PrefetchSharedBuffer(), the buffer is not pinned and the answer is only a
+ * hint: the caller must recheck, typically through ReadRecentBuffer().
+ *
+ * Callers that want the residency answer alone use this: the recovery
+ * prefetcher, to decide whether a block is worth handing to the warm pool,
+ * and a warm worker, to tell a real read from a hit (ReadBufferWithoutRelcache
+ * does not report that).
  */
-PrefetchBufferResult
-PrefetchSharedBuffer(SMgrRelation smgr_reln,
-					 ForkNumber forkNum,
-					 BlockNumber blockNum)
+Buffer
+LookupSharedBuffer(SMgrRelation smgr_reln,
+				   ForkNumber forkNum,
+				   BlockNumber blockNum)
 {
-	PrefetchBufferResult result = {InvalidBuffer, false};
 	BufferTag	newTag;			/* identity of requested block */
 	uint32		newHash;		/* hash value for newTag */
 	LWLock	   *newPartitionLock;	/* buffer partition lock for it */
@@ -589,8 +597,24 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 	buf_id = BufTableLookup(&newTag, newHash);
 	LWLockRelease(newPartitionLock);
 
+	return buf_id < 0 ? InvalidBuffer : buf_id + 1;
+}
+
+/*
+ * Implementation of PrefetchBuffer() for shared buffers.
+ */
+PrefetchBufferResult
+PrefetchSharedBuffer(SMgrRelation smgr_reln,
+					 ForkNumber forkNum,
+					 BlockNumber blockNum)
+{
+	PrefetchBufferResult result = {InvalidBuffer, false};
+	Buffer		recent_buffer;
+
+	recent_buffer = LookupSharedBuffer(smgr_reln, forkNum, blockNum);
+
 	/* If not in buffers, initiate prefetch */
-	if (buf_id < 0)
+	if (!BufferIsValid(recent_buffer))
 	{
 #ifdef USE_PREFETCH
 		/*
@@ -611,7 +635,7 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 		 * to avoid a buffer table lookup, but it's not pinned and it must be
 		 * rechecked!
 		 */
-		result.recent_buffer = buf_id + 1;
+		result.recent_buffer = recent_buffer;
 	}
 
 	/*
@@ -5423,6 +5447,7 @@ DropDatabaseBuffers(Oid dbid)
 	 * We needn't consider local buffers, since by assumption the target
 	 * database isn't our own.
 	 */
+
 
 	for (i = 0; i < NBuffers; i++)
 	{

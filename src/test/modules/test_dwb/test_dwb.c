@@ -22,6 +22,7 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/xact.h"
+#include "access/xlogwarm.h"
 #include "catalog/pg_tablespace_d.h"
 #include "common/relpath.h"
 #include "fmgr.h"
@@ -1138,6 +1139,129 @@ test_dwb_cleaner_counters(PG_FUNCTION_ARGS)
 							  (int64) pg_atomic_read_u64(&DWBCleanerQueue->pressure_naps));
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * Counters of the replay warm pool: what the publisher handed over and
+ * what came back, and what the workers did with it.  Errors out when the
+ * pool is not configured, so a test cannot mistake "off" for "idle".
+ */
+PG_FUNCTION_INFO_V1(test_dwb_warm_counters);
+Datum
+test_dwb_warm_counters(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[13];
+	bool		nulls[13] = {0};
+	XLogWarmStats stats;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	if (!XLogWarmGetStats(&stats))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the replay warm pool is not configured"),
+				 errhint("Set \"replay_warm_workers\" above 0.")));
+
+	values[0] = Int64GetDatum((int64) stats.published);
+	values[1] = Int64GetDatum((int64) stats.dropped_full);
+	values[2] = Int64GetDatum((int64) stats.collected);
+	values[3] = Int64GetDatum((int64) stats.missed);
+	values[4] = Int64GetDatum((int64) stats.stale);
+	values[5] = Int64GetDatum((int64) stats.cancelled);
+	values[6] = Int64GetDatum((int64) stats.released);
+	values[7] = Int64GetDatum((int64) stats.claimed);
+	values[8] = Int64GetDatum((int64) stats.reads);
+	values[9] = Int64GetDatum((int64) stats.hits);
+	values[10] = Int64GetDatum((int64) stats.failed);
+	values[11] = Int64GetDatum((int64) stats.discarded);
+	values[12] = Int64GetDatum((int64) stats.vanished);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * Pids of the running warm workers.  They hold no database connection, so
+ * pg_stat_activity cannot show them; this is how a test finds one to kill
+ * and how an operator sees the pool is alive.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_warm_worker_pids);
+Datum
+test_dwb_warm_worker_pids(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int			pids[XLOGWARM_MAX_WORKERS];
+	int			nworkers;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	nworkers = XLogWarmGetWorkerPids(pids);
+	for (int i = 0; i < nworkers; i++)
+	{
+		Datum		values[2];
+		bool		nulls[2] = {0};
+
+		values[0] = Int32GetDatum(i);
+		values[1] = Int32GetDatum(pids[i]);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * What the pool is doing right now: requests waiting for a worker, and
+ * requests a worker holds.  The running totals say what has happened; this
+ * is what a test needs to catch a request in flight.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_warm_slot_states);
+Datum
+test_dwb_warm_slot_states(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+	int			published;
+	int			claimed;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	XLogWarmGetSlotCounts(&published, &claimed);
+
+	values[0] = Int32GetDatum(published);
+	values[1] = Int32GetDatum(claimed);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * How many buffers still hold pages of this relation file.  After replay has
+ * dropped a relation the answer must be zero, whatever the warm pool was
+ * doing at the time — a page left behind for a relation that no longer exists
+ * is the failure this counts.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_count_rel_buffers);
+Datum
+test_dwb_count_rel_buffers(PG_FUNCTION_ARGS)
+{
+	Oid			relnumber = PG_GETARG_OID(0);
+	int			count = 0;
+
+	for (int i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *desc = GetBufferDescriptor(i);
+		uint32		state = LockBufHdr(desc);
+
+		if ((state & BM_TAG_VALID) &&
+			desc->tag.relNumber == relnumber)
+			count++;
+
+		UnlockBufHdr(desc, state);
+	}
+
+	PG_RETURN_INT32(count);
 }
 
 /*

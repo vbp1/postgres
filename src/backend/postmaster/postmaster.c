@@ -110,6 +110,7 @@
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
 #include "storage/aio_subsys.h"
+#include "access/xlogwarm.h"
 #include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/io_worker.h"
@@ -936,6 +937,13 @@ PostmasterMain(int argc, char *argv[])
 
 	/* And the double write buffer cleaner pool feeding off the bgwriter. */
 	DWBCleanerWorkersRegister();
+
+	/*
+	 * The replay warm pool, which fetches pages ahead of redo.  It takes no
+	 * database connection, so it can start now and serve crash recovery from
+	 * the first record.
+	 */
+	XLogWarmWorkersRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

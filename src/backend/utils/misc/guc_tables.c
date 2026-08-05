@@ -37,6 +37,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogrecovery.h"
+#include "access/xlogwarm.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
 #include "catalog/namespace.h"
@@ -2247,6 +2248,30 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&dwb_cleaner_workers,
 		0, 0, 64,
+		NULL, NULL, NULL
+	},
+	{
+		{"replay_warm_workers", PGC_POSTMASTER, WAL_RECOVERY,
+			gettext_noop("Number of replay warm worker processes."),
+			gettext_noop("The pool reads the pages replay is about to modify "
+						 "into shared buffers ahead of it, which matters when "
+						 "the WAL stream carries no full-page images. The "
+						 "workers consume \"max_worker_processes\" slots. 0 "
+						 "disables the pool and recovery prefetching falls "
+						 "back to advising the operating system.")
+		},
+		&replay_warm_workers,
+		0, 0, 64,
+		NULL, NULL, NULL
+	},
+	{
+		{"replay_warm_queue_size", PGC_POSTMASTER, WAL_RECOVERY,
+			gettext_noop("Number of block requests the replay warm pool can hold."),
+			gettext_noop("This also bounds how far ahead of replay the "
+						 "prefetcher looks when the pool is enabled.")
+		},
+		&replay_warm_queue_size,
+		256, 16, 8192,
 		NULL, NULL, NULL
 	},
 	{

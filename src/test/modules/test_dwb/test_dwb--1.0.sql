@@ -111,6 +111,28 @@ CREATE FUNCTION test_dwb_cleaner_counters(
 	RETURNS record STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION test_dwb_warm_counters(
+	OUT published bigint, OUT dropped_full bigint, OUT collected bigint,
+	OUT missed bigint, OUT stale bigint, OUT cancelled bigint,
+	OUT released bigint, OUT claimed bigint, OUT reads bigint,
+	OUT hits bigint, OUT failed bigint, OUT discarded bigint,
+	OUT vanished bigint)
+	RETURNS record STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_count_rel_buffers(relnumber oid)
+	RETURNS int STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_warm_slot_states(
+	OUT published int, OUT claimed int)
+	RETURNS record STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_warm_worker_pids(OUT worker int, OUT pid int)
+	RETURNS SETOF record
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_dwb_pin_block(rel regclass, blkno int)
 	RETURNS void STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
