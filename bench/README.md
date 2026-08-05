@@ -14,3 +14,7 @@ and data checksums enabled, converted from the same reference cluster.
   series: throughput and shipped WAL per client count, and the standby's
   replay backlog over the run.  Both instances share the stand, split by
   socket, with a netem-emulated 10 GbE hop between them.
+* `repl-time-tps.png`, `repl-time-lat.png` — TPS and average latency over
+  the run at 750 connections against a synchronous standby, vanilla
+  against DWB with the replay warm pool (`replay_warm_workers = 12`).
+  The vanilla run is 900 s, the pool run 600 s.
