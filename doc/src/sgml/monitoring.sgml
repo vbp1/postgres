@@ -1854,6 +1854,15 @@ description | Waiting for a newly initialized WAL file to reach durable storage
    with the <function>pg_stat_reset_shared</function> function.
   </para>
 
+  <para>
+   When <xref linkend="guc-replay-warm-workers"/> is set, whether a block was
+   already in the buffer pool is decided by the pool's workers rather than by
+   recovery itself, and <structfield>prefetch</structfield> and
+   <structfield>hit</structfield> are counted there.  A request that no worker
+   ever serves — one withdrawn because recovery moved its read position, or
+   one whose worker exited while holding it — is counted in neither.
+  </para>
+
   <table id="pg-stat-recovery-prefetch-view" xreflabel="pg_stat_recovery_prefetch">
    <title><structname>pg_stat_recovery_prefetch</structname> View</title>
    <tgroup cols="1">

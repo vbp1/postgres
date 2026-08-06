@@ -54,7 +54,8 @@ extern void XLogWarmDropBegin(void);
 extern void XLogWarmDropEnd(void);
 extern bool XLogWarmGetStats(XLogWarmStats * stats);
 extern void XLogWarmGetSlotCounts(int *published, int *claimed);
-extern int	XLogWarmGetWorkerPids(int *pids);
+extern void XLogWarmGetPoolState(int *scanners, int *pending, int *sleepers);
+extern int	XLogWarmGetWorkerPids(int *pids, int *slots);
 
 /* the pool size ceiling, matching the setting's maximum */
 #define XLOGWARM_MAX_WORKERS	64

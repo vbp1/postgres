@@ -4445,6 +4445,15 @@ include_dir 'conf.d'
         bounds how far ahead of replay the server looks for blocks to warm.
         The default is 256.  This parameter can only be set at server start.
        </para>
+       <para>
+        Every block a record refers to takes a request, whether or not the
+        block turns out to be in a buffer already: which of the two it is is
+        the pool's answer to give, and asking the question in the startup
+        process is the cost this arrangement avoids.  Since most references
+        are to blocks already in buffers, the reads actually outstanding
+        ahead of replay are a fraction of this setting, and a pool of many
+        workers wants room for all of them.
+       </para>
       </listitem>
      </varlistentry>
 

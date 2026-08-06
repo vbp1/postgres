@@ -366,6 +366,35 @@ XLogPrefetchIncrement(pg_atomic_uint64 *counter)
 }
 
 /*
+ * Increment a counter that more than one process writes.
+ *
+ * The plain increment above belongs to the startup process alone and is a
+ * read followed by a write, which several writers would lose counts to.  The
+ * replay warm pool has as many writers as it has workers, so it uses this.
+ */
+static inline void
+XLogPrefetchIncrementShared(pg_atomic_uint64 *counter)
+{
+	pg_atomic_fetch_add_u64(counter, 1);
+}
+
+/*
+ * Record what the warm pool found when it served a request: a block already
+ * in a buffer, or one it had to read.
+ */
+void
+XLogPrefetchCountHit(void)
+{
+	XLogPrefetchIncrementShared(&SharedStats->hit);
+}
+
+void
+XLogPrefetchCountPrefetch(void)
+{
+	XLogPrefetchIncrementShared(&SharedStats->prefetch);
+}
+
+/*
  * Create a prefetcher that is ready to begin prefetching blocks referenced by
  * WAL records.
  */
@@ -785,20 +814,19 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			 */
 			if (XLogWarmPoolActive())
 			{
-				Buffer		resident;
 				uint64		request_id;
 				int			slot_no;
 
-				resident = LookupSharedBuffer(reln, block->forknum,
-											  block->blkno);
-				if (BufferIsValid(resident))
-				{
-					/* Cache hit, nothing to do. */
-					XLogPrefetchIncrement(&SharedStats->hit);
-					block->prefetch_buffer = resident;
-					return LRQ_NEXT_NO_IO;
-				}
-
+				/*
+				 * Whether the block is already in a buffer is a question with
+				 * a hash lookup under a partition lock behind it, and three
+				 * references in four answer yes.  Asking it here spends that
+				 * lookup in the one process replay cannot do without, so the
+				 * question goes to the pool along with the block: a worker
+				 * asks it, hands back whichever buffer the answer names, and
+				 * counts it (XLogWarmDoOne()).  Replay ends up with the same
+				 * hint, produced beside it instead of by it.
+				 */
 				slot_no = XLogWarmPublish(block->rlocator, block->forknum,
 										  block->blkno, &request_id);
 				if (slot_no == XLOGWARM_NO_SLOT)
@@ -809,7 +837,6 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 
 				block->warm_slot = slot_no;
 				block->warm_request = request_id;
-				XLogPrefetchIncrement(&SharedStats->prefetch);
 				block->prefetch_buffer = InvalidBuffer;
 				return LRQ_NEXT_IO;
 			}

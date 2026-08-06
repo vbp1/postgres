@@ -1246,9 +1246,11 @@ test_dwb_warm_counters(PG_FUNCTION_ARGS)
 }
 
 /*
- * Pids of the running warm workers.  They hold no database connection, so
- * pg_stat_activity cannot show them; this is how a test finds one to kill
- * and how an operator sees the pool is alive.
+ * Pids of the running warm workers, and the slot each one holds.  They keep
+ * no database connection, so pg_stat_activity cannot show them; this is how
+ * a test finds one to kill, how it finds the one holding a given request,
+ * and how an operator sees the pool is alive.  A worker holding nothing
+ * reports -1.
  */
 PG_FUNCTION_INFO_V1(test_dwb_warm_worker_pids);
 Datum
@@ -1256,18 +1258,20 @@ test_dwb_warm_worker_pids(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	int			pids[XLOGWARM_MAX_WORKERS];
+	int			slots[XLOGWARM_MAX_WORKERS];
 	int			nworkers;
 
 	InitMaterializedSRF(fcinfo, 0);
 
-	nworkers = XLogWarmGetWorkerPids(pids);
+	nworkers = XLogWarmGetWorkerPids(pids, slots);
 	for (int i = 0; i < nworkers; i++)
 	{
-		Datum		values[2];
-		bool		nulls[2] = {0};
+		Datum		values[3];
+		bool		nulls[3] = {0};
 
 		values[0] = Int32GetDatum(i);
 		values[1] = Int32GetDatum(pids[i]);
+		values[2] = Int32GetDatum(slots[i]);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 
@@ -1275,27 +1279,39 @@ test_dwb_warm_worker_pids(PG_FUNCTION_ARGS)
 }
 
 /*
- * What the pool is doing right now: requests waiting for a worker, and
- * requests a worker holds.  The running totals say what has happened; this
- * is what a test needs to catch a request in flight.
+ * What the pool is doing right now: requests waiting for a worker, requests
+ * a worker holds, and what the workers themselves are up to.  The running
+ * totals say what has happened; this is what a test needs to catch a request
+ * in flight, or to wait until the whole pool is asleep.
+ *
+ * The first two come from a walk of the ring, which slots change state
+ * under, so they are an impression rather than an instant.  The last three
+ * are counters and are exact.
  */
 PG_FUNCTION_INFO_V1(test_dwb_warm_slot_states);
 Datum
 test_dwb_warm_slot_states(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[2];
-	bool		nulls[2] = {0};
+	Datum		values[5];
+	bool		nulls[5] = {0};
 	int			published;
 	int			claimed;
+	int			scanners;
+	int			pending;
+	int			sleepers;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
 	XLogWarmGetSlotCounts(&published, &claimed);
+	XLogWarmGetPoolState(&scanners, &pending, &sleepers);
 
 	values[0] = Int32GetDatum(published);
 	values[1] = Int32GetDatum(claimed);
+	values[2] = Int32GetDatum(scanners);
+	values[3] = Int32GetDatum(pending);
+	values[4] = Int32GetDatum(sleepers);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
@@ -1377,6 +1393,44 @@ test_dwb_pin_xact_callback(XactEvent event, void *arg)
 		default:
 			break;
 	}
+}
+
+/*
+ * Hand the pool one request, from here instead of from replay.
+ *
+ * The pool's wakeup protocol is about what happens between a publication and
+ * the workers, and driving it from replay means driving it from a stream of
+ * thousands a second — nothing a test can aim.  This publishes exactly one
+ * request, so a test can set the pool up in a known state and then watch what
+ * a single block does to it.  Meant for a pool that is otherwise idle: the
+ * publisher's slot cursor and request ids are per-process, so a second
+ * publisher alongside a busy replay would be publishing into the same ring
+ * with a cursor of its own.
+ */
+PG_FUNCTION_INFO_V1(test_dwb_warm_publish);
+Datum
+test_dwb_warm_publish(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	BlockNumber blkno = (BlockNumber) PG_GETARG_INT32(1);
+	Relation	rel;
+	RelFileLocator rlocator;
+	uint64		request_id;
+	int			slot_no;
+
+	if (!XLogWarmPoolActive())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the replay warm pool is not configured"),
+				 errhint("Set \"replay_warm_workers\" above 0.")));
+
+	rel = relation_open(relid, AccessShareLock);
+	rlocator = rel->rd_locator;
+	relation_close(rel, NoLock);
+
+	slot_no = XLogWarmPublish(rlocator, MAIN_FORKNUM, blkno, &request_id);
+
+	PG_RETURN_INT32(slot_no);
 }
 
 PG_FUNCTION_INFO_V1(test_dwb_pin_block);

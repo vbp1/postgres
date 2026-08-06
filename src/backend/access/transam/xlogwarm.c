@@ -57,6 +57,7 @@
  */
 #include "postgres.h"
 
+#include "access/xlogprefetcher.h"
 #include "access/xlogwarm.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -129,6 +130,35 @@ typedef struct XLogWarmCtl
 	pg_atomic_uint32 hand;		/* where consumers start scanning */
 
 	/*
+	 * What keeps the publisher from spending a system call per block.
+	 *
+	 * Replay publishes on the order of a hundred thousand blocks a second,
+	 * and a condition variable signal that finds a sleeper costs a kill(2)
+	 * every time.  So the publisher only signals when nobody is looking at
+	 * the ring, and a worker that stops looking hands the ring over in its
+	 * place.  Between them the wakeup happens once per idle pool rather than
+	 * once per block.
+	 *
+	 * scanners counts workers searching the ring, and deliberately not the
+	 * ones inside a page read: a worker in a read cannot take new work, so
+	 * counting it would let one busy worker silence the wakeups for a pool
+	 * that is otherwise asleep.
+	 *
+	 * pending counts published requests nobody has claimed.  It is what a
+	 * searching worker reads instead of walking every slot, and what tells
+	 * the process leaving the ring whether the ring still needs somebody. It
+	 * is raised before its slot becomes visible, so it is never lower than
+	 * the number of published slots and a claimer never takes it below zero;
+	 * the two are equal only when no publication is in flight.
+	 *
+	 * sleepers decides nothing.  It exists so that "the whole pool is asleep"
+	 * is an observable fact from outside the pool.
+	 */
+	pg_atomic_uint32 scanners;
+	pg_atomic_uint32 pending;
+	pg_atomic_uint32 sleepers;
+
+	/*
 	 * Bumped under ReplayWarmReadLock whenever a relation or a database is
 	 * about to lose its files.  A worker has no database connection and so
 	 * receives no cache invalidations: without this it could keep a
@@ -144,12 +174,32 @@ typedef struct XLogWarmCtl
 	 */
 	pg_atomic_uint32 worker_pids[XLOGWARM_MAX_WORKERS];
 
+	/*
+	 * The slot each worker holds, one past its index, or zero for none. A
+	 * request that stops moving belongs to somebody, and this is how the
+	 * owner is found: a worker inside a read that never returns is the one
+	 * case that costs the ring a slot for good, and without this the pid to
+	 * look at is a guess.
+	 */
+	pg_atomic_uint32 worker_slots[XLOGWARM_MAX_WORKERS];
+
 	XLogWarmSlot slots[FLEXIBLE_ARRAY_MEMBER];
 }			XLogWarmCtl;
 
 static XLogWarmCtl * XLogWarmQueue = NULL;
 
+/* one claimed request, in the hands of the worker that claimed it */
+typedef struct XLogWarmRequest
+{
+	XLogWarmSlot *slot;
+	uint64		request_id;
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+}			XLogWarmRequest;
+
 static void XLogWarmWorkerExit(int code, Datum arg);
+static void XLogWarmHandOff(void);
 
 /* publisher-private state */
 static uint64 next_request_id = 1;
@@ -175,18 +225,15 @@ static uint64 my_drop_epoch = 0;
  * the relation" and re-measured for anything else.  Direct-mapped and small
  * on purpose — replay works through a handful of relations at a time.
  */
-#define XLOGWARM_SIZES	16
-
-typedef struct XLogWarmSize
-{
-	RelFileLocator rlocator;
-	ForkNumber	forknum;
-	BlockNumber nblocks;
-	uint64		epoch;
-	bool		valid;
-}			XLogWarmSize;
-
-static XLogWarmSize my_sizes[XLOGWARM_SIZES];
+/*
+ * How long a worker keeps searching an empty ring before it sleeps, in
+ * pg_spin_delay() rounds.  It buys the publisher its silence: a worker that
+ * stays in the search over the gap between two publications is one the
+ * publisher does not have to wake, and at replay's rate those gaps are
+ * microseconds.  Large enough to cover them, small enough that a standby
+ * with nothing to replay settles into sleeping workers within a moment.
+ */
+#define XLOGWARM_SPINS	1000
 
 /*
  * Worker-private: the slot this worker holds, or -1.  Read on the way out to
@@ -194,6 +241,21 @@ static XLogWarmSize my_sizes[XLOGWARM_SIZES];
  * of the ring with it.
  */
 static int	my_claimed_slot = -1;
+
+/*
+ * Worker-private: which of the two shared counts this worker is part of.
+ *
+ * Both are read on the way out.  A worker can be signalled away from either
+ * state, and a count left standing would say the pool has a searcher, or a
+ * sleeper, that no longer exists — the first silences the publisher's
+ * wakeups, the second makes "the whole pool is asleep" untrue where it is
+ * relied upon.
+ */
+static bool my_scanning = false;
+static bool my_sleeping = false;
+
+/* Worker-private: this worker's index in the pool, or -1 outside one. */
+static int	my_worker_id = -1;
 
 Size
 XLogWarmShmemSize(void)
@@ -234,11 +296,17 @@ XLogWarmShmemInit(void)
 		pg_atomic_init_u64(&XLogWarmQueue->vanished, 0);
 		pg_atomic_init_u64(&XLogWarmQueue->discarded, 0);
 		pg_atomic_init_u32(&XLogWarmQueue->hand, 0);
+		pg_atomic_init_u32(&XLogWarmQueue->scanners, 0);
+		pg_atomic_init_u32(&XLogWarmQueue->pending, 0);
+		pg_atomic_init_u32(&XLogWarmQueue->sleepers, 0);
 		XLogWarmQueue->drop_epoch = 0;
 		XLogWarmQueue->capacity = replay_warm_queue_size;
 
 		for (int i = 0; i < XLOGWARM_MAX_WORKERS; i++)
+		{
 			pg_atomic_init_u32(&XLogWarmQueue->worker_pids[i], 0);
+			pg_atomic_init_u32(&XLogWarmQueue->worker_slots[i], 0);
+		}
 
 		for (int i = 0; i < replay_warm_queue_size; i++)
 			pg_atomic_init_u32(&XLogWarmQueue->slots[i].state, XLOGWARM_FREE);
@@ -309,6 +377,13 @@ XLogWarmPublish(RelFileLocator rlocator, ForkNumber forknum,
 	slot->forknum = forknum;
 	slot->blkno = blkno;
 
+	/*
+	 * The count covers the slot before anybody else can see it.  Raising it
+	 * afterwards would let a worker claim the slot and lower a count that had
+	 * not been raised yet, which on an unsigned counter is not a small error.
+	 */
+	pg_atomic_fetch_add_u32(&XLogWarmQueue->pending, 1);
+
 	/* the payload must be visible before a worker can see the state */
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->state, XLOGWARM_PUBLISHED);
@@ -317,7 +392,18 @@ XLogWarmPublish(RelFileLocator rlocator, ForkNumber forknum,
 	publish_hand = (slot_no + 1) % XLogWarmQueue->capacity;
 	pg_atomic_fetch_add_u64(&XLogWarmQueue->published, 1);
 
-	ConditionVariableSignal(&XLogWarmQueue->cv_work);
+	/*
+	 * Somebody already searching the ring will find this request without
+	 * being told, so the signal — and the system call inside it — is only
+	 * for a pool where nobody is.  The barrier is what makes the two sides
+	 * meet: a write barrier would order the publication, but not this load
+	 * against it, and the pairing needs the load to come after.  A worker on
+	 * its way out of the search closes the other half of the window in
+	 * XLogWarmHandOff().
+	 */
+	pg_memory_barrier();
+	if (pg_atomic_read_u32(&XLogWarmQueue->scanners) == 0)
+		ConditionVariableSignal(&XLogWarmQueue->cv_work);
 
 	return slot_no;
 }
@@ -390,7 +476,11 @@ XLogWarmCancelAll(void)
 
 		if (pg_atomic_compare_exchange_u32(&slot->state, &expected,
 										   XLOGWARM_FREE))
+		{
+			/* the request is gone, and so is the need for somebody to take it */
+			pg_atomic_fetch_sub_u32(&XLogWarmQueue->pending, 1);
 			pg_atomic_fetch_add_u64(&XLogWarmQueue->cancelled, 1);
+		}
 	}
 
 	publish_hand = 0;
@@ -444,7 +534,7 @@ XLogWarmCountStale(void)
  * XLOGWARM_MAX_WORKERS entries, returning how many were found.
  */
 int
-XLogWarmGetWorkerPids(int *pids)
+XLogWarmGetWorkerPids(int *pids, int *slots)
 {
 	int			found = 0;
 
@@ -456,7 +546,12 @@ XLogWarmGetWorkerPids(int *pids)
 		uint32		pid = pg_atomic_read_u32(&XLogWarmQueue->worker_pids[i]);
 
 		if (pid != 0)
+		{
+			if (slots != NULL)
+				slots[found] =
+					(int) pg_atomic_read_u32(&XLogWarmQueue->worker_slots[i]) - 1;
 			pids[found++] = (int) pid;
+		}
 	}
 
 	return found;
@@ -504,6 +599,13 @@ XLogWarmGetSlotCounts(int *published, int *claimed)
 	if (XLogWarmQueue == NULL)
 		return;
 
+	/*
+	 * This walk is not a snapshot: slots change state under it, so what it
+	 * returns is what the ring looked like slot by slot rather than at any
+	 * one instant.  Good enough to see a request in flight, and not good
+	 * enough to check a counter against while the pool is working.
+	 */
+
 	for (int i = 0; i < XLogWarmQueue->capacity; i++)
 	{
 		switch (pg_atomic_read_u32(&XLogWarmQueue->slots[i].state))
@@ -521,6 +623,28 @@ XLogWarmGetSlotCounts(int *published, int *claimed)
 }
 
 /*
+ * What the pool's processes are doing right now: how many are searching the
+ * ring, how many requests are waiting for one of them, and how many are
+ * asleep.  Unlike the slot walk above these are single counters, so each is
+ * a real value rather than a scan; "the whole pool is asleep" is a fact a
+ * test can wait for here.
+ */
+void
+XLogWarmGetPoolState(int *scanners, int *pending, int *sleepers)
+{
+	*scanners = 0;
+	*pending = 0;
+	*sleepers = 0;
+
+	if (XLogWarmQueue == NULL)
+		return;
+
+	*scanners = (int) pg_atomic_read_u32(&XLogWarmQueue->scanners);
+	*pending = (int) pg_atomic_read_u32(&XLogWarmQueue->pending);
+	*sleepers = (int) pg_atomic_read_u32(&XLogWarmQueue->sleepers);
+}
+
+/*
  * Read one published block into shared buffers.
  *
  * Runs inside the worker's own resource owner: replay may drop or truncate
@@ -532,7 +656,7 @@ XLogWarmDoOne(XLogWarmSlot * slot, uint64 request_id,
 			  RelFileLocator rlocator, ForkNumber forknum, BlockNumber blkno)
 {
 	SMgrRelation smgr;
-	XLogWarmSize *size;
+	BlockNumber nblocks;
 	Buffer		buffer = InvalidBuffer;
 	uint32		expected;
 	bool		failed = false;
@@ -558,7 +682,6 @@ XLogWarmDoOne(XLogWarmSlot * slot, uint64 request_id,
 		if (XLogWarmQueue->drop_epoch != my_drop_epoch)
 		{
 			smgrreleaseall();
-			memset(my_sizes, 0, sizeof(my_sizes));
 			my_drop_epoch = XLogWarmQueue->drop_epoch;
 		}
 
@@ -570,41 +693,51 @@ XLogWarmDoOne(XLogWarmSlot * slot, uint64 request_id,
 		 * running ahead of it, and the outcome the interlock guarantees for a
 		 * request that gets here after a drop.
 		 *
-		 * Asking outright costs more than it looks: smgrexists() closes the
-		 * fork first (mdexists() skips that only in the startup process) and
-		 * smgrnblocks() then walks the segment chain from the beginning, so
-		 * on a terabyte relation one question is a thousand file opens.  The
-		 * answer is therefore remembered per epoch, and only the first
-		 * request for a fork, or one that lands past a remembered end, pays
-		 * for asking again.
+		 * Asking the file system outright costs more than it looks:
+		 * smgrexists() closes the fork before answering (mdexists() skips
+		 * that only in the startup process) and the smgrnblocks() behind it
+		 * then reopens the segment chain from the beginning, so on a terabyte
+		 * relation one question is a thousand file opens.
+		 *
+		 * The size this worker last saw is therefore taken from the relation
+		 * itself: smgrnblocks() records it there, smgrrelease() clears it,
+		 * and the smgrreleaseall() above is what clears it after a drop.
+		 * Reading the field directly is how the rest of the tree uses it —
+		 * see the comment on smgrnblocks_cached(), whose InRecovery test is
+		 * about the startup process and so never lets a worker in.
 		 */
-		size = &my_sizes[rlocator.relNumber % XLOGWARM_SIZES];
+		nblocks = smgr->smgr_cached_nblocks[forknum];
 
-		if (!size->valid || size->epoch != my_drop_epoch ||
-			size->forknum != forknum ||
-			!RelFileLocatorEquals(size->rlocator, rlocator))
+		if (nblocks == InvalidBlockNumber)
 		{
+			/*
+			 * Nothing known about this fork: either the worker has not
+			 * touched it since the last drop, or it has never touched it at
+			 * all.  This is the one place that pays for the expensive
+			 * question, and it is also the only place that can tell a
+			 * relation whose files are gone from one that is merely shorter
+			 * than the request expects.
+			 */
 			if (!smgrexists(smgr, forknum))
 			{
 				failed = true;
 				pg_atomic_fetch_add_u64(&XLogWarmQueue->vanished, 1);
 			}
 			else
-			{
-				size->rlocator = rlocator;
-				size->forknum = forknum;
-				size->nblocks = smgrnblocks(smgr, forknum);
-				size->epoch = my_drop_epoch;
-				size->valid = true;
-			}
+				nblocks = smgrnblocks(smgr, forknum);
 		}
 
-		if (!failed && blkno >= size->nblocks)
+		if (!failed && blkno >= nblocks)
 		{
-			/* the remembered size may simply predate an extension */
-			size->nblocks = smgrnblocks(smgr, forknum);
+			/*
+			 * The remembered size may simply predate an extension: nothing
+			 * tells a worker that replay has grown a relation, so a known
+			 * size is a lower bound.  mdnblocks() resumes from the last open
+			 * segment, which makes this an lseek rather than another walk.
+			 */
+			nblocks = smgrnblocks(smgr, forknum);
 
-			if (blkno >= size->nblocks)
+			if (blkno >= nblocks)
 			{
 				failed = true;
 				pg_atomic_fetch_add_u64(&XLogWarmQueue->vanished, 1);
@@ -620,14 +753,21 @@ XLogWarmDoOne(XLogWarmSlot * slot, uint64 request_id,
 			/*
 			 * Already resident: not a read, but still the answer replay
 			 * wants, so hand the buffer on as if we had read it.
+			 *
+			 * This is also where that question gets answered for
+			 * pg_stat_recovery_prefetch.  Replay used to ask it before
+			 * publishing and count the answer itself; with the pool running
+			 * it no longer asks, so the count belongs to whoever does.
 			 */
 			pg_atomic_fetch_add_u64(&XLogWarmQueue->hits, 1);
+			XLogPrefetchCountHit();
 		}
 		else
 		{
 			buffer = ReadBufferWithoutRelcache(rlocator, forknum, blkno,
 											   RBM_NORMAL, NULL, true);
 			pg_atomic_fetch_add_u64(&XLogWarmQueue->reads, 1);
+			XLogPrefetchCountPrefetch();
 
 			/*
 			 * Hand the buffer number on and let go: holding pins ahead of
@@ -697,6 +837,34 @@ XLogWarmWorkerExit(int code, Datum arg)
 	if (XLogWarmQueue == NULL)
 		return;
 
+	/*
+	 * Leave the pool's counts, and leave them in the order a live worker
+	 * would.  This callback runs in the before_shmem_exit phase, and the
+	 * teardown that takes a process off a condition variable's wait list
+	 * happens later, in ProcKill(): until then a publisher's signal can still
+	 * land on this process, which is about to stop reading its latch.  So the
+	 * wait list goes first, then the counts, then the hand-off — a searcher
+	 * that leaves without one takes the ring's only promised searcher with
+	 * it.
+	 */
+	if (my_scanning || my_sleeping)
+	{
+		ConditionVariableCancelSleep();
+
+		if (my_sleeping)
+		{
+			pg_atomic_fetch_sub_u32(&XLogWarmQueue->sleepers, 1);
+			my_sleeping = false;
+		}
+		if (my_scanning)
+		{
+			pg_atomic_fetch_sub_u32(&XLogWarmQueue->scanners, 1);
+			my_scanning = false;
+		}
+
+		XLogWarmHandOff();
+	}
+
 	if (my_claimed_slot >= 0)
 	{
 		XLogWarmSlot *slot = &XLogWarmQueue->slots[my_claimed_slot];
@@ -709,54 +877,149 @@ XLogWarmWorkerExit(int code, Datum arg)
 			pg_atomic_fetch_add_u64(&XLogWarmQueue->released, 1);
 	}
 
+	pg_atomic_write_u32(&XLogWarmQueue->worker_slots[worker_id], 0);
 	pg_atomic_write_u32(&XLogWarmQueue->worker_pids[worker_id], 0);
 }
 
 /*
- * Claim and serve one published slot.  Returns false when the ring holds
- * nothing to do.
+ * Claim one published slot.  Returns false when the ring holds nothing to do.
+ *
+ * The caller must be counted in scanners while this runs: that is what tells
+ * a publisher it need not spend a wakeup, and the promise behind it is that
+ * this process looks at the ring after the publication became visible.
  */
 static bool
-XLogWarmServeOne(void)
+XLogWarmClaimOne(XLogWarmRequest * req)
 {
 	int			capacity = XLogWarmQueue->capacity;
-	uint32		start = pg_atomic_fetch_add_u32(&XLogWarmQueue->hand, 1);
+	uint32		start;
+
+	/*
+	 * No request outstanding, and the counter says so without touching a
+	 * slot.  A worker that searched the whole ring every time it looked would
+	 * spend the pool's cores dragging several hundred shared cache lines
+	 * between them, which is what makes waiting here cheap enough to prefer
+	 * to sleeping.
+	 */
+	if (pg_atomic_read_u32(&XLogWarmQueue->pending) == 0)
+		return false;
+
+	start = pg_atomic_fetch_add_u32(&XLogWarmQueue->hand, 1);
 
 	for (int i = 0; i < capacity; i++)
 	{
 		XLogWarmSlot *slot = &XLogWarmQueue->slots[(start + i) % capacity];
 		uint32		expected = XLOGWARM_PUBLISHED;
-		uint64		request_id;
-		RelFileLocator rlocator;
-		ForkNumber	forknum;
-		BlockNumber blkno;
 
 		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected,
 											XLOGWARM_CLAIMED))
 			continue;
 
+		pg_atomic_fetch_sub_u32(&XLogWarmQueue->pending, 1);
+
 		/* the state was observed before the payload it advertises */
 		pg_read_barrier();
 
-		request_id = slot->request_id;
-		rlocator = slot->rlocator;
-		forknum = slot->forknum;
-		blkno = slot->blkno;
+		req->slot = slot;
+		req->request_id = slot->request_id;
+		req->rlocator = slot->rlocator;
+		req->forknum = slot->forknum;
+		req->blkno = slot->blkno;
 
 		/*
 		 * From here until the slot is finished this worker owns it, and says
 		 * so where its exit callback can see it.
 		 */
 		my_claimed_slot = (start + i) % capacity;
+		if (my_worker_id >= 0)
+			pg_atomic_write_u32(&XLogWarmQueue->worker_slots[my_worker_id],
+								(uint32) my_claimed_slot + 1);
 
 		pg_atomic_fetch_add_u64(&XLogWarmQueue->claimed, 1);
-		XLogWarmDoOne(slot, request_id, rlocator, forknum, blkno);
-
-		my_claimed_slot = -1;
 		return true;
 	}
 
 	return false;
+}
+
+/*
+ * Hand the ring over on the way out of the search.
+ *
+ * A publisher that saw this process searching stayed quiet, so a process
+ * that stops searching — to read a page, or for good — has to make sure
+ * somebody else is looking if anything is still outstanding.  Otherwise the
+ * work it was trusted to find would sit in front of a sleeping pool until
+ * the next publication happened to wake somebody.
+ *
+ * Two things must already be true at the call: this process has left the
+ * scanners count, and it is not itself on the wait list — a signal issued
+ * while still registered could pick the signaller and leave the others
+ * asleep.
+ */
+static void
+XLogWarmHandOff(void)
+{
+	/*
+	 * Pairs with the publisher: it publishes and then reads scanners, this
+	 * side leaves scanners and then reads pending, and a full barrier on both
+	 * sides is what guarantees at least one of the two sees the other.
+	 */
+	pg_memory_barrier();
+
+	if (pg_atomic_read_u32(&XLogWarmQueue->pending) > 0 &&
+		pg_atomic_read_u32(&XLogWarmQueue->scanners) == 0)
+		ConditionVariableSignal(&XLogWarmQueue->cv_work);
+}
+
+/*
+ * Stop and start searching, as the states above are entered and left.
+ */
+static void
+XLogWarmStopScanning(void)
+{
+	Assert(my_scanning);
+	pg_atomic_fetch_sub_u32(&XLogWarmQueue->scanners, 1);
+	my_scanning = false;
+	XLogWarmHandOff();
+}
+
+static void
+XLogWarmStartScanning(void)
+{
+	Assert(!my_scanning);
+	pg_atomic_fetch_add_u32(&XLogWarmQueue->scanners, 1);
+	my_scanning = true;
+}
+
+/*
+ * Serve a claimed request and go back to searching.
+ */
+static void
+XLogWarmServe(XLogWarmRequest * req)
+{
+	XLogWarmDoOne(req->slot, req->request_id, req->rlocator, req->forknum,
+				  req->blkno);
+	my_claimed_slot = -1;
+	if (my_worker_id >= 0)
+		pg_atomic_write_u32(&XLogWarmQueue->worker_slots[my_worker_id], 0);
+}
+
+/*
+ * Leave the search to serve what this worker just claimed, then rejoin it.
+ *
+ * The injection point catches a worker in the state the hand-off exists for:
+ * holding a request, and still counted as a searcher, so a publication
+ * landing now is one the publisher will leave to this process.  It is safe
+ * to park here — the worker is not on the pool's wait list at this point, so
+ * the waiting the injection point does of its own cannot disturb it.
+ */
+static void
+XLogWarmServeAsScanner(XLogWarmRequest * req)
+{
+	INJECTION_POINT("replay-warm-claimed", NULL);
+	XLogWarmStopScanning();
+	XLogWarmServe(req);
+	XLogWarmStartScanning();
 }
 
 /*
@@ -834,11 +1097,18 @@ XLogWarmWorkerMain(Datum main_arg)
 
 	worker_id = DatumGetInt32(main_arg);
 	Assert(worker_id >= 0 && worker_id < XLOGWARM_MAX_WORKERS);
+	my_worker_id = worker_id;
 	pg_atomic_write_u32(&XLogWarmQueue->worker_pids[worker_id], MyProcPid);
 	before_shmem_exit(XLogWarmWorkerExit, Int32GetDatum(worker_id));
 
+	/* this process is searching the ring from here on */
+	XLogWarmStartScanning();
+
 	for (;;)
 	{
+		XLogWarmRequest req;
+		int			spins;
+
 		/* the CFI is what turns a pending die() into the FATAL exit */
 		CHECK_FOR_INTERRUPTS();
 
@@ -848,24 +1118,72 @@ XLogWarmWorkerMain(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		if (!XLogWarmServeOne())
+		if (XLogWarmClaimOne(&req))
 		{
-			/*
-			 * Sleep without losing a wakeup: get onto the wait list first,
-			 * then recheck, then sleep.  A signal sent after the recheck is
-			 * kept by the prepared state; a request published before it is
-			 * seen by the recheck.
-			 */
-			ConditionVariablePrepareToSleep(&XLogWarmQueue->cv_work);
-			if (!XLogWarmServeOne())
-			{
-				ConditionVariableSleep(&XLogWarmQueue->cv_work,
-									   WAIT_EVENT_REPLAY_WARM_MAIN);
-				continue;
-			}
+			XLogWarmServeAsScanner(&req);
+			continue;
 		}
 
-		/* off the wait list while serving (no-op if never prepared) */
+		/*
+		 * Nothing to do this instant, which at replay's publication rate
+		 * usually means "not yet" rather than "not at all".  Stay in the
+		 * search for a while: a worker that is still counted is a worker the
+		 * publisher does not have to wake, and the whole point of the counts
+		 * is to keep that system call out of replay's way.  The budget is
+		 * small enough that an idle standby settles into sleeping workers
+		 * rather than spinning ones.
+		 */
+		for (spins = XLOGWARM_SPINS; spins > 0; spins--)
+		{
+			if (pg_atomic_read_u32(&XLogWarmQueue->pending) > 0)
+				break;
+			pg_spin_delay();
+		}
+
+		if (spins > 0 && XLogWarmClaimOne(&req))
+		{
+			XLogWarmServeAsScanner(&req);
+			continue;
+		}
+
+		/*
+		 * Give up and sleep, without losing a wakeup: join the wait list
+		 * first, then leave the searchers, then recheck.  In that order a
+		 * publisher that reads no searchers is reading about a process that
+		 * is already waiting, and a publisher that reads one is reading about
+		 * a process that has yet to look again.
+		 */
+		ConditionVariablePrepareToSleep(&XLogWarmQueue->cv_work);
+		pg_atomic_fetch_sub_u32(&XLogWarmQueue->scanners, 1);
+		my_scanning = false;
+
+		if (XLogWarmClaimOne(&req))
+		{
+			/* leave the wait list before the hand-off can pick this process */
+			ConditionVariableCancelSleep();
+			XLogWarmHandOff();
+			XLogWarmServe(&req);
+			XLogWarmStartScanning();
+			continue;
+		}
+
+		pg_atomic_fetch_add_u32(&XLogWarmQueue->sleepers, 1);
+		my_sleeping = true;
+
+		ConditionVariableSleep(&XLogWarmQueue->cv_work,
+							   WAIT_EVENT_REPLAY_WARM_MAIN);
+
+		/*
+		 * ConditionVariableSleep() puts this process back on the wait list
+		 * before it returns, so become a searcher while still registered:
+		 * between the two counts there must be no moment where this process
+		 * is neither searching nor waiting, or a publisher could look at that
+		 * moment and decide the ring needs nobody.
+		 */
+		pg_atomic_fetch_sub_u32(&XLogWarmQueue->sleepers, 1);
+		my_sleeping = false;
+		pg_atomic_fetch_add_u32(&XLogWarmQueue->scanners, 1);
+		my_scanning = true;
 		ConditionVariableCancelSleep();
 	}
 }

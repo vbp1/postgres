@@ -395,6 +395,249 @@ SKIP:
 	pass('the pool restored its worker');
 }
 
+# --- the wakeup protocol ------------------------------------------------
+
+# Replay publishes on the order of a hundred thousand blocks a second, and
+# waking a worker for each of them costs a system call each time.  So the
+# publisher stays quiet while somebody is searching the ring, and a worker
+# that stops searching hands the ring on in its place.  Driving that from
+# replay would mean driving it thousands of requests at a time; these
+# scenarios hand the pool one request at a time instead.
+
+my $proto = make_standby('warm_proto', 2);
+$proto->start;
+$proto->poll_query_until('postgres',
+	'SELECT count(*) = 2 FROM test_dwb_warm_worker_pids()')
+  or die 'timed out waiting for the protocol standby to start its workers';
+$primary->wait_for_catchup($proto, 'replay');
+
+sub pool_state
+{
+	my ($node) = @_;
+	my %s;
+	@s{qw(published claimed scanners pending sleepers)} = split /\|/,
+	  $node->safe_psql('postgres',
+		'SELECT * FROM test_dwb_warm_slot_states()');
+	return \%s;
+}
+
+# With nothing being replayed the pool has nothing to search for, and the
+# spin that keeps a busy worker out of the wait list runs out.
+$proto->poll_query_until('postgres',
+	'SELECT sleepers = 2 AND scanners = 0 FROM test_dwb_warm_slot_states()')
+  or die 'the idle pool never settled into sleeping workers';
+pass('an idle pool settles into sleeping workers');
+
+# Quiesced, the count and the ring agree.  Under load they need not: a
+# publication raises the count before its slot becomes visible, so the count
+# leads by whatever is in flight, and the ring walk is not a snapshot anyway.
+my $quiet = pool_state($proto);
+is($quiet->{pending}, $quiet->{published},
+	'the pending count matches the published slots with the pool quiesced');
+
+# The edge a lost wakeup would show at: a request arriving at a pool where
+# nobody is searching has to be one the publisher wakes somebody for.
+my $idle_before = warm_counters($proto);
+my $pf_before = $proto->safe_psql('postgres',
+	q{SELECT prefetch || ' ' || hit FROM pg_stat_recovery_prefetch});
+my ($pf_prefetch, $pf_hit) = split / /, $pf_before;
+
+my $slot =
+  $proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 0)");
+cmp_ok($slot, '>=', 0, 'the published request got a slot');
+$proto->poll_query_until('postgres',
+	"SELECT claimed > $idle_before->{claimed} FROM test_dwb_warm_counters()")
+  or die 'a request published to a sleeping pool was never claimed';
+pass('a request published to a sleeping pool is served');
+
+# Whether a block was already in a buffer is decided in the pool now, and
+# pg_stat_recovery_prefetch is where that decision has always been counted.
+# The block above was not resident, so it was read; asking for the same block
+# again is the other answer.
+$proto->poll_query_until('postgres',
+	"SELECT prefetch > $pf_prefetch FROM pg_stat_recovery_prefetch")
+  or die 'the view did not count the page the pool read';
+pass('the view counts a page the pool read');
+
+$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 0)");
+$proto->poll_query_until('postgres',
+	"SELECT hit > $pf_hit FROM pg_stat_recovery_prefetch")
+  or die 'the view did not count the page the pool found resident';
+pass('the view counts a page the pool found already in a buffer');
+
+# A worker can be signalled away while it sleeps, and the count it is part of
+# has to go with it: the decrement that follows the sleep never runs in that
+# case, and a count left standing says the pool has a sleeper it does not
+# have — which is the very fact the scenarios above wait on.
+$proto->poll_query_until('postgres',
+	'SELECT sleepers = 2 FROM test_dwb_warm_slot_states()')
+  or die 'the pool did not settle before the worker was killed; state: '
+  . $proto->safe_psql('postgres', 'SELECT * FROM test_dwb_warm_slot_states()')
+  . ' workers: '
+  . $proto->safe_psql(
+	'postgres',
+	q{SELECT string_agg(worker || ':' || pid || ':' || holding, ',')
+	  FROM test_dwb_warm_worker_pids()});
+
+my $doomed = $proto->safe_psql('postgres',
+	'SELECT pid FROM test_dwb_warm_worker_pids() ORDER BY worker LIMIT 1');
+kill 'TERM', $doomed;
+
+$proto->poll_query_until('postgres',
+	'SELECT count(*) = 2 FROM test_dwb_warm_worker_pids()')
+  or die 'the protocol standby did not restore its worker';
+$proto->poll_query_until('postgres',
+	'SELECT sleepers = 2 FROM test_dwb_warm_slot_states()')
+  or die 'a worker killed in its sleep left its count behind; state: '
+  . $proto->safe_psql('postgres',
+	'SELECT * FROM test_dwb_warm_slot_states()');
+pass('a worker killed in its sleep leaves no count behind');
+
+# The pool still works afterwards, which is what the counts are for.
+my $after_kill = warm_counters($proto);
+$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 4)");
+$proto->poll_query_until('postgres',
+	"SELECT claimed > $after_kill->{claimed} FROM test_dwb_warm_counters()")
+  or die 'the pool stopped serving after losing a sleeping worker';
+pass('the pool serves again after losing a sleeping worker');
+
+SKIP:
+{
+	skip 'injection points not supported by this build', 3
+	  unless $injection_points;
+
+	# Park a worker where it holds a request and still counts as a searcher.
+	# Everything published while it sits there is something the publisher
+	# leaves to it, so the only way the rest of the ring gets served is if
+	# that worker hands the ring on when it stops searching.
+	$proto->safe_psql('postgres',
+		"SELECT injection_points_attach('replay-warm-claimed', 'wait')");
+	$proto->poll_query_until('postgres',
+		'SELECT sleepers = 2 FROM test_dwb_warm_slot_states()')
+	  or die 'the pool did not go back to sleep before the hand-off scenario';
+
+	$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 1)");
+	$proto->poll_query_until(
+		'postgres',
+		'SELECT scanners = 1 AND sleepers = 1 AND claimed = 1
+		 FROM test_dwb_warm_slot_states()')
+	  or die 'no worker parked holding a request; state: '
+	  . $proto->safe_psql('postgres',
+		'SELECT * FROM test_dwb_warm_slot_states()');
+	pass('a worker parks holding a request, still counted as a searcher');
+
+	$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 2)");
+	$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 3)");
+
+	# Two requests, one searcher the publisher trusted, and a worker asleep
+	# that was told nothing.
+	is( $proto->safe_psql(
+			'postgres', 'SELECT pending FROM test_dwb_warm_slot_states()'),
+		2,
+		'requests wait while the publisher leaves them to the searcher');
+
+	# Let the parked worker go, but leave the point attached: it takes one
+	# of the two waiting requests and parks again.  The other one can only
+	# be served by the worker that is asleep, and nothing has woken it but
+	# the hand-off.
+	$proto->safe_psql('postgres',
+		"SELECT injection_points_wakeup('replay-warm-claimed')");
+	$proto->poll_query_until('postgres',
+		'SELECT pending = 0 FROM test_dwb_warm_slot_states()')
+	  or die 'the worker leaving the search did not hand the ring on; state: '
+	  . $proto->safe_psql('postgres',
+		'SELECT * FROM test_dwb_warm_slot_states()');
+	pass('a worker leaving the search hands the ring to a sleeping one');
+
+	# Let the parked workers out and put the pool back to sleep before the
+	# next scenario builds its own state.
+	$proto->safe_psql('postgres',
+		"SELECT injection_points_detach('replay-warm-claimed')");
+	# "Nobody is holding a request" is not the same as "nobody is parked":
+	# a detached point can still be reached by a worker that looked it up a
+	# moment earlier, so a loop that stops at the first idle instant can
+	# leave the next claim parked with nothing left to wake it.  Waiting for
+	# the pool to be asleep is the state that cannot be a gap between two
+	# claims.
+	foreach my $attempt (1 .. 600)
+	{
+		last
+		  if $proto->safe_psql(
+			'postgres',
+			'SELECT claimed = 0 AND sleepers = 2
+			 FROM test_dwb_warm_slot_states()') eq 't';
+		$proto->psql('postgres',
+			"SELECT injection_points_wakeup('replay-warm-claimed')");
+		usleep(100_000);
+	}
+	$proto->poll_query_until('postgres',
+		'SELECT claimed = 0 AND sleepers = 2 FROM test_dwb_warm_slot_states()'
+	  )
+	  or die 'workers stayed parked after the point was detached; state: '
+	  . $proto->safe_psql('postgres',
+		'SELECT * FROM test_dwb_warm_slot_states()');
+	$proto->poll_query_until('postgres',
+		'SELECT sleepers = 2 AND pending = 0 FROM test_dwb_warm_slot_states()'
+	) or die 'the pool did not settle before the dying-searcher scenario';
+
+	# The same hand-off from the other side: the searcher the publisher
+	# trusted does not stop searching, it dies.  Whatever it was trusted to
+	# find has to be picked up by the worker asleep beside it, and the only
+	# thing that can tell that worker is the exit path.
+	#
+	# The point stays attached on purpose.  The dying worker is replaced
+	# within a second, and a replacement free to drain the ring would hide a
+	# missing hand-off: it parks on its first claim instead, so of the two
+	# requests waiting it can take only one, and the other is left where
+	# nothing but the hand-off reaches it.
+	$proto->safe_psql('postgres',
+		"SELECT injection_points_attach('replay-warm-claimed', 'wait')");
+	$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 5)");
+	$proto->poll_query_until('postgres',
+		'SELECT scanners = 1 AND claimed = 1 FROM test_dwb_warm_slot_states()'
+	) or die 'no worker parked for the dying-searcher scenario';
+
+	$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 6)");
+	$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 7)");
+
+	# The workers advertise which slot each of them holds, so the one to end
+	# is the one parked rather than the one asleep.
+	my $victim = $proto->safe_psql('postgres',
+		'SELECT pid FROM test_dwb_warm_worker_pids() WHERE holding >= 0');
+	like($victim, qr/^\d+$/, 'exactly one worker is holding a request');
+	kill 'TERM', $victim;
+
+	$proto->poll_query_until('postgres',
+		'SELECT pending = 0 FROM test_dwb_warm_slot_states()')
+	  or die 'a searcher that died did not hand the ring on; state: '
+	  . $proto->safe_psql('postgres',
+		'SELECT * FROM test_dwb_warm_slot_states()');
+	pass('a searcher that dies hands the ring to a sleeping worker');
+
+	# Nobody is woken from here on, and nothing below needs a worker to
+	# move.  The worker killed above was waiting at the point, and a waiter
+	# that dies leaves its registration behind: a wakeup goes to the first
+	# registration under that name, so it would keep going to a process that
+	# no longer exists.  This node is finished after the check below.
+	$proto->safe_psql('postgres',
+		"SELECT injection_points_detach('replay-warm-claimed')");
+
+	# A worker died holding a request, which is one of the two ways a
+	# published request leaves the ring without a claim behind it.
+	$proto->poll_query_until('postgres',
+		'SELECT count(*) = 2 FROM test_dwb_warm_worker_pids()')
+	  or die 'the pool did not come back after the dying-searcher scenario';
+	$proto->poll_query_until('postgres',
+		'SELECT pending = published FROM test_dwb_warm_slot_states()')
+	  or die 'the pending count and the ring disagree after a worker died '
+	  . 'holding a request; state: '
+	  . $proto->safe_psql('postgres',
+		'SELECT * FROM test_dwb_warm_slot_states()');
+	pass('the pending count survives a worker dying with a request');
+}
+
+$proto->stop;
+
 # --- the pool on its own, with kernel advice turned off -----------------
 
 my $noadvice =
@@ -412,6 +655,59 @@ cmp_ok($na->{published}, '>', 0,
 cmp_ok($na->{collected}, '>', 0,
 	'replay collects the pool answers with the advice prefetcher off');
 $noadvice->stop;
+
+# --- a relation that grew after a worker learned its size ---------------
+
+# The size a worker goes by is the one the storage manager recorded when it
+# last asked, and nothing tells a worker that replay has extended a
+# relation.  A request past the end it knows must therefore make it ask
+# again rather than refuse on what it remembers.
+#
+# The remembered size belongs to the process that asked, so this runs with
+# a single worker: with more of them the second half could land in a
+# process that never saw the first and would pass without asking anything.
+my $onework = make_standby('warm_onework', 1);
+$onework->start;
+$onework->poll_query_until('postgres',
+	'SELECT count(*) = 1 FROM test_dwb_warm_worker_pids()')
+  or die 'timed out waiting for the single warm worker to start';
+$primary->wait_for_catchup($onework, 'replay');
+
+my $past = $onework->safe_psql('postgres',
+	q{SELECT (pg_relation_size('t') / current_setting('block_size')::int)::int}
+);
+
+my $before = warm_counters($onework);
+$onework->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', $past)");
+$onework->poll_query_until('postgres',
+	"SELECT vanished > $before->{vanished} FROM test_dwb_warm_counters()")
+  or die 'a request past the end of a relation was not refused';
+pass('a block past the end of a relation is refused');
+
+$primary->safe_psql('postgres',
+	q{INSERT INTO t SELECT g, repeat('z', 200) FROM generate_series(40001, 60000) g}
+);
+$primary->wait_for_catchup($onework, 'replay');
+
+cmp_ok(
+	$onework->safe_psql(
+		'postgres',
+		q{SELECT (pg_relation_size('t') / current_setting('block_size')::int)::int}
+	),
+	'>', $past,
+	'the relation grew past the refused block');
+
+$before = warm_counters($onework);
+$onework->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', $past)");
+$onework->poll_query_until(
+	'postgres',
+	"SELECT hits + reads > @{[ $before->{hits} + $before->{reads} ]}
+	 FROM test_dwb_warm_counters()")
+  or die 'the worker went by the size it learned before the relation grew; '
+  . 'counters: '
+  . $onework->safe_psql('postgres', 'SELECT * FROM test_dwb_warm_counters()');
+pass('a worker asks again for a block past the size it knows');
+$onework->stop;
 
 # --- promotion with requests still outstanding --------------------------
 
@@ -459,6 +755,18 @@ cmp_ok(
 		'postgres', "SELECT count(*) FROM t WHERE filler LIKE 'y%'"),
 	'>', 0,
 	'the promoted node has the replayed data');
+
+# The end of recovery withdraws every request nobody claimed, which is the
+# other way the count of outstanding requests goes down without a claim
+# behind it.  A withdrawal that forgot the count would leave the pool
+# claiming to owe work it has thrown away.
+$standby->poll_query_until('postgres',
+	'SELECT pending = published FROM test_dwb_warm_slot_states()')
+  or die 'the pending count and the ring disagree after promotion withdrew '
+  . 'the outstanding requests; state: '
+  . $standby->safe_psql('postgres',
+	'SELECT * FROM test_dwb_warm_slot_states()');
+pass('the pending count comes down with the requests promotion withdraws');
 
 $standby->stop;
 $primary->stop;

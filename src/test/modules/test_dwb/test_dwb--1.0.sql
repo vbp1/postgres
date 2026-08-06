@@ -125,11 +125,17 @@ CREATE FUNCTION test_dwb_count_rel_buffers(relnumber oid)
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
 CREATE FUNCTION test_dwb_warm_slot_states(
-	OUT published int, OUT claimed int)
+	OUT published int, OUT claimed int,
+	OUT scanners int, OUT pending int, OUT sleepers int)
 	RETURNS record STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE FUNCTION test_dwb_warm_worker_pids(OUT worker int, OUT pid int)
+CREATE FUNCTION test_dwb_warm_publish(rel regclass, blkno int)
+	RETURNS int STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_warm_worker_pids(
+	OUT worker int, OUT pid int, OUT holding int)
 	RETURNS SETOF record
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
