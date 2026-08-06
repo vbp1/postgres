@@ -18,3 +18,9 @@ and data checksums enabled, converted from the same reference cluster.
   the run at 750 connections against a synchronous standby, vanilla
   against DWB with the replay warm pool (`replay_warm_workers = 12`).
   The vanilla run is 900 s, the pool run 600 s.
+* `repl2-tps-sockets.png`, `repl2-time-tps.png`, `repl2-time-lat.png` —
+  the two-host grid: the primary owns 1, 2 or 4 whole NUMA sockets of a
+  240-thread host, the synchronous standby has a second host to itself,
+  and the link between them is a real 100 GbE hop (RTT 0.126 ms).  The
+  bar chart is throughput per socket count; the two line charts follow
+  the two-socket point over its 600 s run.
