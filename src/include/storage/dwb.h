@@ -72,13 +72,31 @@ extern PGDLLIMPORT int dwb_cleaner_workers;
 extern PGDLLIMPORT int dwb_retire_sync_method;
 extern PGDLLIMPORT int dwb_batch_timeout_ms;
 extern PGDLLIMPORT int dwb_retire_interval_ms;
-extern PGDLLIMPORT bool dwb_writeback;
+extern PGDLLIMPORT int dwb_writeback_after;
 extern PGDLLIMPORT int dwb_slow_warn_ms;
 extern PGDLLIMPORT int dwb_slot_stuck_timeout_ms;
 extern PGDLLIMPORT int dwb_write_timeout_ms;
 extern PGDLLIMPORT int dwb_on_stall;
 
 #define DWBIsEnabled() (io_torn_pages_protection == DWB_PROTECT_DOUBLE_WRITES)
+
+/*
+ * Does a page write retire its own batch inline?  Without a retire pool
+ * DWBFinishPageWrite fsyncs before it returns (see dwb.c), so a writeback
+ * hint that is still sitting in a pending array when it is called has already
+ * missed its purpose.  Callers hand the page to the kernel there and then.
+ * Requires miscadmin.h for IsUnderPostmaster.
+ */
+#define DWBRetiresInline() (dwb_retire_workers == 0 || !IsUnderPostmaster)
+
+/*
+ * Blocks a process accumulates before it hands the double write buffer's
+ * writeback hints to the kernel.  The same count as the checkpointer's
+ * default, for the same reason: the hint is worth starting early, and worth
+ * starting in block order, but not worth a syscall per page.  Like that one
+ * it is a block count, so what it is worth in bytes follows BLCKSZ.
+ */
+#define DEFAULT_DWB_WRITEBACK_AFTER		32
 
 /*
  * Compile-time capacity limits (GUC maxima).  Statically sized arrays

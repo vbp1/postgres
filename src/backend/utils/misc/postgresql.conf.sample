@@ -264,7 +264,7 @@
 					# default there), fsync elsewhere
 #dwb_batch_timeout_ms = 10ms		# force-seal an open batch after this time
 #dwb_retire_interval_ms = 50ms		# retire worker cycle
-#dwb_writeback = on			# start kernel writeback after batch writes
+#dwb_writeback_after = 32		# measured in pages, 0 disables
 #dwb_slow_warn_ms = 5s			# throttle non-critical writers after this wait
 #dwb_slot_stuck_timeout_ms = 30s	# PANIC on stuck batch coverage
 #dwb_write_timeout_ms = 60s		# apply dwb_on_stall after this wait

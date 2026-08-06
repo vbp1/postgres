@@ -1184,7 +1184,7 @@ DWBFinishPageWrite(const DWBSlotRef *ref)
 {
 	DWBReleaseSlot(ref);
 
-	if (dwb_retire_workers == 0 || !IsUnderPostmaster)
+	if (DWBRetiresInline())
 		(void) DWBRetireAllSync();
 }
 

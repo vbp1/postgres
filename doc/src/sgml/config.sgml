@@ -3669,20 +3669,55 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
-     <varlistentry id="guc-dwb-writeback" xreflabel="dwb_writeback">
-      <term><varname>dwb_writeback</varname> (<type>boolean</type>)
+     <varlistentry id="guc-dwb-writeback-after" xreflabel="dwb_writeback_after">
+      <term><varname>dwb_writeback_after</varname> (<type>integer</type>)
       <indexterm>
-       <primary><varname>dwb_writeback</varname> configuration parameter</primary>
+       <primary><varname>dwb_writeback_after</varname> configuration parameter</primary>
       </indexterm>
       </term>
       <listitem>
        <para>
-        When on, the server asks the kernel to start writing data pages
-        back to disk right after their double write, so that the eventual
-        retirement <function>fsync</function> finds the data already on its
-        way and acts as a cheap barrier rather than a full flush.  Has no
-        effect on platforms without such a request.  The default is
-        <literal>on</literal>.
+        Whenever a process has written this many data pages through the
+        double write buffer, it asks the kernel to start writing them back to
+        disk.  The synchronization that eventually retires their batch (see
+        <xref linkend="guc-dwb-retire-sync-method"/>) is then more likely to
+        find the data already on its way, and to cost closer to a barrier
+        than to a full flush.  The pending pages are handed over in block
+        order, and neighbouring ones as a single request.  Has no effect on
+        platforms without such a request.
+       </para>
+       <para>
+        This is pacing, not ordering: a page waits in its process until the
+        count is reached, so a batch may well be retired before the kernel
+        has heard about the pages in it.  Raising the value trades away more
+        of that overlap for fewer requests.  The exception is a server
+        running without retire workers (<xref linkend="guc-dwb-retire-workers"/>
+        set to <literal>0</literal>), where a page write retires its own
+        batch before returning: there the pending pages are handed over at
+        every such write, so any positive value behaves as
+        <literal>1</literal> — and so, for pages the double write buffer
+        stages, do <xref linkend="guc-checkpoint-flush-after"/> and
+        <xref linkend="guc-bgwriter-flush-after"/>.
+       </para>
+       <para>
+        This parameter governs the pages the double write buffer stages on
+        paths that have no writeback pacing of their own — above all the
+        eviction a backend performs to make room for a page it needs.  Pages
+        written by the checkpointer and the background writer keep following
+        <xref linkend="guc-checkpoint-flush-after"/> and
+        <xref linkend="guc-bgwriter-flush-after"/>.  When a backend evicts a
+        page the double write buffer does not stage, such as a page of an
+        unlogged relation, that page keeps following
+        <xref linkend="guc-backend-flush-after"/>.
+       </para>
+       <para>
+        If this value is specified without units, it is taken as blocks, that
+        is <symbol>BLCKSZ</symbol> bytes, typically 8kB.  The valid range is
+        between <literal>0</literal>, which disables the double write buffer's
+        own writeback, and <literal>2MB</literal>.  The default is
+        <literal>256kB</literal> on all platforms.  (If <symbol>BLCKSZ</symbol>
+        is not 8kB, the default and maximum values scale proportionally to
+        it.)
         This parameter can only be set in the <filename>postgresql.conf</filename>
         file or on the server command line.
        </para>

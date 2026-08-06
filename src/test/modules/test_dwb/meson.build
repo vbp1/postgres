@@ -58,6 +58,7 @@ tests += {
       't/019_autovacuum_class.pl',
       't/020_ckpt_yield.pl',
       't/021_replay_warm.pl',
+      't/022_writeback_pacing.pl',
     ],
   },
 }

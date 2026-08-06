@@ -38,6 +38,7 @@
 #include "storage/smgr.h"
 #include "storage/sync.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
@@ -45,6 +46,69 @@
 #include "varatt.h"
 
 PG_MODULE_MAGIC;
+
+/*
+ * Ordering watch for the inline-retirement path.
+ *
+ * Without a retire pool a page write makes its own batch durable before it
+ * returns, so the kernel writeback the double write buffer wants started
+ * ahead of that sync has to leave the pending array first.  The callback
+ * fires in whichever process is doing the writing — a client backend for
+ * FlushBuffer, the checkpointer or the background writer for the bin path —
+ * and is handed the very context that process queued into, so it reports
+ * through the server log rather than through memory the test session could
+ * read: one line the first time it runs in a process, and a warning every
+ * time something was still queued, which is the ordering mistake a later
+ * edit could reintroduce.
+ */
+#ifdef USE_INJECTION_POINTS
+PGDLLEXPORT void test_dwb_inline_retire_cb(const char *name,
+										   const void *private_data,
+										   void *arg);
+
+void
+test_dwb_inline_retire_cb(const char *name, const void *private_data, void *arg)
+{
+	static bool announced = false;
+	WritebackContext *wb_context = (WritebackContext *) arg;
+
+	if (!announced)
+	{
+		announced = true;
+		elog(LOG, "dwb-inline-retire watch armed in %s",
+			 GetBackendTypeDesc(MyBackendType));
+	}
+
+	if (wb_context != NULL && wb_context->nr_pending > 0)
+		elog(WARNING, "dwb-inline-retire: %d writebacks still queued",
+			 wb_context->nr_pending);
+}
+#endif
+
+PG_FUNCTION_INFO_V1(test_dwb_watch_inline_retire);
+Datum
+test_dwb_watch_inline_retire(PG_FUNCTION_ARGS)
+{
+#ifdef USE_INJECTION_POINTS
+	InjectionPointAttach("dwb-inline-retire", "test_dwb",
+						 "test_dwb_inline_retire_cb", NULL, 0);
+	PG_RETURN_VOID();
+#else
+	elog(ERROR, "injection points are not supported by this build");
+#endif
+}
+
+PG_FUNCTION_INFO_V1(test_dwb_unwatch_inline_retire);
+Datum
+test_dwb_unwatch_inline_retire(PG_FUNCTION_ARGS)
+{
+#ifdef USE_INJECTION_POINTS
+	(void) InjectionPointDetach("dwb-inline-retire");
+	PG_RETURN_VOID();
+#else
+	elog(ERROR, "injection points are not supported by this build");
+#endif
+}
 
 static void
 check_dwb_enabled(void)

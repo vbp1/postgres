@@ -144,3 +144,11 @@ CREATE FUNCTION test_dwb_unpin_block()
 CREATE FUNCTION test_dwb_enqueue_block(rel regclass, blkno int)
 	RETURNS bool STRICT
 	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_watch_inline_retire()
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_dwb_unwatch_inline_retire()
+	RETURNS void STRICT
+	AS 'MODULE_PATHNAME' LANGUAGE C;

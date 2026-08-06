@@ -1223,16 +1223,6 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
-		{"dwb_writeback", PGC_SIGHUP, WAL_SETTINGS,
-			gettext_noop("Starts kernel writeback of data pages right after a double write buffer write."),
-			gettext_noop("Makes the retire fsync a cheap barrier instead of a full flush.")
-		},
-		&dwb_writeback,
-		true,
-		NULL, NULL, NULL
-	},
-
-	{
 		{"wal_log_hints", PGC_POSTMASTER, WAL_SETTINGS,
 			gettext_noop("Writes full pages to WAL when first modified after a checkpoint, even for a non-critical modification."),
 			NULL
@@ -3164,6 +3154,19 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&checkpoint_flush_after,
 		DEFAULT_CHECKPOINT_FLUSH_AFTER, 0, WRITEBACK_MAX_PENDING_FLUSHES,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dwb_writeback_after", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Number of pages the double write buffer accumulates before starting kernel writeback of them."),
+			gettext_noop("Lets the sync that retires a batch cost closer to a barrier than to a full flush. "
+						 "0 disables the double write buffer's own writeback; the checkpointer "
+						 "and the background writer keep using their own parameters."),
+			GUC_UNIT_BLOCKS
+		},
+		&dwb_writeback_after,
+		DEFAULT_DWB_WRITEBACK_AFTER, 0, WRITEBACK_MAX_PENDING_FLUSHES,
 		NULL, NULL, NULL
 	},
 

@@ -63,6 +63,7 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#include "utils/injection_point.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
@@ -539,8 +540,9 @@ static inline BufferDesc *BufferAlloc(SMgrRelation smgr,
 static bool AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress);
 static void CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete);
 static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
-static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
-						IOObject io_object, IOContext io_context);
+static bool FlushBuffer(BufferDesc *buf, SMgrRelation reln,
+						IOObject io_object, IOContext io_context,
+						WritebackContext *wb_context);
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
 									   BlockNumber nForkBlock,
@@ -2387,6 +2389,7 @@ GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 	Buffer		buf;
 	uint32		buf_state;
 	bool		from_ring;
+	bool		staged;
 
 	/*
 	 * Ensure, while the spinlock's not yet held, that there's a free refcount
@@ -2480,11 +2483,17 @@ again:
 		}
 
 		/* OK, do the I/O */
-		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
+		staged = FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context,
+							 &DwbWritebackContext);
 		LWLockRelease(content_lock);
 
-		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
-									  &buf_hdr->tag);
+		/*
+		 * A staged page has already been scheduled, paced by the double write
+		 * buffer's own parameter; only the rest is ours to pace.
+		 */
+		if (!staged)
+			ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
+										  &buf_hdr->tag);
 	}
 
 
@@ -4196,6 +4205,7 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	int			result = 0;
 	uint32		buf_state;
 	BufferTag	tag;
+	bool		staged;
 
 	/* Make sure we can handle the pin */
 	ReservePrivateRefCountEntry();
@@ -4238,7 +4248,8 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	PinBuffer_Locked(bufHdr);
 	LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	staged = FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+						 wb_context);
 
 	LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 
@@ -4248,9 +4259,11 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 
 	/*
 	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so
-	 * IOContext will always be IOCONTEXT_NORMAL.
+	 * IOContext will always be IOCONTEXT_NORMAL.  A staged page went into the
+	 * same context already, before its batch could retire.
 	 */
-	ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
+	if (!staged)
+		ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
 
 	return result | BUF_WRITTEN;
 }
@@ -4462,9 +4475,14 @@ FlushBufferBin(const int *buf_ids, int nbuf, bool opportunistic,
 			pgstat_count_io_op_time(IOOBJECT_RELATION, IOCONTEXT_NORMAL,
 									IOOP_WRITE, io_start, 1, BLCKSZ);
 
-			if (dwb_writeback)
-				smgrwriteback(reln, BufTagGetForkNum(&bufHdr->tag),
-							  bufHdr->tag.blockNum, 1);
+			/* queue, and where the retirement is inline also issue */
+			tag = bufHdr->tag;
+			ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
+			if (DWBRetiresInline())
+			{
+				IssuePendingWritebacks(wb_context, IOCONTEXT_NORMAL);
+				INJECTION_POINT("dwb-inline-retire", wb_context);
+			}
 			DWBFinishPageWrite(&refs[i]);
 
 			pgBufferUsage.shared_blks_written++;
@@ -4478,10 +4496,8 @@ FlushBufferBin(const int *buf_ids, int nbuf, bool opportunistic,
 											   BufTagGetRelFileLocator(&bufHdr->tag).relNumber);
 
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
-			tag = bufHdr->tag;
 			TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(bufHdr->buf_id);
 			UnpinBuffer(bufHdr);
-			ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
 
 			written++;
 		}
@@ -4802,10 +4818,17 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
  *
  * If the caller has an smgr reference for the buffer's relation, pass it
  * as the second parameter.  If not, pass NULL.
+ *
+ * A page written through the double write buffer wants a kernel writeback
+ * started before its batch retires, so that the sync retiring the batch is a
+ * cheap barrier rather than a full flush.  Such a page is queued into
+ * wb_context, and true is returned so the caller knows not to queue it a
+ * second time; a page written without the double write buffer is left to the
+ * caller entirely and returns false.
  */
-static void
+static bool
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
-			IOContext io_context)
+			IOContext io_context, WritebackContext *wb_context)
 {
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
@@ -4814,6 +4837,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	char	   *bufToWrite;
 	uint32		buf_state;
 	DWBSlotRef	dwbref;
+	bool		staged;
 
 	/*
 	 * Try to start an I/O operation.  If StartBufferIO returns false, then
@@ -4821,7 +4845,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * anything.
 	 */
 	if (!StartBufferIO(buf, false, false))
-		return;
+		return false;
 
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = shared_buffer_write_error_callback;
@@ -4935,16 +4959,28 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
 							IOOP_WRITE, io_start, 1, BLCKSZ);
 
-	if (dwbref.batch_idx >= 0)
+	staged = dwbref.batch_idx >= 0;
+	if (staged)
 	{
 		/*
-		 * Step 6b: start kernel writeback of the page now so the segment
-		 * fsync that retires the batch becomes a cheap barrier instead of a
-		 * full flush.  Not durability — that comes from the fsync.
+		 * Step 6b: queue the page for kernel writeback, so that the sync
+		 * retiring its batch becomes a cheap barrier instead of a full flush.
+		 * Not durability — that comes from the sync.
+		 *
+		 * Queueing is not handing over: the context holds the tag until
+		 * dwb_writeback_after of them have accumulated, so under a retire
+		 * pool a batch may retire before the kernel has heard about its
+		 * pages.  That is the price of not making one syscall per page, and
+		 * the sync is correct either way.  When the retirement runs inline
+		 * there is nothing to gamble on — the fsync is a few statements
+		 * below — so the queue is emptied here instead.
 		 */
-		if (dwb_writeback)
-			smgrwriteback(reln, BufTagGetForkNum(&buf->tag),
-						  buf->tag.blockNum, 1);
+		ScheduleBufferTagForWriteback(wb_context, io_context, &buf->tag);
+		if (DWBRetiresInline())
+		{
+			IssuePendingWritebacks(wb_context, io_context);
+			INJECTION_POINT("dwb-inline-retire", wb_context);
+		}
 		DWBFinishPageWrite(&dwbref);
 	}
 
@@ -4964,6 +5000,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
+
+	return staged;
 }
 
 /*
@@ -5559,7 +5597,8 @@ FlushRelationBuffers(Relation rel)
 		{
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+						&DwbWritebackContext);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
 		}
@@ -5656,7 +5695,8 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 		{
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION,
+						IOCONTEXT_NORMAL, &DwbWritebackContext);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
 		}
@@ -5884,7 +5924,8 @@ FlushDatabaseBuffers(Oid dbid)
 		{
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+						&DwbWritebackContext);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
 		}
@@ -5911,7 +5952,8 @@ FlushOneBuffer(Buffer buffer)
 
 	Assert(LWLockHeldByMe(BufferDescriptorGetContentLock(bufHdr)));
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+				&DwbWritebackContext);
 }
 
 /*
@@ -7161,7 +7203,8 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
 	if (buf_state & BM_DIRTY)
 	{
 		LWLockAcquire(BufferDescriptorGetContentLock(desc), LW_SHARED);
-		FlushBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		FlushBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+					&DwbWritebackContext);
 		*buffer_flushed = true;
 		LWLockRelease(BufferDescriptorGetContentLock(desc));
 	}
