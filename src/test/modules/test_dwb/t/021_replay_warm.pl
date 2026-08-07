@@ -506,6 +506,11 @@ SKIP:
 	skip 'injection points not supported by this build', 2
 	  unless $injection_points;
 
+	# This scenario holds a process still with SIGSTOP, which Windows has no
+	# equivalent of.
+	skip 'stopping and continuing a process is not portable to Windows', 2
+	  if $PostgreSQL::Test::Utils::windows_os;
+
 	# The worse version of the same thing: the worker that dies is the one
 	# the publisher has just woken.  A signal is delivered to the head of the
 	# wait list and takes it off that list, so if the head is on its way out,
