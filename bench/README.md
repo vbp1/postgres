@@ -24,3 +24,9 @@ and data checksums enabled, converted from the same reference cluster.
   and the link between them is a real 100 GbE hop (RTT 0.126 ms).  The
   bar chart is throughput per socket count; the two line charts follow
   the two-socket point over its 600 s run.
+* `ring-size.png`, `ring-time-tps.png`, `ring-time-lat.png` — the
+  `replay_warm_queue_size` series on the two-host pair: what each ring size
+  buys the standby's replay and what it costs the pool, and the primary's
+  throughput and latency over each 600 s run at 750 connections against a
+  synchronous standby.  The four points ran back to back on one pair, so
+  only neighbours are comparable.
