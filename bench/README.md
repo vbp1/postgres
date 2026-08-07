@@ -30,3 +30,7 @@ and data checksums enabled, converted from the same reference cluster.
   throughput and latency over each 600 s run at 750 connections against a
   synchronous standby.  The four points ran back to back on one pair, so
   only neighbours are comparable.
+* `replay-lag-512.png`, `replay-time-budget.png` — the standby side of the
+  ring-512 point: the backlog it accumulates over the run, and where the
+  replay process's time goes — its wall clock split between running and
+  waiting, and the running part broken down by symbol group.
