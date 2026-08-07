@@ -300,7 +300,7 @@
 				# (change requires restart)
 #replay_warm_workers = 0	# workers reading pages ahead of replay
 				# (change requires restart)
-#replay_warm_queue_size = 256	# block requests the warm pool can hold
+#replay_warm_queue_size = 512	# block requests the warm pool can hold
 				# (change requires restart)
 
 # - Archiving -

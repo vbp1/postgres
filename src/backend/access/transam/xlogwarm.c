@@ -78,7 +78,7 @@
 
 /* GUCs */
 int			replay_warm_workers = 0;
-int			replay_warm_queue_size = 256;
+int			replay_warm_queue_size = 512;
 
 
 typedef enum XLogWarmState

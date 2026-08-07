@@ -503,6 +503,110 @@ pass('the pool serves again after losing a sleeping worker');
 
 SKIP:
 {
+	skip 'injection points not supported by this build', 2
+	  unless $injection_points;
+
+	# The worse version of the same thing: the worker that dies is the one
+	# the publisher has just woken.  A signal is delivered to the head of the
+	# wait list and takes it off that list, so if the head is on its way out,
+	# the request it was woken for has been told to nobody.  Handing the ring
+	# on from the exit path is what covers that, and it is the only thing
+	# that can.
+	#
+	# Freezing the process is what makes the race observable.  A stopped
+	# worker stays on the wait list and stays asleep, so the wakeup is spent
+	# on it and the rest of the pool hears nothing.  An injection point could
+	# not stand in for this: preparing to sleep on the point's own variable
+	# cancels the registration on the pool's — see
+	# ConditionVariablePrepareToSleep — and that registration is the whole
+	# subject.
+	$proto->poll_query_until('postgres',
+		'SELECT sleepers = 2 AND pending = 0 FROM test_dwb_warm_slot_states()'
+	) or die 'the pool did not settle before the head-of-queue scenario';
+
+	my @pids = split /\n/,
+	  $proto->safe_psql('postgres',
+		'SELECT pid FROM test_dwb_warm_worker_pids() ORDER BY worker');
+
+	# The list is joined at the tail and served from the head, so replacing
+	# one of the two workers leaves the other at the head for certain:
+	# whatever the order was, the replacement can only have joined behind it.
+	kill 'TERM', $pids[1];
+	$proto->poll_query_until(
+		'postgres',
+		"SELECT count(*) = 2 AND count(*) FILTER (WHERE pid = $pids[1]) = 0
+		 FROM test_dwb_warm_worker_pids()"
+	) or die 'the protocol standby did not replace the worker';
+	$proto->poll_query_until('postgres',
+		'SELECT sleepers = 2 FROM test_dwb_warm_slot_states()')
+	  or die 'the pool did not settle after the worker was replaced';
+
+	my $head = $pids[0];
+	my $rest = $proto->safe_psql('postgres',
+		"SELECT pid FROM test_dwb_warm_worker_pids() WHERE pid <> $head");
+
+	# The dying worker is replaced within a second, and a replacement is free
+	# to walk the ring and take whatever it finds — which would drain the
+	# request whether or not anybody was ever told about it.  So the point
+	# stays attached: the worker that claims parks while still holding the
+	# slot, and the pool then says which pid that is.  A served request is
+	# not the evidence here; who served it is.
+	$proto->safe_psql('postgres',
+		"SELECT injection_points_attach('replay-warm-claimed', 'wait')");
+
+	kill 'STOP', $head;
+
+	$proto->safe_psql('postgres', "SELECT test_dwb_warm_publish('t', 6)");
+	is( $proto->safe_psql(
+			'postgres', 'SELECT pending FROM test_dwb_warm_slot_states()'),
+		1,
+		'the one wakeup goes to the worker at the head of the wait list');
+
+	# That worker never gets to serve it: it is signalled away before it runs
+	# again, so the request now depends entirely on what its exit path does.
+	kill 'TERM', $head;
+	kill 'CONT', $head;
+
+	$proto->poll_query_until('postgres',
+		'SELECT count(*) = 1 FROM test_dwb_warm_worker_pids() WHERE holding >= 0'
+	  )
+	  or die 'nobody took the request the dying worker was woken for; state: '
+	  . $proto->safe_psql('postgres',
+		'SELECT * FROM test_dwb_warm_slot_states()');
+	is( $proto->safe_psql(
+			'postgres',
+			'SELECT pid FROM test_dwb_warm_worker_pids() WHERE holding >= 0'),
+		$rest,
+		'a worker that dies holding the wakeup hands the ring to the sleeper'
+	);
+
+	# Let the parked worker out and put the pool back to sleep, the same way
+	# the scenarios below do: a detached point can still be reached by a
+	# worker that looked it up a moment earlier.
+	$proto->safe_psql('postgres',
+		"SELECT injection_points_detach('replay-warm-claimed')");
+	foreach my $attempt (1 .. 600)
+	{
+		last
+		  if $proto->safe_psql(
+			'postgres',
+			'SELECT claimed = 0 AND sleepers = 2
+			 FROM test_dwb_warm_slot_states()') eq 't';
+		$proto->psql('postgres',
+			"SELECT injection_points_wakeup('replay-warm-claimed')");
+		usleep(100_000);
+	}
+	$proto->poll_query_until('postgres',
+		'SELECT claimed = 0 AND sleepers = 2 FROM test_dwb_warm_slot_states()'
+	  )
+	  or die
+	  'the pool stayed parked after the head-of-queue scenario; state: '
+	  . $proto->safe_psql('postgres',
+		'SELECT * FROM test_dwb_warm_slot_states()');
+}
+
+SKIP:
+{
 	skip 'injection points not supported by this build', 3
 	  unless $injection_points;
 

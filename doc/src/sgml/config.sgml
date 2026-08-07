@@ -4443,7 +4443,7 @@ include_dir 'conf.d'
         How many block requests the pool enabled by
         <xref linkend="guc-replay-warm-workers"/> can hold at once, which also
         bounds how far ahead of replay the server looks for blocks to warm.
-        The default is 256.  This parameter can only be set at server start.
+        The default is 512.  This parameter can only be set at server start.
        </para>
        <para>
         Every block a record refers to takes a request, whether or not the

@@ -2261,7 +2261,7 @@ struct config_int ConfigureNamesInt[] =
 						 "prefetcher looks when the pool is enabled.")
 		},
 		&replay_warm_queue_size,
-		256, 16, 8192,
+		512, 16, 8192,
 		NULL, NULL, NULL
 	},
 	{
