@@ -64,6 +64,7 @@
 #include "postgres.h"
 
 #include "access/xlogutils.h"
+#include "access/xlogwarm.h"
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
