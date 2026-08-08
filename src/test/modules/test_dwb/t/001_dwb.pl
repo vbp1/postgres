@@ -155,6 +155,18 @@ $node->poll_query_until('postgres',
 is($node->safe_psql('postgres', 'SELECT test_dwb_retire()'),
 	'1', 'batch published from the exit backstop retires');
 
+# A command that registers an exit callback of its own and cancels it again
+# on the way out -- PG_ENSURE_ERROR_CLEANUP, as CREATE DATABASE uses -- can
+# only cancel it while it is still the last one registered.  The backstop
+# above is registered once, when the process starts, so that a write staged
+# in between does not land on top of it.  This session has staged none yet,
+# which is exactly the case that would.
+$node->safe_psql('postgres', 'CREATE DATABASE dwb_createdb');
+is( $node->safe_psql('dwb_createdb', 'SELECT count(*) FROM pg_class'),
+	$node->safe_psql('template1', 'SELECT count(*) FROM pg_class'),
+	'a database copied through the buffer cache is complete and usable');
+$node->safe_psql('postgres', 'DROP DATABASE dwb_createdb');
+
 # --- transaction abort releases refs (ResourceOwner path) ---------------
 
 # An ERROR with unpublished refs: the abort poisons the slots, and the

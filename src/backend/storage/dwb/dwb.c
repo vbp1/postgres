@@ -61,7 +61,6 @@ typedef struct DWBPendingRef
 } DWBPendingRef;
 
 static DWBPendingRef pendingRefs[2 * DWB_BATCH_MAX_PAGES];
-static bool cleanup_registered = false;
 
 /* leader-side meta assembly area, allocated before the seal is attempted */
 static DWSlotMeta *leader_metas = NULL;
@@ -790,18 +789,6 @@ DWBAcquireSlot(const BufferTag *tag, int wclass, bool use_resowner,
 	if (use_resowner)
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
-	if (!cleanup_registered)
-	{
-		/*
-		 * before_shmem_exit, NOT on_proc_exit: dropping the last ref of a
-		 * durable batch publishes its seg_set under LWLocks, which is only
-		 * legal while our PGPROC is alive — on_proc_exit callbacks run
-		 * after ProcKill has released it.
-		 */
-		before_shmem_exit(DWBProcExit, 0);
-		cleanup_registered = true;
-	}
-
 	for (;;)
 	{
 		uint32		idx = pg_atomic_read_u32(&DWBCtl->open_batch_idx[wclass]);
@@ -1403,4 +1390,27 @@ DWBProcExit(int code, Datum arg)
 		if (pendingRefs[i].in_use)
 			DWBAbandonRef(&pendingRefs[i]);
 	}
+}
+
+/*
+ * Per-process initialization: arrange for the refs this process is holding
+ * to be given back if it exits still holding them.
+ *
+ * before_shmem_exit, NOT on_proc_exit: dropping the last ref of a durable
+ * batch publishes its seg_set under LWLocks, which is only legal while our
+ * PGPROC is alive — on_proc_exit callbacks run after ProcKill has released
+ * it.
+ *
+ * The callback belongs here, among the other process-wide registrations,
+ * rather than at the first slot a process takes.  A command that registers
+ * a cleanup callback of its own and then cancels it — PG_ENSURE_ERROR_CLEANUP,
+ * as CREATE DATABASE uses — requires its callback to still be the last one
+ * registered, and a first write staged through the buffer between the two
+ * would leave ours on top of it.
+ */
+void
+DWBInitBackend(void)
+{
+	if (DWBIsEnabled())
+		before_shmem_exit(DWBProcExit, 0);
 }

@@ -510,6 +510,7 @@ extern Size DWBShmemSize(void);
 extern void DWBShmemInit(void);
 
 /* dwb.c — write path */
+extern void DWBInitBackend(void);
 extern void DWBStagePageWrite(const BufferTag *tag, const char *image,
 							  XLogRecPtr page_lsn, DWBSlotRef *ref);
 extern void DWBStagePageWriteNoWait(const BufferTag *tag, const char *image,
