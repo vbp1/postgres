@@ -694,7 +694,14 @@ test_dwb_checkpoint_pending(PG_FUNCTION_ARGS)
 	BufferTag	tag = make_tag(MyDatabaseId, relnumber, 0);
 	DWBSlotRef	ref;
 	SMgrRelation reln;
-	static PGAlignedBlock image;
+
+	/*
+	 * This one goes through smgr, which may reach the file with direct I/O
+	 * and requires the alignment that needs.  The other page buffers here are
+	 * read and written through this test's own descriptors, where the block
+	 * alignment is all that is asked for.
+	 */
+	static PGIOAlignedBlock image;
 
 	check_dwb_enabled();
 
