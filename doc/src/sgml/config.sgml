@@ -3403,9 +3403,405 @@ include_dir 'conf.d'
        </para>
 
        <para>
+        This parameter has an effect only when <xref
+        linkend="guc-io-torn-pages-protection"/> is set to
+        <literal>full_pages</literal>; the other modes determine the
+        protection against partial page writes themselves and ignore it.
+       </para>
+
+       <para>
         This parameter can only be set in the <filename>postgresql.conf</filename>
         file or on the server command line.
         The default is <literal>on</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-io-torn-pages-protection" xreflabel="io_torn_pages_protection">
+      <term><varname>io_torn_pages_protection</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>io_torn_pages_protection</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Selects the mechanism that protects data files against torn
+        (partially written) pages after an operating system crash.
+        Valid values are <literal>full_pages</literal>,
+        <literal>double_writes</literal> and <literal>off</literal>.
+        The default is <literal>full_pages</literal>.
+        This parameter can only be set at server start.
+       </para>
+
+       <para>
+        <literal>full_pages</literal> is the traditional protection: a full
+        image of each page is written to WAL on its first modification after
+        a checkpoint, under the control of the
+        <xref linkend="guc-full-page-writes"/> parameter.
+       </para>
+
+       <para>
+        <literal>double_writes</literal> replaces the page images in WAL
+        with a <firstterm>double write buffer</firstterm>: every permanent
+        data page leaving shared buffers is first written and flushed to a
+        small reusable ring of files in the <filename>pg_dwb</filename>
+        directory, and only then written to its actual location.  After a
+        crash, pages torn by interrupted writes are restored from their
+        ring copies before WAL replay begins.  The automatic page images
+        that <literal>full_pages</literal> mode writes into WAL on the
+        first modification after a checkpoint are not written in this mode
+        (operations that explicitly request a page image still log one),
+        which can substantially reduce WAL volume and the associated commit
+        latency spikes after checkpoints, at the price of writing every
+        flushed data page twice.  See
+        <xref linkend="wal-reliability"/> for discussion.  This mode
+        requires data checksums (see <xref linkend="app-initdb-data-checksums"/>);
+        the server refuses to start without them.  An active base backup
+        temporarily forces page images back into WAL, because a backup can
+        legitimately copy a torn page that only WAL replay can repair.
+       </para>
+
+       <para>
+        <literal>off</literal> disables torn page protection entirely
+        (<varname>full_page_writes</varname> is ignored).  Nothing can
+        repair pages torn by a crash in this mode; use it only on storage
+        that guarantees atomic 8kB writes, under the same considerations as
+        turning off <varname>full_page_writes</varname>.
+       </para>
+
+       <para>
+        The mode in effect is recorded in <filename>pg_control</filename>
+        and in the WAL stream.  A standby tracks the mode of its primary:
+        replaying WAL that was generated without page images is refused if
+        the standby itself expects <literal>full_pages</literal> protection,
+        because a crash of that standby could tear pages its own recovery
+        could not repair.  A standby running <literal>double_writes</literal>
+        repairs its own torn pages from its own ring and can follow a
+        primary in any mode.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-num-batches" xreflabel="dwb_num_batches">
+      <term><varname>dwb_num_batches</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_num_batches</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Number of batches in the double write buffer ring.  Together with
+        <xref linkend="guc-dwb-batch-pages"/> this sets the ring capacity:
+        the on-disk size of <filename>pg_dwb</filename> is roughly
+        <varname>dwb_num_batches</varname> &times;
+        <varname>dwb_batch_pages</varname> &times; 8kB.  A larger ring
+        absorbs longer bursts of page writes before writers have to wait
+        for batches to be retired.  The default is 64.
+        This parameter can only be set at server start.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-batch-pages" xreflabel="dwb_batch_pages">
+      <term><varname>dwb_batch_pages</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_batch_pages</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Number of pages in one double write buffer batch.  A batch is
+        written to the ring and flushed as a single unit, so this is the
+        unit of grouping for the ring's writes and fsyncs.  The default
+        is 64.  This parameter can only be set at server start.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-max-segments" xreflabel="dwb_max_segments">
+      <term><varname>dwb_max_segments</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_max_segments</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Capacity of the shared table that tracks which data file segments
+        still need an <function>fsync</function> before their ring batches
+        can be reused.  If it overflows, batch publication falls back to
+        retiring the batch synchronously, which is safe but slower.  The
+        default is 4096.  This parameter can only be set at server start.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-retire-workers" xreflabel="dwb_retire_workers">
+      <term><varname>dwb_retire_workers</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_retire_workers</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Number of background workers that retire double write buffer
+        batches by flushing the covered data files, freeing ring space for
+        new writes.  The workers consume
+        <xref linkend="guc-max-worker-processes"/> slots.  Setting it to 0
+        disables the pool and makes writers retire batches synchronously;
+        this is meant for testing only.  The default is 1.
+        This parameter can only be set at server start.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-cleaner-workers" xreflabel="dwb_cleaner_workers">
+      <term><varname>dwb_cleaner_workers</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_cleaner_workers</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Number of background workers that execute the flush bins produced
+        by the background writer's LRU scan.  Each bin is one double write
+        buffer batch write followed by its sync and the data-file writes;
+        a single background writer executing them serially cannot clean
+        more than a few thousand pages per second, and backends then evict
+        dirty buffers themselves at full double write buffer latency.
+        With a pool the scan keeps running in the background writer while
+        the bins are executed concurrently, and backends find clean
+        buffers instead.  The background writer then writes no data pages
+        itself: when the pool falls momentarily behind, the scan pauses
+        instead of writing and resumes as soon as a worker frees queue
+        space.  The checkpointer also defers to a loaded pool: while the
+        pool's queue is hot, checkpoint writes pause within a small,
+        bounded slice of the
+        <xref linkend="guc-checkpoint-completion-target"/> slack, so
+        checkpoint traffic lands in the quieter moments of the write
+        window.  The workers consume
+        <xref linkend="guc-max-worker-processes"/> slots.  Setting it to 0
+        (the default) disables the pool and the background writer flushes
+        its bins itself.
+        This parameter can only be set at server start.
+       </para>
+       <para>
+        The pool scales execution only; how much the LRU scan issues per
+        round is still governed by
+        <xref linkend="guc-bgwriter-lru-maxpages"/>,
+        <xref linkend="guc-bgwriter-delay"/> and
+        <xref linkend="guc-bgwriter-lru-multiplier"/>.  With their default
+        values the pool mostly idles, so raise them together with this
+        setting.  Pages written by the pool are counted in
+        <structname>pg_stat_bgwriter</structname>.<structfield>buffers_clean</structfield>
+        as if the background writer had written them itself.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-retire-sync-method" xreflabel="dwb_retire_sync_method">
+      <term><varname>dwb_retire_sync_method</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>dwb_retire_sync_method</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Selects how retirement makes the covered data files durable before
+        freeing a batch.  With <literal>fsync</literal> each touched
+        data-file segment is synced individually.  With
+        <literal>syncfs</literal> a retire round issues one
+        <function>syncfs()</function> call per file system holding data
+        files and then frees every batch whose data-file writes preceded
+        the round, which is much cheaper when a write-heavy workload
+        touches many segments between rounds.  <literal>syncfs</literal>
+        is only available on Linux and is the default there;
+        <literal>fsync</literal> is the default elsewhere.
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
+       </para>
+       <para>
+        The caveats of <function>syncfs</function> described under
+        <xref linkend="guc-recovery-init-sync-method"/> apply here as
+        well.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-batch-timeout-ms" xreflabel="dwb_batch_timeout_ms">
+      <term><varname>dwb_batch_timeout_ms</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_batch_timeout_ms</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Maximum time an open batch may collect pages before it is sealed
+        and written even if not full, bounding the latency a lone page
+        flush can spend waiting for company.  A lone page flush seals its
+        batch immediately while its writer class is quiet; after a recent
+        full-batch seal — the sign of a dense concurrent stream — it waits
+        out this window instead, letting the batch fill.  With
+        <xref linkend="guc-dwb-retire-workers"/> set to 0 and in
+        single-user mode a lone flush always seals immediately.
+        If this value is specified without units, it is taken as milliseconds.
+        The default is 10 milliseconds.
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-retire-interval-ms" xreflabel="dwb_retire_interval_ms">
+      <term><varname>dwb_retire_interval_ms</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_retire_interval_ms</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Cycle time of each retire worker: how long a worker sleeps when it
+        finds no batches waiting for retirement.
+        If this value is specified without units, it is taken as milliseconds.
+        The default is 50 milliseconds.
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-writeback-after" xreflabel="dwb_writeback_after">
+      <term><varname>dwb_writeback_after</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_writeback_after</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Whenever a process has written this many data pages through the
+        double write buffer, it asks the kernel to start writing them back to
+        disk.  The synchronization that eventually retires their batch (see
+        <xref linkend="guc-dwb-retire-sync-method"/>) is then more likely to
+        find the data already on its way, and to cost closer to a barrier
+        than to a full flush.  The pending pages are handed over in block
+        order, and neighbouring ones as a single request.  Has no effect on
+        platforms without such a request.
+       </para>
+       <para>
+        This is pacing, not ordering: a page waits in its process until the
+        count is reached, so a batch may well be retired before the kernel
+        has heard about the pages in it.  Raising the value trades away more
+        of that overlap for fewer requests.  The exception is a server
+        running without retire workers (<xref linkend="guc-dwb-retire-workers"/>
+        set to <literal>0</literal>), where a page write retires its own
+        batch before returning: there the pending pages are handed over at
+        every such write, so any positive value behaves as
+        <literal>1</literal> — and so, for pages the double write buffer
+        stages, do <xref linkend="guc-checkpoint-flush-after"/> and
+        <xref linkend="guc-bgwriter-flush-after"/>.
+       </para>
+       <para>
+        This parameter governs the pages the double write buffer stages on
+        paths that have no writeback pacing of their own — above all the
+        eviction a backend performs to make room for a page it needs.  Pages
+        written by the checkpointer and the background writer keep following
+        <xref linkend="guc-checkpoint-flush-after"/> and
+        <xref linkend="guc-bgwriter-flush-after"/>.  When a backend evicts a
+        page the double write buffer does not stage, such as a page of an
+        unlogged relation, that page keeps following
+        <xref linkend="guc-backend-flush-after"/>.
+       </para>
+       <para>
+        If this value is specified without units, it is taken as blocks, that
+        is <symbol>BLCKSZ</symbol> bytes, typically 8kB.  The valid range is
+        between <literal>0</literal>, which disables the double write buffer's
+        own writeback, and <literal>2MB</literal>.  The default is
+        <literal>256kB</literal> on all platforms.  (If <symbol>BLCKSZ</symbol>
+        is not 8kB, the default and maximum values scale proportionally to
+        it.)
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-slow-warn-ms" xreflabel="dwb_slow_warn_ms">
+      <term><varname>dwb_slow_warn_ms</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_slow_warn_ms</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        When a writer has waited this long for free ring space, a warning
+        is logged and non-critical background writing is paused so that the
+        remaining ring capacity serves user-facing work first.
+        If this value is specified without units, it is taken as milliseconds.
+        The default is 5 seconds.
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-slot-stuck-timeout-ms" xreflabel="dwb_slot_stuck_timeout_ms">
+      <term><varname>dwb_slot_stuck_timeout_ms</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_slot_stuck_timeout_ms</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Time the writer of a sealed batch waits for the batch's remaining
+        pages to be staged before treating the batch as wedged and raising
+        a <literal>PANIC</literal>.  This is a defensive limit that should
+        never be reached.
+        If this value is specified without units, it is taken as milliseconds.
+        The default is 30 seconds.
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-write-timeout-ms" xreflabel="dwb_write_timeout_ms">
+      <term><varname>dwb_write_timeout_ms</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dwb_write_timeout_ms</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        When a writer has waited this long for free ring space, the action
+        selected by <xref linkend="guc-dwb-on-stall"/> is taken.  A wait
+        this long means batch retirement cannot keep up with the flow of
+        page writes (or the underlying storage has stalled).
+        If this value is specified without units, it is taken as milliseconds.
+        The default is 60 seconds.
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dwb-on-stall" xreflabel="dwb_on_stall">
+      <term><varname>dwb_on_stall</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>dwb_on_stall</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Action taken when a double write buffer wait exceeds
+        <xref linkend="guc-dwb-write-timeout-ms"/>: <literal>warn</literal>
+        logs and keeps waiting, <literal>error</literal> aborts the waiting
+        transaction, and <literal>panic</literal> restarts the server.
+        Processes whose page writes cannot be abandoned, such as the
+        checkpointer, always escalate to <literal>panic</literal>.  The
+        default is <literal>panic</literal>: a stall this long indicates a
+        storage-level problem, and a restart with crash recovery is
+        preferable to an indefinite hang.
+        This parameter can only be set in the <filename>postgresql.conf</filename>
+        file or on the server command line.
        </para>
       </listitem>
      </varlistentry>
@@ -3996,6 +4392,67 @@ include_dir 'conf.d'
         See also the <xref linkend="guc-wal-decode-buffer-size"/> and
         <xref linkend="guc-maintenance-io-concurrency"/> settings, which limit
         prefetching activity.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-replay-warm-workers" xreflabel="replay_warm_workers">
+      <term><varname>replay_warm_workers</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>replay_warm_workers</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Number of background workers that read the blocks recovery is about to
+        modify into shared buffers, ahead of replay.  The default is 0, which
+        disables the pool; recovery then relies on
+        <xref linkend="guc-recovery-prefetch"/> advising the operating system
+        and reads the blocks in the startup process itself.
+       </para>
+       <para>
+        This matters most when the WAL stream carries no full-page images,
+        which is the case on a standby of a cluster running
+        <xref linkend="guc-io-torn-pages-protection"/> set to
+        <literal>double_writes</literal>: every replayed record then needs its
+        page fetched, and doing that from the single replay process can make
+        it the limit on how fast the standby keeps up.  With the pool enabled
+        that fetching, including its checksum verification and its buffer
+        allocation, happens in the workers instead.
+       </para>
+       <para>
+        The workers take slots from
+        <xref linkend="guc-max-worker-processes"/>, take no database
+        connection, and start with the postmaster, so they also serve crash
+        recovery.  Their requests are advisory throughout: anything they do
+        not get to in time is simply read by the replay process, as it would
+        be with the pool disabled.  This parameter can only be set at server
+        start.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-replay-warm-queue-size" xreflabel="replay_warm_queue_size">
+      <term><varname>replay_warm_queue_size</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>replay_warm_queue_size</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        How many block requests the pool enabled by
+        <xref linkend="guc-replay-warm-workers"/> can hold at once, which also
+        bounds how far ahead of replay the server looks for blocks to warm.
+        The default is 512.  This parameter can only be set at server start.
+       </para>
+       <para>
+        Every block a record refers to takes a request, whether or not the
+        block turns out to be in a buffer already: which of the two it is is
+        the pool's answer to give, and asking the question in the startup
+        process is the cost this arrangement avoids.  Since most references
+        are to blocks already in buffers, the reads actually outstanding
+        ahead of replay are a fraction of this setting, and a pool of many
+        workers wants room for all of them.
        </para>
       </listitem>
      </varlistentry>

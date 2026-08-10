@@ -23,6 +23,7 @@
 #include "access/xlogrecovery.h"
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
+#include "access/xlogwarm.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
@@ -432,6 +433,18 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	else
 	{
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode, prefetch_buffer);
+
+		/*
+		 * A hint the pool produced and replay could not use means the page
+		 * was evicted between the worker reading it and replay reaching it —
+		 * the pool running too far ahead of replay, which is worth knowing
+		 * about. Hints the buffer lookup left behind say nothing about the
+		 * pool, so only the pool's own answers are counted.
+		 */
+		if (XLogRecGetBlock(record, block_id)->warm_hint &&
+			mode == RBM_NORMAL && *buf != prefetch_buffer)
+			XLogWarmCountStale();
+
 		if (BufferIsValid(*buf))
 		{
 			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
@@ -493,11 +506,13 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 
 	/* Do we have a clue where the buffer might be already? */
 	if (BufferIsValid(recent_buffer) &&
-		mode == RBM_NORMAL &&
-		ReadRecentBuffer(rlocator, forknum, blkno, recent_buffer))
+		mode == RBM_NORMAL)
 	{
-		buffer = recent_buffer;
-		goto recent_buffer_fast_path;
+		if (ReadRecentBuffer(rlocator, forknum, blkno, recent_buffer))
+		{
+			buffer = recent_buffer;
+			goto recent_buffer_fast_path;
+		}
 	}
 
 	/* Open the relation at smgr level */

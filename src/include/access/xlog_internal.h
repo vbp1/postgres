@@ -31,7 +31,7 @@
 /*
  * Each page of XLOG file has a header like this:
  */
-#define XLOG_PAGE_MAGIC 0xD118	/* can be used as WAL version indicator */
+#define XLOG_PAGE_MAGIC 0xD11A	/* can be used as WAL version indicator */
 
 typedef struct XLogPageHeaderData
 {
@@ -278,6 +278,7 @@ typedef struct xl_parameter_change
 	int			max_prepared_xacts;
 	int			max_locks_per_xact;
 	int			wal_level;
+	int			io_torn_pages_protection;	/* DWBTornPageProtection */
 	bool		wal_log_hints;
 	bool		track_commit_timestamp;
 } xl_parameter_change;

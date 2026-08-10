@@ -819,7 +819,11 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
     to make a base backup. However, if you normally run the
     server with <varname>full_page_writes</varname> disabled, you might notice a drop
     in performance while the backup runs since <varname>full_page_writes</varname> is
-    effectively forced on during backup mode.
+    effectively forced on during backup mode.  The same applies when the
+    server runs with <xref linkend="guc-io-torn-pages-protection"/> set to
+    <literal>double_writes</literal>: page images are forced back into WAL
+    for the duration of the backup, because a base backup can legitimately
+    copy a torn page that only WAL replay with page images can repair.
    </para>
 
    <para>
@@ -1130,11 +1134,15 @@ SELECT * FROM pg_backup_stop(wait_for_archive => true);
    </para>
 
    <para>
-    The contents of the directories <filename>pg_dynshmem/</filename>,
+    The contents of the directories <filename>pg_dwb/</filename>,
+    <filename>pg_dynshmem/</filename>,
     <filename>pg_notify/</filename>, <filename>pg_serial/</filename>,
     <filename>pg_snapshots/</filename>, <filename>pg_stat_tmp/</filename>,
     and <filename>pg_subtrans/</filename> (but not the directories themselves) can be
     omitted from the backup as they will be initialized on postmaster startup.
+    The double write buffer ring in <filename>pg_dwb/</filename> in particular
+    must never be restored to another cluster: its page copies only repair
+    torn writes of the instance that wrote them.
    </para>
 
    <para>

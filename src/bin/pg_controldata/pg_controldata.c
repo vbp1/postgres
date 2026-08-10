@@ -296,6 +296,8 @@ main(int argc, char *argv[])
 		   ControlFile->backupEndRequired ? _("yes") : _("no"));
 	printf(_("wal_level setting:                    %s\n"),
 		   wal_level_str(ControlFile->wal_level));
+	printf(_("io_torn_pages_protection setting:     %s\n"),
+		   DWBProtectionModeName(ControlFile->io_torn_pages_protection));
 	printf(_("wal_log_hints setting:                %s\n"),
 		   ControlFile->wal_log_hints ? _("on") : _("off"));
 	printf(_("max_connections setting:              %d\n"),

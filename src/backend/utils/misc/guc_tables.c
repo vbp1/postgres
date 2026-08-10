@@ -37,6 +37,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogrecovery.h"
+#include "access/xlogwarm.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
 #include "catalog/namespace.h"
@@ -78,6 +79,7 @@
 #include "replication/syncrep.h"
 #include "storage/aio.h"
 #include "storage/bufmgr.h"
+#include "storage/dwb.h"
 #include "storage/bufpage.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
@@ -355,6 +357,21 @@ static const struct config_enum_entry synchronous_commit_options[] = {
 	{NULL, 0, false}
 };
 
+/* keep the spellings in sync with DWBProtectionModeName() in pg_control.h */
+static const struct config_enum_entry io_torn_pages_protection_options[] = {
+	{"off", DWB_PROTECT_OFF, false},
+	{"full_pages", DWB_PROTECT_FULL_PAGES, false},
+	{"double_writes", DWB_PROTECT_DOUBLE_WRITES, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry dwb_on_stall_options[] = {
+	{"warn", DWB_ON_STALL_WARN, false},
+	{"error", DWB_ON_STALL_ERROR, false},
+	{"panic", DWB_ON_STALL_PANIC, false},
+	{NULL, 0, false}
+};
+
 /*
  * Although only "on", "off", "try" are documented, we accept all the likely
  * variants of "on" and "off".
@@ -436,6 +453,7 @@ static const struct config_enum_entry debug_logical_replication_streaming_option
 StaticAssertDecl(lengthof(ssl_protocol_versions_info) == (PG_TLS1_3_VERSION + 2),
 				 "array length mismatch");
 
+/* shared by recovery_init_sync_method and dwb_retire_sync_method */
 static const struct config_enum_entry recovery_init_sync_method_options[] = {
 	{"fsync", DATA_DIR_SYNC_METHOD_FSYNC, false},
 #ifdef HAVE_SYNCFS
@@ -1204,7 +1222,6 @@ struct config_bool ConfigureNamesBool[] =
 		true,
 		NULL, NULL, NULL
 	},
-
 	{
 		{"wal_log_hints", PGC_POSTMASTER, WAL_SETTINGS,
 			gettext_noop("Writes full pages to WAL when first modified after a checkpoint, even for a non-critical modification."),
@@ -2173,6 +2190,131 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"dwb_num_batches", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Number of batches in the double write buffer ring."),
+			NULL
+		},
+		&dwb_num_batches,
+		64, 16, DWB_NUM_BATCHES_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_batch_pages", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Number of pages per double write buffer batch."),
+			NULL
+		},
+		&dwb_batch_pages,
+		64, 16, DWB_BATCH_MAX_PAGES,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_max_segments", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Capacity of the double write buffer segment hash table."),
+			NULL
+		},
+		&dwb_max_segments,
+		4096, 1024, 1048576,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_retire_workers", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Number of double write buffer retire worker processes."),
+			gettext_noop("The workers consume \"max_worker_processes\" slots. "
+						 "0 disables the pool and makes writers retire batches "
+						 "synchronously; meant for testing only.")
+		},
+		&dwb_retire_workers,
+		1, 0, 32,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_cleaner_workers", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Number of double write buffer cleaner worker processes."),
+			gettext_noop("The pool executes the flush bins the background "
+						 "writer's LRU scan produces, so the scan's issue rate "
+						 "is not capped by one process. The workers consume "
+						 "\"max_worker_processes\" slots. 0 disables the pool "
+						 "and the background writer flushes its bins itself.")
+		},
+		&dwb_cleaner_workers,
+		0, 0, 64,
+		NULL, NULL, NULL
+	},
+	{
+		{"replay_warm_workers", PGC_POSTMASTER, WAL_RECOVERY,
+			gettext_noop("Number of replay warm worker processes."),
+			gettext_noop("The pool reads the pages replay is about to modify "
+						 "into shared buffers ahead of it, which matters when "
+						 "the WAL stream carries no full-page images. The "
+						 "workers consume \"max_worker_processes\" slots. 0 "
+						 "disables the pool and recovery prefetching falls "
+						 "back to advising the operating system.")
+		},
+		&replay_warm_workers,
+		0, 0, 64,
+		NULL, NULL, NULL
+	},
+	{
+		{"replay_warm_queue_size", PGC_POSTMASTER, WAL_RECOVERY,
+			gettext_noop("Number of block requests the replay warm pool can hold."),
+			gettext_noop("This also bounds how far ahead of replay the "
+						 "prefetcher looks when the pool is enabled.")
+		},
+		&replay_warm_queue_size,
+		512, 16, 8192,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_batch_timeout_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Maximum time an open double write buffer batch may wait before being sealed."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_batch_timeout_ms,
+		10, 1, 1000,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_retire_interval_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Cycle time of each double write buffer retire worker."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_retire_interval_ms,
+		50, 5, 5000,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_slow_warn_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Double write buffer wait time after which throttling of non-critical writers begins."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_slow_warn_ms,
+		5000, 100, 60000,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_slot_stuck_timeout_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Time a double write buffer batch leader waits for slot coverage before PANIC."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_slot_stuck_timeout_ms,
+		30000, 1000, 600000,
+		NULL, NULL, NULL
+	},
+	{
+		{"dwb_write_timeout_ms", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Double write buffer wait time after which dwb_on_stall applies."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&dwb_write_timeout_ms,
+		60000, 1000, 600000,
+		NULL, NULL, NULL
+	},
+	{
 		{"post_auth_delay", PGC_BACKEND, DEVELOPER_OPTIONS,
 			gettext_noop("Sets the amount of time to wait after "
 						 "authentication on connection startup."),
@@ -3012,6 +3154,19 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&checkpoint_flush_after,
 		DEFAULT_CHECKPOINT_FLUSH_AFTER, 0, WRITEBACK_MAX_PENDING_FLUSHES,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dwb_writeback_after", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Number of pages the double write buffer accumulates before starting kernel writeback of them."),
+			gettext_noop("Lets the sync that retires a batch cost closer to a barrier than to a full flush. "
+						 "0 disables the double write buffer's own writeback; the checkpointer "
+						 "and the background writer keep using their own parameters."),
+			GUC_UNIT_BLOCKS
+		},
+		&dwb_writeback_after,
+		DEFAULT_DWB_WRITEBACK_AFTER, 0, WRITEBACK_MAX_PENDING_FLUSHES,
 		NULL, NULL, NULL
 	},
 
@@ -5003,6 +5158,38 @@ struct config_string ConfigureNamesString[] =
 
 struct config_enum ConfigureNamesEnum[] =
 {
+	{
+		{"io_torn_pages_protection", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Selects the protection against torn (partially written) data pages."),
+			gettext_noop("\"full_pages\" writes full page images to WAL after a checkpoint, "
+						 "\"double_writes\" uses the double write buffer in pg_dwb, "
+						 "\"off\" disables protection.")
+		},
+		&io_torn_pages_protection,
+		DWB_PROTECT_FULL_PAGES, io_torn_pages_protection_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dwb_on_stall", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Action to take when a double write buffer wait exceeds dwb_write_timeout_ms."),
+			NULL
+		},
+		&dwb_on_stall,
+		DWB_ON_STALL_PANIC, dwb_on_stall_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dwb_retire_sync_method", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Selects how double write buffer retirement makes data files durable."),
+			gettext_noop("\"fsync\" syncs the touched data-file segments one by one; \"syncfs\" syncs their whole file systems per retire round.")
+		},
+		&dwb_retire_sync_method,
+		DWB_RETIRE_SYNC_METHOD_DEFAULT, recovery_init_sync_method_options,
+		NULL, NULL, NULL
+	},
+
 	{
 		{"backslash_quote", PGC_USERSET, COMPAT_OPTIONS_PREVIOUS,
 			gettext_noop("Sets whether \"\\'\" is allowed in string literals."),

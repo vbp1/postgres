@@ -1,0 +1,144 @@
+CREATE EXTENSION test_dwb;
+-- ring is idle after startup
+SELECT test_dwb_states();
+                              test_dwb_states                               
+----------------------------------------------------------------------------
+ free=16 allocated=0 sealed=0 written=0 fsynced=0 data_written=0 retiring=0
+(1 row)
+
+-- a partial batch, sealed by force (ring: 16 batches x 16 pages)
+SELECT test_dwb_cycle(5);
+ test_dwb_cycle 
+----------------
+              1
+(1 row)
+
+-- overflow-sealed batches: 40 pages = 16 + 16 + 8 (tail force-sealed)
+SELECT test_dwb_cycle(40);
+ test_dwb_cycle 
+----------------
+              3
+(1 row)
+
+-- every surviving slot validates against meta_crc, generation and
+-- image_crc: eager retirement lets the cycles reuse batch file 0, so its
+-- final content is the 8-slot tail write, plus 16 slots in batch file 1
+SELECT test_dwb_ring_slots(true);
+ test_dwb_ring_slots 
+---------------------
+                  24
+(1 row)
+
+-- and the ring is fully retired again
+SELECT test_dwb_states();
+                              test_dwb_states                               
+----------------------------------------------------------------------------
+ free=16 allocated=0 sealed=0 written=0 fsynced=0 data_written=0 retiring=0
+(1 row)
+
+-- the cycles sealed deterministically: two overflow seals from the 40-page
+-- run (2 x 16 slots) and two forced tail seals (5 + 8 slots)
+SELECT wclass, reason, seals, pages FROM test_dwb_seal_stats()
+ WHERE seals > 0 ORDER BY wclass, reason;
+  wclass  |  reason  | seals | pages 
+----------+----------+-------+-------
+ eviction | forced   |     2 |    13
+ eviction | overflow |     2 |    32
+(2 rows)
+
+-- lone-writer fast seal in a QUIET class: get clear of the cycles' overflow
+-- stamps first, then a single staged page must seal immediately as "lone"
+SELECT pg_sleep(0.3);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+CREATE TEMP TABLE seal_before_quiet AS SELECT * FROM test_dwb_seal_stats();
+SELECT test_dwb_stage_lone_wait();
+ test_dwb_stage_lone_wait 
+--------------------------
+ 
+(1 row)
+
+SELECT s.wclass, s.reason, s.seals - b.seals AS dseals, s.pages - b.pages AS dpages
+  FROM test_dwb_seal_stats() s JOIN seal_before_quiet b USING (wclass, reason)
+ WHERE s.seals <> b.seals ORDER BY s.wclass, s.reason;
+  wclass  | reason | dseals | dpages 
+----------+--------+--------+--------
+ eviction | lone   |      1 |      1
+(1 row)
+
+SELECT test_dwb_retire() >= 0 AS drained;
+ drained 
+---------
+ t
+(1 row)
+
+-- HOT class: an overflow seal microseconds before the lone attempt must
+-- suppress the fast seal into the waiter's timeout seal
+CREATE TEMP TABLE seal_before_hot AS SELECT * FROM test_dwb_seal_stats();
+SELECT test_dwb_overflow_lone_wait();
+ test_dwb_overflow_lone_wait 
+-----------------------------
+ 
+(1 row)
+
+SELECT s.wclass, s.reason, s.seals - b.seals AS dseals, s.pages - b.pages AS dpages
+  FROM test_dwb_seal_stats() s JOIN seal_before_hot b USING (wclass, reason)
+ WHERE s.seals <> b.seals ORDER BY s.wclass, s.reason;
+  wclass  |    reason    | dseals | dpages 
+----------+--------------+--------+--------
+ eviction | overflow     |      1 |     16
+ eviction | wait_timeout |      1 |      1
+(2 rows)
+
+SELECT test_dwb_retire() >= 0 AS drained;
+ drained 
+---------
+ t
+(1 row)
+
+-- the hot test reads the stamp through the same helper: a fresh stamp is
+-- hot, a stamp from the FUTURE (a backward clock step) must read as quiet
+-- and keep the fast seal immediate
+SELECT test_dwb_set_overflow_stamp(0) AS hot_now;
+ hot_now 
+---------
+ t
+(1 row)
+
+SELECT test_dwb_set_overflow_stamp(60000) AS hot_future;
+ hot_future 
+------------
+ f
+(1 row)
+
+CREATE TEMP TABLE seal_before_future AS SELECT * FROM test_dwb_seal_stats();
+SELECT test_dwb_stage_lone_wait();
+ test_dwb_stage_lone_wait 
+--------------------------
+ 
+(1 row)
+
+SELECT s.wclass, s.reason, s.seals - b.seals AS dseals, s.pages - b.pages AS dpages
+  FROM test_dwb_seal_stats() s JOIN seal_before_future b USING (wclass, reason)
+ WHERE s.seals <> b.seals ORDER BY s.wclass, s.reason;
+  wclass  | reason | dseals | dpages 
+----------+--------+--------+--------
+ eviction | lone   |      1 |      1
+(1 row)
+
+SELECT test_dwb_retire() >= 0 AS drained;
+ drained 
+---------
+ t
+(1 row)
+
+-- and the ring is idle again
+SELECT test_dwb_states();
+                              test_dwb_states                               
+----------------------------------------------------------------------------
+ free=16 allocated=0 sealed=0 written=0 fsynced=0 data_written=0 retiring=0
+(1 row)
+

@@ -64,6 +64,7 @@
 #include "postgres.h"
 
 #include "access/xlogutils.h"
+#include "access/xlogwarm.h"
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
@@ -552,6 +553,14 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	HOLD_INTERRUPTS();
 
 	/*
+	 * Keep the replay warm pool out of these relations until the files are
+	 * gone: a worker reading one of their pages right now would otherwise
+	 * leave that page in the buffer pool, which is exactly what
+	 * DropRelationsAllBuffers() must not have happen behind it.
+	 */
+	XLogWarmDropBegin();
+
+	/*
 	 * Get rid of any remaining buffers for the relations.  bufmgr will just
 	 * drop them without bothering to write the contents.
 	 */
@@ -602,6 +611,8 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	}
 
 	pfree(rlocators);
+
+	XLogWarmDropEnd();
 
 	RESUME_INTERRUPTS();
 }
@@ -878,6 +889,13 @@ smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 	int			i;
 
 	/*
+	 * As in smgrdounlinkall(): a warm-pool worker must not be able to load a
+	 * page of this relation into buffers between the drop below and the
+	 * truncation that follows it.
+	 */
+	XLogWarmDropBegin();
+
+	/*
 	 * Get rid of any buffers for the about-to-be-deleted blocks. bufmgr will
 	 * just drop them without bothering to write the contents.
 	 */
@@ -922,6 +940,8 @@ smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 		reln->smgr_cached_nblocks[forknum[i]] =
 			nblocks[i] > old_nblocks[i] ? old_nblocks[i] : nblocks[i];
 	}
+
+	XLogWarmDropEnd();
 }
 
 /*

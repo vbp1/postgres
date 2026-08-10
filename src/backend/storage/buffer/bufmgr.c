@@ -54,6 +54,8 @@
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/checksum.h"
+#include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -61,7 +63,9 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#include "utils/injection_point.h"
 #include "utils/memdebug.h"
+#include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
@@ -76,9 +80,11 @@
 #define LocalBufHdrGetBlock(bufHdr) \
 	LocalBufferBlockPointers[-((bufHdr)->buf_id + 2)]
 
-/* Bits in SyncOneBuffer's return value */
+/* Bits in SyncOneBuffer's (and BgSyncPeekBuffer's) return value */
 #define BUF_WRITTEN				0x01
 #define BUF_REUSABLE			0x02
+#define BUF_BINNABLE			0x04	/* would-write candidate for the
+										 * vectored DWB flush bin */
 
 #define RELS_BSEARCH_THRESHOLD		20
 
@@ -518,6 +524,7 @@ static void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
 static void BufferSync(int flags);
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
+static int	BgSyncPeekBuffer(int buf_id);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
 static void WaitIO(BufferDesc *buf);
@@ -533,8 +540,9 @@ static inline BufferDesc *BufferAlloc(SMgrRelation smgr,
 static bool AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress);
 static void CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete);
 static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
-static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
-						IOObject io_object, IOContext io_context);
+static bool FlushBuffer(BufferDesc *buf, SMgrRelation reln,
+						IOObject io_object, IOContext io_context,
+						WritebackContext *wb_context);
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
 									   BlockNumber nForkBlock,
@@ -555,14 +563,22 @@ static int	ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
 
 
 /*
- * Implementation of PrefetchBuffer() for shared buffers.
+ * Look up a shared buffer without touching storage.
+ *
+ * Returns the buffer the block was found in, or InvalidBuffer.  As with
+ * PrefetchSharedBuffer(), the buffer is not pinned and the answer is only a
+ * hint: the caller must recheck, typically through ReadRecentBuffer().
+ *
+ * Callers that want the residency answer alone use this: the recovery
+ * prefetcher, to decide whether a block is worth handing to the warm pool,
+ * and a warm worker, to tell a real read from a hit (ReadBufferWithoutRelcache
+ * does not report that).
  */
-PrefetchBufferResult
-PrefetchSharedBuffer(SMgrRelation smgr_reln,
-					 ForkNumber forkNum,
-					 BlockNumber blockNum)
+Buffer
+LookupSharedBuffer(SMgrRelation smgr_reln,
+				   ForkNumber forkNum,
+				   BlockNumber blockNum)
 {
-	PrefetchBufferResult result = {InvalidBuffer, false};
 	BufferTag	newTag;			/* identity of requested block */
 	uint32		newHash;		/* hash value for newTag */
 	LWLock	   *newPartitionLock;	/* buffer partition lock for it */
@@ -583,8 +599,24 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 	buf_id = BufTableLookup(&newTag, newHash);
 	LWLockRelease(newPartitionLock);
 
+	return buf_id < 0 ? InvalidBuffer : buf_id + 1;
+}
+
+/*
+ * Implementation of PrefetchBuffer() for shared buffers.
+ */
+PrefetchBufferResult
+PrefetchSharedBuffer(SMgrRelation smgr_reln,
+					 ForkNumber forkNum,
+					 BlockNumber blockNum)
+{
+	PrefetchBufferResult result = {InvalidBuffer, false};
+	Buffer		recent_buffer;
+
+	recent_buffer = LookupSharedBuffer(smgr_reln, forkNum, blockNum);
+
 	/* If not in buffers, initiate prefetch */
-	if (buf_id < 0)
+	if (!BufferIsValid(recent_buffer))
 	{
 #ifdef USE_PREFETCH
 		/*
@@ -605,7 +637,7 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 		 * to avoid a buffer table lookup, but it's not pinned and it must be
 		 * rechecked!
 		 */
-		result.recent_buffer = buf_id + 1;
+		result.recent_buffer = recent_buffer;
 	}
 
 	/*
@@ -2357,6 +2389,7 @@ GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 	Buffer		buf;
 	uint32		buf_state;
 	bool		from_ring;
+	bool		staged;
 
 	/*
 	 * Ensure, while the spinlock's not yet held, that there's a free refcount
@@ -2450,11 +2483,17 @@ again:
 		}
 
 		/* OK, do the I/O */
-		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
+		staged = FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context,
+							 &DwbWritebackContext);
 		LWLockRelease(content_lock);
 
-		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
-									  &buf_hdr->tag);
+		/*
+		 * A staged page has already been scheduled, paced by the double write
+		 * buffer's own parameter; only the rest is ours to pace.
+		 */
+		if (!staged)
+			ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
+										  &buf_hdr->tag);
 	}
 
 
@@ -3364,6 +3403,9 @@ BufferSync(int flags)
 	int			i;
 	int			mask = BM_DIRTY;
 	WritebackContext wb_context;
+	int		   *dwb_bin = NULL;
+	int			dwb_bin_n = 0;
+	int			dwb_bin_size = 0;
 
 	/*
 	 * Unless this is a shutdown checkpoint or we have been explicitly told,
@@ -3426,6 +3468,17 @@ BufferSync(int flags)
 		return;					/* nothing to do */
 
 	WritebackContextInit(&wb_context, &checkpoint_flush_after);
+
+	/*
+	 * With the double write buffer active, permanent buffers are flushed in
+	 * bins of up to a batch: one batch write and one fdatasync cover the
+	 * whole bin instead of one per page (see FlushBufferBin).
+	 */
+	if (DWBIsEnabled() && !IsBootstrapProcessingMode())
+	{
+		dwb_bin_size = Min(dwb_batch_pages, DWB_FLUSH_BIN_MAX);
+		dwb_bin = palloc(dwb_bin_size * sizeof(int));
+	}
 
 	TRACE_POSTGRESQL_BUFFER_SYNC_START(NBuffers, num_to_scan);
 
@@ -3560,7 +3613,27 @@ BufferSync(int flags)
 		 */
 		if (pg_atomic_read_u32(&bufHdr->state) & BM_CHECKPOINT_NEEDED)
 		{
-			if (SyncOneBuffer(buf_id, false, &wb_context) & BUF_WRITTEN)
+			if (dwb_bin != NULL &&
+				(pg_atomic_read_u32(&bufHdr->state) & BM_PERMANENT))
+			{
+				/*
+				 * Vectored flush: collect permanent buffers into a bin and
+				 * write them through the double write buffer with a single
+				 * fdatasync.  Nothing is locked while the bin fills; the
+				 * members are re-checked when it flushes.
+				 */
+				dwb_bin[dwb_bin_n++] = buf_id;
+				if (dwb_bin_n == dwb_bin_size)
+				{
+					int			nw = FlushBufferBin(dwb_bin, dwb_bin_n,
+													false, &wb_context);
+
+					PendingCheckpointerStats.buffers_written += nw;
+					num_written += nw;
+					dwb_bin_n = 0;
+				}
+			}
+			else if (SyncOneBuffer(buf_id, false, &wb_context) & BUF_WRITTEN)
 			{
 				TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(buf_id);
 				PendingCheckpointerStats.buffers_written++;
@@ -3593,6 +3666,20 @@ BufferSync(int flags)
 		 * (This will check for barrier events even if it doesn't sleep.)
 		 */
 		CheckpointWriteDelay(flags, (double) num_processed / num_to_scan);
+	}
+
+	/* flush the residual bin of the vectored path */
+	if (dwb_bin != NULL)
+	{
+		if (dwb_bin_n > 0)
+		{
+			int			nw = FlushBufferBin(dwb_bin, dwb_bin_n,
+											false, &wb_context);
+
+			PendingCheckpointerStats.buffers_written += nw;
+			num_written += nw;
+		}
+		pfree(dwb_bin);
 	}
 
 	/*
@@ -3663,7 +3750,20 @@ BgBufferSync(WritebackContext *wb_context)
 	/* Variables for the scanning loop proper */
 	int			num_to_scan;
 	int			num_written;
+	int			num_issued;
 	int			reusable_buffers;
+
+	/*
+	 * Vectored DWB flush bin (bin_size stays 0 without the DWB).  The bin is
+	 * static so that a bin refused by a full cleaner queue survives the round
+	 * and is re-offered at the top of the next one.
+	 */
+	static int	bin[DWB_FLUSH_BIN_MAX];
+	static int	bin_n = 0;
+	int			bin_size = 0;
+	bool		use_cleaners;
+	bool		bin_deferred = false;
+	bool		skip_scan = false;
 
 	/* Variables for final smoothed_density update */
 	long		new_strategy_delta;
@@ -3679,6 +3779,16 @@ BgBufferSync(WritebackContext *wb_context)
 	PendingBgWriterStats.buf_alloc += recent_alloc;
 
 	/*
+	 * Fold the cleaner pool's completed writes into buf_written_clean:
+	 * pg_stat_bgwriter keeps counting pages written by LRU cleaning no matter
+	 * which process executed the write.
+	 */
+	use_cleaners = DWBCleanersActive();
+	if (use_cleaners)
+		PendingBgWriterStats.buf_written_clean +=
+			DWBCleanerFetchPoolWritten();
+
+	/*
 	 * If we're not running the LRU scan, just stop after doing the stats
 	 * stuff.  We mark the saved state invalid so that we can recover sanely
 	 * if LRU scan is turned back on later.
@@ -3686,6 +3796,13 @@ BgBufferSync(WritebackContext *wb_context)
 	if (bgwriter_lru_maxpages <= 0)
 	{
 		saved_info_valid = false;
+
+		/*
+		 * A disabled scan feeds the pool nothing; a bin carried over from
+		 * before the disable was only ever a hint, so drop it — the pages
+		 * stay dirty for later scans, backends or the next checkpoint.
+		 */
+		bin_n = 0;
 		return true;
 	}
 
@@ -3843,13 +3960,80 @@ BgBufferSync(WritebackContext *wb_context)
 
 	num_to_scan = bufs_to_lap;
 	num_written = 0;
+	num_issued = 0;
 	reusable_buffers = reusable_buffers_est;
 
-	/* Execute the LRU scan */
-	while (num_to_scan > 0 && reusable_buffers < upcoming_alloc_est)
+	/*
+	 * With the double write buffer active, would-write buffers are collected
+	 * into bins and flushed as one batch each: one batch write and one
+	 * fdatasync cover the whole bin instead of one per page (the LRU scan's
+	 * scattered singleton writes otherwise degenerate to lone-writer batches;
+	 * see FlushBufferBin).  With a cleaner pool the bgwriter writes nothing
+	 * itself: bins are handed to the pool's queue, and a refused bin (queue
+	 * full: the pool is saturated) is carried over to the next round while
+	 * the scan ends early — scanning further ahead would only produce bins
+	 * nobody can drain, and flushing here would stall the scan behind serial
+	 * batch fsyncs, starving the pool of fresh bins until the strategy clock
+	 * hand catches the scan point and evictions land on the backends.  The
+	 * bgwriter_lru_maxpages budget caps the pages ISSUED per round — bins
+	 * accepted by the queue, plus everything written in pool-less mode —
+	 * while buf_written_clean counts actual writes only (the pool's
+	 * completions are folded in at the top of the next round).
+	 */
+	if (DWBIsEnabled())
+		bin_size = Min(dwb_batch_pages, DWB_FLUSH_BIN_MAX);
+
+	/*
+	 * Offer a bin carried over from a deferred round before scanning anew.
+	 * Refused again: no scan this round, the queue is simply polled once per
+	 * bgwriter_delay while the pool is saturated.  Accepted: it spends this
+	 * round's issue budget, and a budget shrunk below the bin size meanwhile
+	 * (SIGHUP) ends the round before any scanning.
+	 */
+	if (use_cleaners && bin_n > 0)
 	{
-		int			sync_state = SyncOneBuffer(next_to_clean, true,
-											   wb_context);
+		if (DWBCleanerEnqueueBin(bin, bin_n))
+		{
+			num_issued += bin_n;
+			bin_n = 0;
+			if (num_issued >= bgwriter_lru_maxpages)
+			{
+				PendingBgWriterStats.maxwritten_clean++;
+				skip_scan = true;
+			}
+		}
+		else
+		{
+			DWBCleanerCountDeferral();
+			bin_deferred = true;
+			skip_scan = true;
+		}
+	}
+
+	/* Execute the LRU scan */
+	while (!skip_scan && num_to_scan > 0 &&
+		   reusable_buffers < upcoming_alloc_est)
+	{
+		int			sync_state;
+
+		if (bin_size > 0)
+			sync_state = BgSyncPeekBuffer(next_to_clean);
+		else
+			sync_state = SyncOneBuffer(next_to_clean, true, wb_context);
+
+		if (sync_state & BUF_BINNABLE)
+		{
+			bin[bin_n++] = next_to_clean;
+			reusable_buffers++;
+		}
+		else if (sync_state & BUF_WRITTEN)
+		{
+			reusable_buffers++;
+			num_written++;
+			num_issued++;
+		}
+		else if (sync_state & BUF_REUSABLE)
+			reusable_buffers++;
 
 		if (++next_to_clean >= NBuffers)
 		{
@@ -3858,17 +4042,67 @@ BgBufferSync(WritebackContext *wb_context)
 		}
 		num_to_scan--;
 
-		if (sync_state & BUF_WRITTEN)
+		/*
+		 * Flush a full bin, and any partial one that already covers the
+		 * remaining issue budget: the cap check below must see the true
+		 * issued count, not a deferred bin.
+		 */
+		if (bin_n > 0 &&
+			(bin_n == bin_size ||
+			 num_issued + bin_n >= bgwriter_lru_maxpages))
 		{
-			reusable_buffers++;
-			if (++num_written >= bgwriter_lru_maxpages)
+			if (use_cleaners)
 			{
-				PendingBgWriterStats.maxwritten_clean++;
-				break;
+				if (DWBCleanerEnqueueBin(bin, bin_n))
+				{
+					num_issued += bin_n;
+					bin_n = 0;
+				}
+				else
+				{
+					/* queue full: carry the bin over, end the round */
+					DWBCleanerCountDeferral();
+					bin_deferred = true;
+					break;
+				}
+			}
+			else
+			{
+				int			nw = FlushBufferBin(bin, bin_n, false, wb_context);
+
+				num_written += nw;
+				num_issued += nw;
+				bin_n = 0;
 			}
 		}
-		else if (sync_state & BUF_REUSABLE)
-			reusable_buffers++;
+
+		if (num_issued >= bgwriter_lru_maxpages)
+		{
+			PendingBgWriterStats.maxwritten_clean++;
+			break;
+		}
+	}
+
+	if (bin_n > 0 && !bin_deferred)
+	{
+		if (use_cleaners)
+		{
+			if (DWBCleanerEnqueueBin(bin, bin_n))
+			{
+				num_issued += bin_n;
+				bin_n = 0;
+			}
+			else
+				DWBCleanerCountDeferral();	/* carry the bin over */
+		}
+		else
+		{
+			int			nw = FlushBufferBin(bin, bin_n, false, wb_context);
+
+			num_written += nw;
+			num_issued += nw;
+			bin_n = 0;
+		}
 	}
 
 	PendingBgWriterStats.buf_written_clean += num_written;
@@ -3905,8 +4139,49 @@ BgBufferSync(WritebackContext *wb_context)
 #endif
 	}
 
-	/* Return true if OK to hibernate */
-	return (bufs_to_lap == 0 && recent_alloc == 0);
+	/* Return true if OK to hibernate; a carried bin is pending work */
+	return (bufs_to_lap == 0 && recent_alloc == 0 && bin_n == 0);
+}
+
+/*
+ * BgSyncPeekBuffer -- the check half of SyncOneBuffer (with its
+ * skip_recently_used semantics) without the write.  Classifies a buffer for
+ * the bgwriter's vectored flush: returns BUF_REUSABLE exactly as
+ * SyncOneBuffer would, plus BUF_BINNABLE when the buffer would have been
+ * written — the caller collects those into a bin and flushes them through
+ * the double write buffer as one batch (FlushBufferBin).  The bin flush
+ * re-checks validity, dirtiness and permanence under the header lock, so a
+ * buffer that changes between the peek and the flush is handled there:
+ * clean again is skipped, recycled to unlogged goes to the per-page
+ * fallback.  Pin and usage counts are not re-checked anywhere past this
+ * peek — a fresh pin or usage bump before the flush is the same benign
+ * race SyncOneBuffer itself has between its check and its write;
+ * skip_recently_used is an optimization, not a correctness contract.
+ */
+static int
+BgSyncPeekBuffer(int buf_id)
+{
+	BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
+	int			result = 0;
+	uint32		buf_state;
+
+	buf_state = LockBufHdr(bufHdr);
+
+	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
+		BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
+		result |= BUF_REUSABLE;
+	else
+	{
+		/* recently used: not a replacement candidate, nothing to write */
+		UnlockBufHdr(bufHdr, buf_state);
+		return result;
+	}
+
+	if ((buf_state & BM_VALID) && (buf_state & BM_DIRTY))
+		result |= BUF_BINNABLE;
+
+	UnlockBufHdr(bufHdr, buf_state);
+	return result;
 }
 
 /*
@@ -3930,6 +4205,7 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	int			result = 0;
 	uint32		buf_state;
 	BufferTag	tag;
+	bool		staged;
 
 	/* Make sure we can handle the pin */
 	ReservePrivateRefCountEntry();
@@ -3972,7 +4248,8 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	PinBuffer_Locked(bufHdr);
 	LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	staged = FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+						 wb_context);
 
 	LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 
@@ -3982,11 +4259,264 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 
 	/*
 	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so
-	 * IOContext will always be IOCONTEXT_NORMAL.
+	 * IOContext will always be IOCONTEXT_NORMAL.  A staged page went into the
+	 * same context already, before its batch could retire.
 	 */
-	ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
+	if (!staged)
+		ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
 
 	return result | BUF_WRITTEN;
+}
+
+/*
+ * FlushBufferBin -- flush a bin of buffers through the double write buffer
+ * as one batch.  Serves both background flushers: the checkpointer's
+ * BufferSync and the bgwriter's LRU scan.
+ *
+ * The per-page write protocol cannot amortize the batch fdatasync for a
+ * sequential stream: each page waits for its own batch copy to become
+ * durable before its data-file write, and the lone-writer seal then closes
+ * the batch over that single page — a background flusher would pay one
+ * fdatasync per page.  Here the whole bin is staged first, sealed and
+ * fdatasynced once, and only then written to the data files (the vectored
+ * background flush of the design, 3.4).
+ *
+ * All lock acquisitions in the gather phase are non-blocking: waiting for a
+ * content lock or for somebody's buffer I/O while already holding shared
+ * content locks of earlier bin members could deadlock against backends that
+ * take multiple buffer locks in their own order.  Buffers that cannot be
+ * claimed without waiting fall back to the ordinary per-page SyncOneBuffer
+ * path after the bin is done, when nothing is held.
+ *
+ * A caller may pre-filter for BM_PERMANENT (BufferSync does, the bgwriter's
+ * peek deliberately does not), but that is only ever an optimization: the
+ * authoritative check is made here under the buffer header lock, because a
+ * captured buffer can be recycled for an unlogged page before the bin
+ * flushes (the same benign window BufferSync already tolerates for the
+ * checkpoint-needed bit).  Non-permanent buffers go to the per-page
+ * fallback, whose FlushBuffer skips both the WAL flush and the DWB for
+ * them.  Pin counts and usage counts are NOT re-checked here — writing a
+ * buffer that became recently-used after the caller picked it is the same
+ * benign race the per-page paths have between their check and their write.
+ * Returns the number of buffers written.
+ *
+ * All of the above describes the mandatory mode (opportunistic = false):
+ * the caller's bins are fresh and every member must be flushed or handed
+ * to the blocking per-page fallback — checkpointer semantics.  The
+ * cleaner worker pool executes bins that sat in a queue for arbitrarily
+ * long, so it passes opportunistic = true: each member is reclassified
+ * under the buffer header lock with the LRU-candidate predicate of the
+ * scan that produced it (unpinned, unused, valid, dirty — see
+ * BgSyncPeekBuffer), and a member that fails the predicate, lost
+ * BM_PERMANENT, or cannot be claimed without waiting is dropped instead
+ * of written: the page stays dirty for the next scan pass or checkpoint,
+ * and the cleaner never blocks on somebody's content lock or I/O.  In
+ * this mode every bin member ends up either written (counted in the
+ * return value) or dropped, so callers derive the skip count as
+ * nbuf minus the result.
+ */
+int
+FlushBufferBin(const int *buf_ids, int nbuf, bool opportunistic,
+			   WritebackContext *wb_context)
+{
+	static char *bin_buf = NULL;
+
+	BufferDesc *bufs[DWB_FLUSH_BIN_MAX];
+	XLogRecPtr	lsns[DWB_FLUSH_BIN_MAX];
+	DWBSlotRef	refs[DWB_FLUSH_BIN_MAX];
+	int			fb_ids[DWB_FLUSH_BIN_MAX];
+	int			gathered = 0;
+	int			nfallback = 0;
+	int			written = 0;
+	XLogRecPtr	max_lsn = InvalidXLogRecPtr;
+	ErrorContextCallback errcallback;
+
+	Assert(nbuf > 0 && nbuf <= DWB_FLUSH_BIN_MAX);
+
+	if (bin_buf == NULL)
+		bin_buf = MemoryContextAllocAligned(TopMemoryContext,
+											(Size) DWB_FLUSH_BIN_MAX * BLCKSZ,
+											PG_IO_ALIGN_SIZE, 0);
+
+	/* Phase 1: claim and copy what can be claimed without waiting */
+	for (int i = 0; i < nbuf; i++)
+	{
+		BufferDesc *bufHdr = GetBufferDescriptor(buf_ids[i]);
+		uint32		buf_state;
+		char	   *dst;
+
+		/* Make sure we can handle the pin */
+		ReservePrivateRefCountEntry();
+		ResourceOwnerEnlarge(CurrentResourceOwner);
+
+		buf_state = LockBufHdr(bufHdr);
+		if (opportunistic &&
+			(BUF_STATE_GET_REFCOUNT(buf_state) != 0 ||
+			 BUF_STATE_GET_USAGECOUNT(buf_state) != 0))
+		{
+			/* a stale claim: the buffer became hot since it was queued */
+			UnlockBufHdr(bufHdr, buf_state);
+			continue;
+		}
+		if (!(buf_state & BM_VALID) || !(buf_state & BM_DIRTY))
+		{
+			/* clean already: nothing to do */
+			UnlockBufHdr(bufHdr, buf_state);
+			continue;
+		}
+		if (!(buf_state & BM_PERMANENT))
+		{
+			/*
+			 * Recycled for an unlogged page after the bin captured it, or a
+			 * shutdown checkpoint's unlogged buffer raced past the unlocked
+			 * pre-check.  Staging it would feed the DWB — and XLogFlush —
+			 * a fake unlogged LSN, so route it to the per-page path instead.
+			 */
+			UnlockBufHdr(bufHdr, buf_state);
+			if (!opportunistic)
+				fb_ids[nfallback++] = buf_ids[i];
+			continue;
+		}
+		PinBuffer_Locked(bufHdr);
+
+		if (!LWLockConditionalAcquire(BufferDescriptorGetContentLock(bufHdr),
+									  LW_SHARED))
+		{
+			UnpinBuffer(bufHdr);
+			if (!opportunistic)
+				fb_ids[nfallback++] = buf_ids[i];
+			continue;
+		}
+		if (!StartBufferIO(bufHdr, false, true))
+		{
+			/*
+			 * Either somebody else's I/O is in flight (fall back per-page:
+			 * SyncOneBuffer may wait and rechecks dirtiness) or the buffer
+			 * went clean; the fallback handles both.  The opportunistic
+			 * caller waits for neither and leaves the page to a later pass.
+			 */
+			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
+			UnpinBuffer(bufHdr);
+			if (!opportunistic)
+				fb_ids[nfallback++] = buf_ids[i];
+			continue;
+		}
+
+		/* as in FlushBuffer: read the LSN under the header lock */
+		buf_state = LockBufHdr(bufHdr);
+		lsns[gathered] = BufferGetLSN(bufHdr);
+		buf_state &= ~BM_JUST_DIRTIED;
+		UnlockBufHdr(bufHdr, buf_state);
+
+		TRACE_POSTGRESQL_BUFFER_FLUSH_START(BufTagGetForkNum(&bufHdr->tag),
+											bufHdr->tag.blockNum,
+											BufTagGetRelFileLocator(&bufHdr->tag).spcOid,
+											BufTagGetRelFileLocator(&bufHdr->tag).dbOid,
+											BufTagGetRelFileLocator(&bufHdr->tag).relNumber);
+
+		/*
+		 * The private copy decouples the image from concurrent hint-bit
+		 * updates, like PageSetChecksumCopy in the per-page path; an all-zero
+		 * page must stay all-zero, so it gets no checksum.
+		 */
+		dst = bin_buf + (Size) gathered * BLCKSZ;
+		memcpy(dst, BufHdrGetBlock(bufHdr), BLCKSZ);
+		if (DataChecksumsEnabled() && !PageIsNew((Page) dst))
+			((PageHeader) dst)->pd_checksum =
+				pg_checksum_page(dst, bufHdr->tag.blockNum);
+
+		if (lsns[gathered] > max_lsn)
+			max_lsn = lsns[gathered];
+		bufs[gathered] = bufHdr;
+		gathered++;
+	}
+
+	if (gathered > 0)
+	{
+		/* Phase 2: one WAL flush covers the whole bin (WAL before data) */
+		if (!XLogRecPtrIsInvalid(max_lsn))
+			XLogFlush(max_lsn);
+
+		/* Setup error traceback support for ereport() */
+		errcallback.callback = shared_buffer_write_error_callback;
+		errcallback.arg = NULL;
+		errcallback.previous = error_context_stack;
+		error_context_stack = &errcallback;
+
+		/* Phase 3: stage everything, then one seal + one fdatasync */
+		for (int i = 0; i < gathered; i++)
+		{
+			errcallback.arg = bufs[i];
+			DWBStagePageWriteNoWait(&bufs[i]->tag,
+									bin_buf + (Size) i * BLCKSZ,
+									lsns[i], &refs[i]);
+		}
+		errcallback.arg = NULL;
+		DWBWaitStagedWrites(refs, gathered);
+
+		/* Phase 4: the data-file writes */
+		for (int i = 0; i < gathered; i++)
+		{
+			BufferDesc *bufHdr = bufs[i];
+			SMgrRelation reln;
+			instr_time	io_start;
+			BufferTag	tag;
+
+			errcallback.arg = bufHdr;
+			reln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag),
+							INVALID_PROC_NUMBER);
+
+			io_start = pgstat_prepare_io_time(track_io_timing);
+			smgrwrite(reln,
+					  BufTagGetForkNum(&bufHdr->tag),
+					  bufHdr->tag.blockNum,
+					  bin_buf + (Size) i * BLCKSZ,
+					  false);
+			pgstat_count_io_op_time(IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+									IOOP_WRITE, io_start, 1, BLCKSZ);
+
+			/* queue, and where the retirement is inline also issue */
+			tag = bufHdr->tag;
+			ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
+			if (DWBRetiresInline())
+			{
+				IssuePendingWritebacks(wb_context, IOCONTEXT_NORMAL);
+				INJECTION_POINT("dwb-inline-retire", wb_context);
+			}
+			DWBFinishPageWrite(&refs[i]);
+
+			pgBufferUsage.shared_blks_written++;
+
+			TerminateBufferIO(bufHdr, true, 0, true, false);
+
+			TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(BufTagGetForkNum(&bufHdr->tag),
+											   bufHdr->tag.blockNum,
+											   BufTagGetRelFileLocator(&bufHdr->tag).spcOid,
+											   BufTagGetRelFileLocator(&bufHdr->tag).dbOid,
+											   BufTagGetRelFileLocator(&bufHdr->tag).relNumber);
+
+			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
+			TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(bufHdr->buf_id);
+			UnpinBuffer(bufHdr);
+
+			written++;
+		}
+
+		error_context_stack = errcallback.previous;
+	}
+
+	/* Phase 5: per-page fallback for the contended buffers, nothing held */
+	Assert(!opportunistic || nfallback == 0);
+	for (int i = 0; i < nfallback; i++)
+	{
+		if (SyncOneBuffer(fb_ids[i], false, wb_context) & BUF_WRITTEN)
+		{
+			TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(fb_ids[i]);
+			written++;
+		}
+	}
+
+	return written;
 }
 
 /*
@@ -4288,10 +4818,17 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
  *
  * If the caller has an smgr reference for the buffer's relation, pass it
  * as the second parameter.  If not, pass NULL.
+ *
+ * A page written through the double write buffer wants a kernel writeback
+ * started before its batch retires, so that the sync retiring the batch is a
+ * cheap barrier rather than a full flush.  Such a page is queued into
+ * wb_context, and true is returned so the caller knows not to queue it a
+ * second time; a page written without the double write buffer is left to the
+ * caller entirely and returns false.
  */
-static void
+static bool
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
-			IOContext io_context)
+			IOContext io_context, WritebackContext *wb_context)
 {
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
@@ -4299,6 +4836,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	Block		bufBlock;
 	char	   *bufToWrite;
 	uint32		buf_state;
+	DWBSlotRef	dwbref;
+	bool		staged;
 
 	/*
 	 * Try to start an I/O operation.  If StartBufferIO returns false, then
@@ -4306,7 +4845,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * anything.
 	 */
 	if (!StartBufferIO(buf, false, false))
-		return;
+		return false;
 
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = shared_buffer_write_error_callback;
@@ -4371,6 +4910,23 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 */
 	bufToWrite = PageSetChecksumCopy((Page) bufBlock, buf->tag.blockNum);
 
+	/*
+	 * Double write buffer path: before the data-file write, make the copy
+	 * durable in pg_dwb/ so that a torn smgrwrite can always be repaired from
+	 * there (full_page_writes replacement, see storage/dwb.h).  Only
+	 * BM_PERMANENT buffers need this: unlogged relations are reset from their
+	 * init fork after a crash, so their torn writes don't matter. Data
+	 * checksums are required by the DWB, so for any page with content
+	 * bufToWrite is a private copy, stable regardless of concurrent hint-bit
+	 * updates; PageSetChecksumCopy returns the shared page only when it is
+	 * all-zero new, where there are no tuples for hint bits to touch.
+	 */
+	if (DWBIsEnabled() && (buf_state & BM_PERMANENT) &&
+		!IsBootstrapProcessingMode())
+		DWBStagePageWrite(&buf->tag, bufToWrite, recptr, &dwbref);
+	else
+		dwbref.batch_idx = -1;
+
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 	/*
@@ -4403,6 +4959,31 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
 							IOOP_WRITE, io_start, 1, BLCKSZ);
 
+	staged = dwbref.batch_idx >= 0;
+	if (staged)
+	{
+		/*
+		 * Step 6b: queue the page for kernel writeback, so that the sync
+		 * retiring its batch becomes a cheap barrier instead of a full flush.
+		 * Not durability — that comes from the sync.
+		 *
+		 * Queueing is not handing over: the context holds the tag until
+		 * dwb_writeback_after of them have accumulated, so under a retire
+		 * pool a batch may retire before the kernel has heard about its
+		 * pages.  That is the price of not making one syscall per page, and
+		 * the sync is correct either way.  When the retirement runs inline
+		 * there is nothing to gamble on — the fsync is a few statements
+		 * below — so the queue is emptied here instead.
+		 */
+		ScheduleBufferTagForWriteback(wb_context, io_context, &buf->tag);
+		if (DWBRetiresInline())
+		{
+			IssuePendingWritebacks(wb_context, io_context);
+			INJECTION_POINT("dwb-inline-retire", wb_context);
+		}
+		DWBFinishPageWrite(&dwbref);
+	}
+
 	pgBufferUsage.shared_blks_written++;
 
 	/*
@@ -4419,6 +5000,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
+
+	return staged;
 }
 
 /*
@@ -4903,6 +5486,7 @@ DropDatabaseBuffers(Oid dbid)
 	 * database isn't our own.
 	 */
 
+
 	for (i = 0; i < NBuffers; i++)
 	{
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
@@ -5013,7 +5597,8 @@ FlushRelationBuffers(Relation rel)
 		{
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+						&DwbWritebackContext);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
 		}
@@ -5110,7 +5695,8 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 		{
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION,
+						IOCONTEXT_NORMAL, &DwbWritebackContext);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
 		}
@@ -5338,7 +5924,8 @@ FlushDatabaseBuffers(Oid dbid)
 		{
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+						&DwbWritebackContext);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
 		}
@@ -5365,7 +5952,8 @@ FlushOneBuffer(Buffer buffer)
 
 	Assert(LWLockHeldByMe(BufferDescriptorGetContentLock(bufHdr)));
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+				&DwbWritebackContext);
 }
 
 /*
@@ -6615,7 +7203,8 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
 	if (buf_state & BM_DIRTY)
 	{
 		LWLockAcquire(BufferDescriptorGetContentLock(desc), LW_SHARED);
-		FlushBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		FlushBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+					&DwbWritebackContext);
 		*buffer_flushed = true;
 		LWLockRelease(BufferDescriptorGetContentLock(desc));
 	}

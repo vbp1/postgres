@@ -1854,6 +1854,15 @@ description | Waiting for a newly initialized WAL file to reach durable storage
    with the <function>pg_stat_reset_shared</function> function.
   </para>
 
+  <para>
+   When <xref linkend="guc-replay-warm-workers"/> is set, whether a block was
+   already in the buffer pool is decided by the pool's workers rather than by
+   recovery itself, and <structfield>prefetch</structfield> and
+   <structfield>hit</structfield> are counted there.  A request that no worker
+   ever serves — one withdrawn because recovery moved its read position, or
+   one whose worker exited while holding it — is counted in neither.
+  </para>
+
   <table id="pg-stat-recovery-prefetch-view" xreflabel="pg_stat_recovery_prefetch">
    <title><structname>pg_stat_recovery_prefetch</structname> View</title>
    <tgroup cols="1">
@@ -2606,8 +2615,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
   </para>
 
   <para>
-   Currently, I/O on relations (e.g. tables, indexes) and WAL activity are
-   tracked. However, relation I/O which bypasses shared buffers
+   Currently, I/O on relations (e.g. tables, indexes), WAL activity and the
+   double write buffer (see <xref linkend="guc-io-torn-pages-protection"/>)
+   are tracked. However, relation I/O which bypasses shared buffers
    (e.g. when moving a table from one tablespace to another) is currently
    not tracked.
   </para>
@@ -2660,6 +2670,13 @@ description | Waiting for a newly initialized WAL file to reach durable storage
         <listitem>
          <para>
           <literal>temp relation</literal>: Temporary relations.
+         </para>
+        </listitem>
+        <listitem>
+         <para>
+          <literal>dwb</literal>: The double write buffer ring in
+          <filename>pg_dwb</filename> (see
+          <xref linkend="guc-io-torn-pages-protection"/>).
          </para>
         </listitem>
         <listitem>
@@ -3059,7 +3076,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <structfield>buffers_clean</structfield> <type>bigint</type>
       </para>
       <para>
-       Number of buffers written by the background writer
+       Number of buffers written by the background writer's LRU cleaning,
+       including buffers its scan handed to the cleaner worker pool
+       (see <xref linkend="guc-dwb-cleaner-workers"/>)
       </para></entry>
      </row>
 
@@ -3069,7 +3088,8 @@ description | Waiting for a newly initialized WAL file to reach durable storage
       </para>
       <para>
        Number of times the background writer stopped a cleaning
-       scan because it had written too many buffers
+       scan because it had issued too many buffers, counting both its own
+       writes and bins handed to the cleaner worker pool
       </para></entry>
      </row>
 

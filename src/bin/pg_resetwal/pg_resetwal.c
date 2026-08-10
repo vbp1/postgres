@@ -708,6 +708,7 @@ GuessControlValues(void)
 	ControlFile.wal_level = WAL_LEVEL_MINIMAL;
 	ControlFile.wal_log_hints = false;
 	ControlFile.track_commit_timestamp = false;
+	ControlFile.io_torn_pages_protection = DWB_PROTECT_FULL_PAGES;
 	ControlFile.MaxConnections = 100;
 	ControlFile.max_wal_senders = 10;
 	ControlFile.max_worker_processes = 8;
@@ -917,6 +918,7 @@ RewriteControlFile(void)
 	ControlFile.wal_level = WAL_LEVEL_MINIMAL;
 	ControlFile.wal_log_hints = false;
 	ControlFile.track_commit_timestamp = false;
+	ControlFile.io_torn_pages_protection = DWB_PROTECT_FULL_PAGES;
 	ControlFile.MaxConnections = 100;
 	ControlFile.max_wal_senders = 10;
 	ControlFile.max_worker_processes = 8;

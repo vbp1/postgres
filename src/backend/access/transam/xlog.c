@@ -83,6 +83,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -146,9 +147,12 @@ int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
 /*
  * Number of WAL insertion locks to use. A higher value allows more insertions
  * to happen concurrently, but adds some CPU overhead to flushing the WAL,
- * which needs to iterate all the locks.
+ * which needs to iterate all the locks.  Raised from 8 for double_writes
+ * workloads: with full-page images gone the record stream is made of many
+ * small records, so high-connection benchmarks bottleneck on insertion-slot
+ * contention well before the WAL device saturates.
  */
-#define NUM_XLOGINSERT_LOCKS  8
+#define NUM_XLOGINSERT_LOCKS  32
 
 /*
  * Max distance from last checkpoint, before triggering a new xlog-based
@@ -687,6 +691,7 @@ static void UpdateLastRemovedPtr(char *filename);
 static void ValidateXLOGDirectoryStructure(void);
 static void CleanupBackupHistory(void);
 static void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force);
+static bool EffectiveFullPageWrites(void);
 static bool PerformRecoveryXLogAction(void);
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
@@ -4228,6 +4233,7 @@ InitControlFile(uint64 sysidentifier, uint32 data_checksum_version)
 	ControlFile->wal_level = wal_level;
 	ControlFile->wal_log_hints = wal_log_hints;
 	ControlFile->track_commit_timestamp = track_commit_timestamp;
+	ControlFile->io_torn_pages_protection = io_torn_pages_protection;
 	ControlFile->data_checksum_version = data_checksum_version;
 }
 
@@ -5115,7 +5121,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	checkPoint.redo = wal_segment_size + SizeOfXLogLongPHD;
 	checkPoint.ThisTimeLineID = BootstrapTimeLineID;
 	checkPoint.PrevTimeLineID = BootstrapTimeLineID;
-	checkPoint.fullPageWrites = fullPageWrites;
+	checkPoint.fullPageWrites = EffectiveFullPageWrites();
 	checkPoint.wal_level = wal_level;
 	checkPoint.nextXid =
 		FullTransactionIdFromEpochAndXid(0, FirstNormalTransactionId);
@@ -5436,6 +5442,26 @@ CheckRequiredParameterValues(void)
 	}
 
 	/*
+	 * A server that believes full page images protect it must not replay WAL
+	 * generated without them: its own crash would leave torn data pages that
+	 * neither this WAL nor its configuration can repair.  A local double
+	 * write buffer repairs its own torn pages instead, and under "off" the
+	 * user has explicitly waived the protection, so only the "full_pages"
+	 * expectation is refused.
+	 */
+	if (ArchiveRecoveryRequested &&
+		ControlFile->io_torn_pages_protection != DWB_PROTECT_FULL_PAGES &&
+		io_torn_pages_protection == DWB_PROTECT_FULL_PAGES)
+	{
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL was generated with \"io_torn_pages_protection=%s\", cannot continue recovering with \"io_torn_pages_protection=full_pages\"",
+						DWBProtectionModeName(ControlFile->io_torn_pages_protection)),
+				 errdetail("The WAL carries no full page images, so a crash of this server would leave torn data pages that nothing can repair."),
+				 errhint("Set \"io_torn_pages_protection\" to \"double_writes\" on this server, or to \"full_pages\" on the server that generated the WAL.")));
+	}
+
+	/*
 	 * For Hot Standby, the WAL must be generated with 'replica' mode, and we
 	 * must have at least as many backend slots as the primary.
 	 */
@@ -5593,6 +5619,85 @@ StartupXLOG(void)
 	}
 	else
 		didCrash = false;
+
+	/*
+	 * Create or validate the double write buffer ring, repair torn data pages
+	 * from it if the previous run did not close it cleanly, and durably bump
+	 * its generation before any of its slots can be written. This runs before
+	 * InitWalRecovery: the repairs establish the base that WAL replay
+	 * advances from, and the backup_label file (a "restoring from base
+	 * backup" indicator, together with backupStartPoint) is still in place
+	 * here.
+	 */
+	{
+		bool		restoring_backup;
+		XLogRecPtr	dwb_applied_upto;
+
+		/*
+		 * A failure to probe for backup_label must fail closed: reading its
+		 * absence out of an EACCES/EIO would drop the one guard that keeps a
+		 * ring shipped inside a base backup from being applied into the
+		 * restored cluster.  (read_backup_label treats a failing open the
+		 * same way.)
+		 */
+		if (access(BACKUP_LABEL_FILE, F_OK) == 0)
+			restoring_backup = true;
+		else if (errno != ENOENT)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not access file \"%s\": %m",
+							BACKUP_LABEL_FILE)));
+		else
+			restoring_backup =
+				!XLogRecPtrIsInvalid(ControlFile->backupStartPoint);
+
+		/*
+		 * Crash recovery over WAL generated without any torn page protection
+		 * cannot repair pages the crash tore, whatever the local mode says
+		 * now.  The mode-based FATAL in CheckRequiredParameterValues fires
+		 * for archive recovery only, so this is the one transition that would
+		 * otherwise be silent.  On a standby the pg_control field describes
+		 * the primary, not the run that crashed here — and a local
+		 * double_writes standby of an "off" primary repairs its own torn
+		 * pages from its ring — so the warning is limited to servers whose
+		 * crashed run owned the field.
+		 */
+		if (didCrash &&
+			ControlFile->state != DB_IN_ARCHIVE_RECOVERY &&
+			ControlFile->io_torn_pages_protection == DWB_PROTECT_OFF &&
+			io_torn_pages_protection != DWB_PROTECT_OFF)
+			ereport(WARNING,
+					(errmsg("database system was interrupted while torn page protection was disabled"),
+					 errdetail("WAL generated with \"io_torn_pages_protection=off\" carries no full page images; pages torn by the crash cannot be repaired by this recovery.")));
+
+		dwb_applied_upto = DWBStartup(restoring_backup);
+
+		/*
+		 * On a standby that did not durably retire the ring — whether it
+		 * crashed or merely skipped its shutdown restartpoint — consistency
+		 * must not be declared before the local WAL covers the repaired
+		 * pages.  The write path guarantees minRecoveryPoint already does —
+		 * FlushBuffer's XLogFlush advances it durably before the page can
+		 * enter the ring — so this raise is expected to be a no-op; it
+		 * stays as a belt-and-braces enforcement of the invariant.  The
+		 * timeline is left alone: any LSN the ring can hold lies on a
+		 * timeline minRecoveryPoint has already seen, by the same write-path
+		 * argument.
+		 */
+		if ((ControlFile->state == DB_IN_ARCHIVE_RECOVERY ||
+			 ControlFile->state == DB_SHUTDOWNED_IN_RECOVERY) &&
+			!XLogRecPtrIsInvalid(ControlFile->minRecoveryPoint) &&
+			dwb_applied_upto > ControlFile->minRecoveryPoint)
+		{
+			ereport(LOG,
+					(errmsg("raising minimum recovery point to %X/%X to cover pages repaired from the double write buffer",
+							LSN_FORMAT_ARGS(dwb_applied_upto))));
+			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+			ControlFile->minRecoveryPoint = dwb_applied_upto;
+			UpdateControlFile();
+			LWLockRelease(ControlFileLock);
+		}
+	}
 
 	/*
 	 * Prepare for WAL recovery if needed.
@@ -6680,6 +6785,15 @@ ShutdownXLOG(int code, Datum arg)
 
 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
 	}
+
+	/*
+	 * Retire what is left in the double write buffer ring — a shutdown
+	 * restartpoint can be skipped entirely, leaving segment fsyncs pending —
+	 * and mark the ring cleanly closed.  The next start can then skip the
+	 * apply-pass, and a start under a different io_torn_pages_protection mode
+	 * is legal.
+	 */
+	DWBMarkCleanShutdown();
 }
 
 /*
@@ -8156,7 +8270,8 @@ XLogReportParameters(void)
 		max_wal_senders != ControlFile->max_wal_senders ||
 		max_prepared_xacts != ControlFile->max_prepared_xacts ||
 		max_locks_per_xact != ControlFile->max_locks_per_xact ||
-		track_commit_timestamp != ControlFile->track_commit_timestamp)
+		track_commit_timestamp != ControlFile->track_commit_timestamp ||
+		io_torn_pages_protection != ControlFile->io_torn_pages_protection)
 	{
 		/*
 		 * The change in number of backend slots doesn't need to be WAL-logged
@@ -8164,8 +8279,14 @@ XLogReportParameters(void)
 		 * with wal_level=minimal anyway. We don't really care about the
 		 * values in pg_control either if wal_level=minimal, but seems better
 		 * to keep them up-to-date to avoid confusion.
+		 *
+		 * An io_torn_pages_protection change is always WAL-logged: replay
+		 * must learn the generating server's mode, because the FATAL in
+		 * CheckRequiredParameterValues keys on it.
 		 */
-		if (wal_level != ControlFile->wal_level || XLogIsNeeded())
+		if (wal_level != ControlFile->wal_level ||
+			io_torn_pages_protection != ControlFile->io_torn_pages_protection ||
+			XLogIsNeeded())
 		{
 			xl_parameter_change xlrec;
 			XLogRecPtr	recptr;
@@ -8178,6 +8299,7 @@ XLogReportParameters(void)
 			xlrec.wal_level = wal_level;
 			xlrec.wal_log_hints = wal_log_hints;
 			xlrec.track_commit_timestamp = track_commit_timestamp;
+			xlrec.io_torn_pages_protection = io_torn_pages_protection;
 
 			XLogBeginInsert();
 			XLogRegisterData(&xlrec, sizeof(xlrec));
@@ -8196,10 +8318,29 @@ XLogReportParameters(void)
 		ControlFile->wal_level = wal_level;
 		ControlFile->wal_log_hints = wal_log_hints;
 		ControlFile->track_commit_timestamp = track_commit_timestamp;
+		ControlFile->io_torn_pages_protection = io_torn_pages_protection;
 		UpdateControlFile();
 
 		LWLockRelease(ControlFileLock);
 	}
+}
+
+/*
+ * The effective value of the full_page_writes setting.
+ *
+ * io_torn_pages_protection selects the torn-page protection mechanism: under
+ * "double_writes" the durable copy in pg_dwb/ replaces FPIs and under "off"
+ * the user has declared torn writes impossible, so both force this off; the
+ * legacy full_page_writes GUC keeps its meaning under "full_pages" only.
+ * Online backups taken on a primary still force page images regardless of
+ * this value, through the runningBackups term of doPageWrites (see
+ * XLogInsertRecord); backups initiated on a standby cannot and are refused
+ * by do_pg_backup_start when the replayed WAL lacks page images.
+ */
+static bool
+EffectiveFullPageWrites(void)
+{
+	return io_torn_pages_protection == DWB_PROTECT_FULL_PAGES && fullPageWrites;
 }
 
 /*
@@ -8213,6 +8354,7 @@ void
 UpdateFullPageWrites(void)
 {
 	XLogCtlInsert *Insert = &XLogCtl->Insert;
+	bool		newFullPageWrites = EffectiveFullPageWrites();
 	bool		recoveryInProgress;
 
 	/*
@@ -8222,7 +8364,7 @@ UpdateFullPageWrites(void)
 	 * because we assume that there is no concurrently running process which
 	 * can update it.
 	 */
-	if (fullPageWrites == Insert->fullPageWrites)
+	if (newFullPageWrites == Insert->fullPageWrites)
 		return;
 
 	/*
@@ -8241,7 +8383,7 @@ UpdateFullPageWrites(void)
 	 * setting it to false, first write the WAL record and then set the global
 	 * flag.
 	 */
-	if (fullPageWrites)
+	if (newFullPageWrites)
 	{
 		WALInsertLockAcquireExclusive();
 		Insert->fullPageWrites = true;
@@ -8255,18 +8397,45 @@ UpdateFullPageWrites(void)
 	if (XLogStandbyInfoActive() && !recoveryInProgress)
 	{
 		XLogBeginInsert();
-		XLogRegisterData(&fullPageWrites, sizeof(bool));
+		XLogRegisterData(&newFullPageWrites, sizeof(bool));
 
 		XLogInsert(RM_XLOG_ID, XLOG_FPW_CHANGE);
 	}
 
-	if (!fullPageWrites)
+	if (!newFullPageWrites)
 	{
 		WALInsertLockAcquireExclusive();
 		Insert->fullPageWrites = false;
 		WALInsertLockRelease();
 	}
 	END_CRIT_SECTION();
+}
+
+/*
+ * Track the last replayed WAL record declaring full-page writes disabled,
+ * for the standby backup guards in do_pg_backup_start/stop.  Both
+ * XLOG_FPW_CHANGE records and checkpoint records can carry the declaration:
+ * a primary restarted into a mode without page images
+ * (io_torn_pages_protection = "double_writes"/"off", or full_page_writes =
+ * off) emits no XLOG_FPW_CHANGE — its checkpoints are the only replayed
+ * evidence of the change (see UpdateFullPageWrites).
+ *
+ * Only the mode-based loss of images is refused by
+ * CheckRequiredParameterValues (keyed on the generating server's
+ * io_torn_pages_protection in pg_control); the legacy case — a "full_pages"
+ * primary running with full_page_writes = off — still replays, and this
+ * tracking is what lets the backup guards reject it.
+ */
+static void
+XLogTrackFullPageWritesDisabled(XLogReaderState *record, bool fpw)
+{
+	if (fpw)
+		return;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	if (XLogCtl->lastFpwDisableRecPtr < record->ReadRecPtr)
+		XLogCtl->lastFpwDisableRecPtr = record->ReadRecPtr;
+	SpinLockRelease(&XLogCtl->info_lck);
 }
 
 /*
@@ -8314,6 +8483,7 @@ xlog_redo(XLogReaderState *record)
 		TimeLineID	replayTLI;
 
 		memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
+		XLogTrackFullPageWritesDisabled(record, checkPoint.fullPageWrites);
 		/* In a SHUTDOWN checkpoint, believe the counters exactly */
 		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
 		TransamVariables->nextXid = checkPoint.nextXid;
@@ -8420,6 +8590,7 @@ xlog_redo(XLogReaderState *record)
 		TimeLineID	replayTLI;
 
 		memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
+		XLogTrackFullPageWritesDisabled(record, checkPoint.fullPageWrites);
 		/* In an ONLINE checkpoint, treat the XID counter as a minimum */
 		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
 		if (FullTransactionIdPrecedes(TransamVariables->nextXid,
@@ -8587,6 +8758,7 @@ xlog_redo(XLogReaderState *record)
 		ControlFile->max_locks_per_xact = xlrec.max_locks_per_xact;
 		ControlFile->wal_level = xlrec.wal_level;
 		ControlFile->wal_log_hints = xlrec.wal_log_hints;
+		ControlFile->io_torn_pages_protection = xlrec.io_torn_pages_protection;
 
 		/*
 		 * Update minRecoveryPoint to ensure that if recovery is aborted, we
@@ -8627,17 +8799,11 @@ xlog_redo(XLogReaderState *record)
 		memcpy(&fpw, XLogRecGetData(record), sizeof(bool));
 
 		/*
-		 * Update the LSN of the last replayed XLOG_FPW_CHANGE record so that
-		 * do_pg_backup_start() and do_pg_backup_stop() can check whether
-		 * full_page_writes has been disabled during online backup.
+		 * Track the disable point so that do_pg_backup_start() and
+		 * do_pg_backup_stop() can check whether full-page writes were
+		 * disabled during an online backup.
 		 */
-		if (!fpw)
-		{
-			SpinLockAcquire(&XLogCtl->info_lck);
-			if (XLogCtl->lastFpwDisableRecPtr < record->ReadRecPtr)
-				XLogCtl->lastFpwDisableRecPtr = record->ReadRecPtr;
-			SpinLockRelease(&XLogCtl->info_lck);
-		}
+		XLogTrackFullPageWritesDisabled(record, fpw);
 
 		/* Keep track of full_page_writes */
 		lastFullPageWrites = fpw;
@@ -8932,6 +9098,7 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 		do
 		{
 			bool		checkpointfpw;
+			int			primary_iotpp;
 
 			/*
 			 * Force a CHECKPOINT.  Aside from being necessary to prevent torn
@@ -8965,6 +9132,7 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 			state->startpoint = ControlFile->checkPointCopy.redo;
 			state->starttli = ControlFile->checkPointCopy.ThisTimeLineID;
 			checkpointfpw = ControlFile->checkPointCopy.fullPageWrites;
+			primary_iotpp = ControlFile->io_torn_pages_protection;
 			LWLockRelease(ControlFileLock);
 
 			if (backup_started_in_recovery)
@@ -8983,12 +9151,19 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 				if (!checkpointfpw || state->startpoint <= recptr)
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-							 errmsg("WAL generated with \"full_page_writes=off\" was replayed "
+							 errmsg("WAL generated without full page images was replayed "
 									"since last restartpoint"),
-							 errhint("This means that the backup being taken on the standby "
-									 "is corrupt and should not be used. "
-									 "Enable \"full_page_writes\" and run CHECKPOINT on the primary, "
-									 "and then try an online backup again.")));
+							 primary_iotpp != DWB_PROTECT_FULL_PAGES
+							 ? errdetail("The primary runs \"io_torn_pages_protection\" = \"%s\" "
+										 "and does not write full page images.",
+										 DWBProtectionModeName(primary_iotpp))
+							 : errdetail("The primary has \"full_page_writes\" disabled."),
+							 errhint("A backup taken on a standby needs full page images in the "
+									 "replayed WAL; the primary's double write buffer cannot "
+									 "substitute for them. Set io_torn_pages_protection = "
+									 "\"full_pages\" (with \"full_page_writes\" enabled) on the "
+									 "primary and run CHECKPOINT there, or take the backup on "
+									 "the primary.")));
 
 				/*
 				 * During recovery, since we don't use the end-of-backup WAL
@@ -9267,6 +9442,7 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 	if (backup_stopped_in_recovery)
 	{
 		XLogRecPtr	recptr;
+		int			primary_iotpp;
 
 		/*
 		 * Check to see if all WAL replayed during online backup contain
@@ -9276,15 +9452,29 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 		recptr = XLogCtl->lastFpwDisableRecPtr;
 		SpinLockRelease(&XLogCtl->info_lck);
 
+		LWLockAcquire(ControlFileLock, LW_SHARED);
+		primary_iotpp = ControlFile->io_torn_pages_protection;
+		LWLockRelease(ControlFileLock);
+
 		if (state->startpoint <= recptr)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("WAL generated with \"full_page_writes=off\" was replayed "
+					 errmsg("WAL generated without full page images was replayed "
 							"during online backup"),
-					 errhint("This means that the backup being taken on the standby "
-							 "is corrupt and should not be used. "
-							 "Enable \"full_page_writes\" and run CHECKPOINT on the primary, "
-							 "and then try an online backup again.")));
+					 primary_iotpp != DWB_PROTECT_FULL_PAGES
+					 ? errdetail("The backup being taken on the standby is corrupt "
+								 "and should not be used: the primary runs "
+								 "\"io_torn_pages_protection\" = \"%s\".",
+								 DWBProtectionModeName(primary_iotpp))
+					 : errdetail("The backup being taken on the standby is corrupt "
+								 "and should not be used: the primary has "
+								 "\"full_page_writes\" disabled."),
+					 errhint("A backup taken on a standby needs full page images in the "
+							 "replayed WAL; the primary's double write buffer cannot "
+							 "substitute for them. Set io_torn_pages_protection = "
+							 "\"full_pages\" (with \"full_page_writes\" enabled) on the "
+							 "primary and run CHECKPOINT there, or take the backup on "
+							 "the primary.")));
 
 
 		LWLockAcquire(ControlFileLock, LW_SHARED);

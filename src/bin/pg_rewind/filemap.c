@@ -132,6 +132,16 @@ static const char *const excludeDirContents[] =
 	/* Contents removed on startup, see dsm_cleanup_for_mmap(). */
 	"pg_dynshmem",				/* defined as PG_DYNSHMEM_DIR */
 
+	/*
+	 * The double write buffer ring is local to an instance: its slots are
+	 * page copies of that cluster's own in-flight writes.  Excluding it keeps
+	 * the source's ring off the target and, because decide_file_action()
+	 * removes excluded paths that exist in the target, also wipes the
+	 * target's own ring — the rewound cluster cold-starts a fresh one, see
+	 * DWBStartup().
+	 */
+	"pg_dwb",					/* defined as DWB_DIR */
+
 	/* Contents removed on startup, see AsyncShmemInit(). */
 	"pg_notify",
 
@@ -706,6 +716,18 @@ decide_file_action(file_entry_t *entry)
 	 * all the other files.
 	 */
 	if (strcmp(path, XLOG_CONTROL_FILE) == 0)
+		return FILE_ACTION_NONE;
+
+	/*
+	 * Never touch the pg_dwb entry itself: either side may have it as a plain
+	 * directory, as a symlink, or (before its first double_writes startup)
+	 * not at all, and the server (re)creates it lazily, see DWBCreateRing().
+	 * Its contents match the exclusion filters and are removed from the
+	 * target below.  The target's entry and ring contents are validated up
+	 * front by checkTargetDwb() before the traversal; the source's entry
+	 * needs no validation, its ring is never used.
+	 */
+	if (strcmp(path, "pg_dwb") == 0)
 		return FILE_ACTION_NONE;
 
 	/* Skip macOS system files */

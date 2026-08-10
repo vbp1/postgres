@@ -29,6 +29,7 @@
 
 #include "access/xlogprefetcher.h"
 #include "access/xlogreader.h"
+#include "access/xlogwarm.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "commands/dbcommands_xlog.h"
@@ -74,6 +75,16 @@ int			recovery_prefetch = RECOVERY_PREFETCH_TRY;
 #else
 #define RecoveryPrefetchEnabled() false
 #endif
+
+/*
+ * The lookahead machinery — decoding ahead, the relation filters, the
+ * distance logic — serves two consumers now, and runs if either wants it.
+ * The warm pool wants it whenever it is configured: it does not issue
+ * kernel advice, so neither USE_PREFETCH nor maintenance_io_concurrency has
+ * any say over it.
+ */
+#define RecoveryLookaheadEnabled() \
+		(RecoveryPrefetchEnabled() || XLogWarmPoolActive())
 
 static int	XLogPrefetchReconfigureCount = 0;
 
@@ -286,7 +297,7 @@ lrq_complete_lsn(LsnReadQueue *lrq, XLogRecPtr lsn)
 		if (lrq->tail == lrq->size)
 			lrq->tail = 0;
 	}
-	if (RecoveryPrefetchEnabled())
+	if (RecoveryLookaheadEnabled())
 		lrq_prefetch(lrq);
 }
 
@@ -355,6 +366,35 @@ XLogPrefetchIncrement(pg_atomic_uint64 *counter)
 }
 
 /*
+ * Increment a counter that more than one process writes.
+ *
+ * The plain increment above belongs to the startup process alone and is a
+ * read followed by a write, which several writers would lose counts to.  The
+ * replay warm pool has as many writers as it has workers, so it uses this.
+ */
+static inline void
+XLogPrefetchIncrementShared(pg_atomic_uint64 *counter)
+{
+	pg_atomic_fetch_add_u64(counter, 1);
+}
+
+/*
+ * Record what the warm pool found when it served a request: a block already
+ * in a buffer, or one it had to read.
+ */
+void
+XLogPrefetchCountHit(void)
+{
+	XLogPrefetchIncrementShared(&SharedStats->hit);
+}
+
+void
+XLogPrefetchCountPrefetch(void)
+{
+	XLogPrefetchIncrementShared(&SharedStats->prefetch);
+}
+
+/*
  * Create a prefetcher that is ready to begin prefetching blocks referenced by
  * WAL records.
  */
@@ -389,6 +429,9 @@ XLogPrefetcherAllocate(XLogReaderState *reader)
 void
 XLogPrefetcherFree(XLogPrefetcher *prefetcher)
 {
+	/* the decoded records go away with the reader, so must their requests */
+	XLogWarmCancelAll();
+
 	lrq_free(prefetcher->streaming_read);
 	hash_destroy(prefetcher->filter_table);
 	pfree(prefetcher);
@@ -503,11 +546,11 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			}
 
 			/*
-			 * If prefetching is disabled, we don't need to analyze the record
-			 * or issue any prefetches.  We just need to cause one record to
-			 * be decoded.
+			 * If neither the advice nor the warm pool wants blocks, we don't
+			 * need to analyze the record or issue any prefetches.  We just
+			 * need to cause one record to be decoded.
 			 */
-			if (!RecoveryPrefetchEnabled())
+			if (!RecoveryLookaheadEnabled())
 			{
 				*lsn = InvalidXLogRecPtr;
 				return LRQ_NEXT_NO_IO;
@@ -763,6 +806,41 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				return LRQ_NEXT_NO_IO;
 			}
 
+			/*
+			 * With the warm pool running, a miss is handed to a worker
+			 * instead of being turned into kernel advice: the worker reads
+			 * the page into a shared buffer, which is what replay actually
+			 * needs, and none of that work lands on this process.
+			 */
+			if (XLogWarmPoolActive())
+			{
+				uint64		request_id;
+				int			slot_no;
+
+				/*
+				 * Whether the block is already in a buffer is a question with
+				 * a hash lookup under a partition lock behind it, and three
+				 * references in four answer yes.  Asking it here spends that
+				 * lookup in the one process replay cannot do without, so the
+				 * question goes to the pool along with the block: a worker
+				 * asks it, hands back whichever buffer the answer names, and
+				 * counts it (XLogWarmDoOne()).  Replay ends up with the same
+				 * hint, produced beside it instead of by it.
+				 */
+				slot_no = XLogWarmPublish(block->rlocator, block->forknum,
+										  block->blkno, &request_id);
+				if (slot_no == XLOGWARM_NO_SLOT)
+				{
+					/* pool behind: replay will read this block itself */
+					return LRQ_NEXT_NO_IO;
+				}
+
+				block->warm_slot = slot_no;
+				block->warm_request = request_id;
+				block->prefetch_buffer = InvalidBuffer;
+				return LRQ_NEXT_IO;
+			}
+
 			/* Try to initiate prefetching. */
 			result = PrefetchSharedBuffer(reln, block->forknum, block->blkno);
 			if (BufferIsValid(result.recent_buffer))
@@ -961,6 +1039,13 @@ XLogPrefetcherIsFiltered(XLogPrefetcher *prefetcher, RelFileLocator rlocator,
 void
 XLogPrefetcherBeginRead(XLogPrefetcher *prefetcher, XLogRecPtr recPtr)
 {
+	/*
+	 * This will forget about any in-flight IO, so the requests those decoded
+	 * records referred to must be withdrawn: nobody will ever collect them,
+	 * and slots nobody collects would eventually fill the ring.
+	 */
+	XLogWarmCancelAll();
+
 	/* This will forget about any in-flight IO. */
 	prefetcher->reconfigure_count--;
 
@@ -995,7 +1080,21 @@ XLogPrefetcherReadRecord(XLogPrefetcher *prefetcher, char **errmsg)
 		if (prefetcher->streaming_read)
 			lrq_free(prefetcher->streaming_read);
 
-		if (RecoveryPrefetchEnabled())
+		if (XLogWarmPoolActive())
+		{
+			/*
+			 * The pool's ring is what bounds requests in flight, and it is
+			 * sized at server start: maintenance_io_concurrency can be raised
+			 * at runtime and must not be able to push the lookahead past the
+			 * ring, which would only produce requests that get dropped for
+			 * want of a slot.
+			 */
+			max_inflight = Max(replay_warm_queue_size / 2, 1);
+			max_distance = Min(max_inflight * XLOGPREFETCHER_DISTANCE_MULTIPLIER,
+							   replay_warm_queue_size);
+			max_distance = Max(max_distance, max_inflight);
+		}
+		else if (RecoveryPrefetchEnabled())
 		{
 			Assert(maintenance_io_concurrency > 0);
 			max_inflight = maintenance_io_concurrency;
@@ -1055,6 +1154,28 @@ XLogPrefetcherReadRecord(XLogPrefetcher *prefetcher, char **errmsg)
 	 * XLogRecXXX() macros.
 	 */
 	Assert(record == prefetcher->reader->record);
+
+	/*
+	 * Collect whatever the warm pool managed to read for this record.  A
+	 * buffer collected here is only a hint, exactly like the one the cache
+	 * lookup above leaves behind, and XLogReadBufferExtended() validates it;
+	 * an unanswered request just leaves replay to read the block itself.
+	 */
+	if (XLogWarmPoolActive())
+	{
+		for (int block_id = 0; block_id <= record->max_block_id; block_id++)
+		{
+			DecodedBkpBlock *block = &record->blocks[block_id];
+
+			if (!block->in_use || block->warm_slot == XLOGWARM_NO_SLOT)
+				continue;
+
+			block->prefetch_buffer = XLogWarmCollect(block->warm_slot,
+													 block->warm_request);
+			block->warm_hint = BufferIsValid(block->prefetch_buffer);
+			block->warm_slot = XLOGWARM_NO_SLOT;
+		}
+	}
 
 	/*
 	 * If maintenance_io_concurrency is set very low, we might have started

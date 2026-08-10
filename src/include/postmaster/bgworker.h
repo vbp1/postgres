@@ -114,6 +114,9 @@ typedef struct BackgroundWorkerHandle BackgroundWorkerHandle;
 /* Register a new bgworker during shared_preload_libraries */
 extern void RegisterBackgroundWorker(BackgroundWorker *worker);
 
+/* How many static bgworkers have been registered so far (postmaster only) */
+extern int	GetNumRegisteredBackgroundWorkers(void);
+
 /* Register a new bgworker from a regular backend */
 extern bool RegisterDynamicBackgroundWorker(BackgroundWorker *worker,
 											BackgroundWorkerHandle **handle);

@@ -21,6 +21,8 @@
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
+#include "access/xlogwarm.h"
+#include "storage/dwb.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -123,6 +125,15 @@ static const struct
 	},
 	{
 		"ApplyLauncherMain", ApplyLauncherMain
+	},
+	{
+		"DWBRetireWorkerMain", DWBRetireWorkerMain
+	},
+	{
+		"DWBCleanerWorkerMain", DWBCleanerWorkerMain
+	},
+	{
+		"XLogWarmWorkerMain", XLogWarmWorkerMain
 	},
 	{
 		"ApplyWorkerMain", ApplyWorkerMain
@@ -936,11 +947,27 @@ BackgroundWorkerUnblockSignals(void)
  * function of a module library that's loaded by shared_preload_libraries;
  * otherwise it will have no effect.
  */
+/* static background workers registered so far (against max_worker_processes) */
+static int	numworkers = 0;
+
+/*
+ * Report how many static background workers have been registered so far.
+ *
+ * RegisterBackgroundWorker only LOGs when the limit is exceeded, so an
+ * in-core pool registered late in startup (after the logical replication
+ * launcher) uses this to verify that its workers actually fit and to fail
+ * loudly otherwise.
+ */
+int
+GetNumRegisteredBackgroundWorkers(void)
+{
+	return numworkers;
+}
+
 void
 RegisterBackgroundWorker(BackgroundWorker *worker)
 {
 	RegisteredBgWorker *rw;
-	static int	numworkers = 0;
 
 	/*
 	 * Static background workers can only be registered in the postmaster
@@ -997,7 +1024,7 @@ RegisterBackgroundWorker(BackgroundWorker *worker)
 	 * towards the MAX_BACKENDS limit elsewhere.  For now, it doesn't seem
 	 * important to relax this restriction.
 	 */
-	if (++numworkers > max_worker_processes)
+	if (numworkers >= max_worker_processes)
 	{
 		ereport(LOG,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
@@ -1030,6 +1057,12 @@ RegisterBackgroundWorker(BackgroundWorker *worker)
 	rw->rw_terminate = false;
 
 	dlist_push_head(&BackgroundWorkerList, &rw->rw_lnode);
+
+	/*
+	 * Count only successful registrations, so that
+	 * GetNumRegisteredBackgroundWorkers() reflects the actual list.
+	 */
+	numworkers++;
 }
 
 /*

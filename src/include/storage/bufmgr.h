@@ -201,6 +201,9 @@ extern PGDLLIMPORT int32 *LocalRefCount;
 /*
  * prototypes for functions in bufmgr.c
  */
+extern Buffer LookupSharedBuffer(struct SMgrRelationData *smgr_reln,
+								 ForkNumber forkNum,
+								 BlockNumber blockNum);
 extern PrefetchBufferResult PrefetchSharedBuffer(struct SMgrRelationData *smgr_reln,
 												 ForkNumber forkNum,
 												 BlockNumber blockNum);

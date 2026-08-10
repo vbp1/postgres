@@ -22,10 +22,48 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	1800
+#define PG_CONTROL_VERSION	1802
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
+
+/*
+ * The torn-page protection mechanism (GUC io_torn_pages_protection).  Like
+ * wal_level, the value in force on the WAL-generating server is a protocol
+ * fact: it decides whether the WAL can carry full page images at all (under
+ * "full_pages" the legacy full_page_writes GUC still chooses whether it
+ * actually does), so it is recorded in pg_control and in
+ * XLOG_PARAMETER_CHANGE records for replay to track.  Defined here rather
+ * than in storage/dwb.h so that frontend code reading pg_control can use it.
+ *
+ * The numeric values are stored on disk and in WAL; never renumber the
+ * members.  Keep the names in sync with the GUC option list in
+ * guc_tables.c.
+ */
+typedef enum
+{
+	DWB_PROTECT_OFF = 0,
+	DWB_PROTECT_FULL_PAGES = 1,
+	DWB_PROTECT_DOUBLE_WRITES = 2,
+} DWBTornPageProtection;
+
+/* GUC-spelling name of a DWBTornPageProtection value, for messages */
+static inline const char *
+DWBProtectionModeName(int mode)
+{
+	/* the cast keeps -Wswitch honest about newly added members */
+	switch ((DWBTornPageProtection) mode)
+	{
+		case DWB_PROTECT_OFF:
+			return "off";
+		case DWB_PROTECT_FULL_PAGES:
+			return "full_pages";
+		case DWB_PROTECT_DOUBLE_WRITES:
+			return "double_writes";
+	}
+	/* garbage read from disk or WAL must not turn into UB */
+	return "unrecognized";
+}
 
 /*
  * Body of CheckPoint XLOG records.  This is declared here because we keep
@@ -176,6 +214,7 @@ typedef struct ControlFileData
 	 * or hot standby.
 	 */
 	int			wal_level;
+	int			io_torn_pages_protection;	/* DWBTornPageProtection */
 	bool		wal_log_hints;
 	int			MaxConnections;
 	int			max_worker_processes;

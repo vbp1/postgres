@@ -17,11 +17,13 @@
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/dwb.h"
 
 BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
+WritebackContext DwbWritebackContext;
 CkptSortItem *CkptBufferIds;
 
 
@@ -150,6 +152,13 @@ BufferManagerShmemInit(void)
 	/* Initialize per-backend file flush context */
 	WritebackContextInit(&BackendWritebackContext,
 						 &backend_flush_after);
+
+	/*
+	 * The double write buffer paces the writeback of the pages it staged with
+	 * a parameter of its own, so that the hint it wants started before a
+	 * batch retires does not turn into one syscall per page in every backend.
+	 */
+	WritebackContextInit(&DwbWritebackContext, &dwb_writeback_after);
 }
 
 /*

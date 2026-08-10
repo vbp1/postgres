@@ -86,9 +86,9 @@ do_syncfs(const char *path)
  * Synchronize PGDATA and all its contents.
  *
  * We sync regular files and directories wherever they are, but we follow
- * symlinks only for pg_wal (or pg_xlog) and immediately under pg_tblspc.
- * Other symlinks are presumed to point at files we're not responsible for
- * syncing, and might not have privileges to write at all.
+ * symlinks only for pg_wal (or pg_xlog), pg_dwb and immediately under
+ * pg_tblspc.  Other symlinks are presumed to point at files we're not
+ * responsible for syncing, and might not have privileges to write at all.
  *
  * serverVersion indicates the version of the server to be sync'd.
  *
@@ -102,12 +102,15 @@ sync_pgdata(const char *pg_data,
 			bool sync_data_files)
 {
 	bool		xlog_is_symlink;
+	bool		dwb_is_symlink;
 	char		pg_wal[MAXPGPATH];
+	char		pg_dwb[MAXPGPATH];
 	char		pg_tblspc[MAXPGPATH];
 
 	/* handle renaming of pg_xlog to pg_wal in post-10 clusters */
 	snprintf(pg_wal, MAXPGPATH, "%s/%s", pg_data,
 			 serverVersion < MINIMUM_VERSION_FOR_PG_WAL ? "pg_xlog" : "pg_wal");
+	snprintf(pg_dwb, MAXPGPATH, "%s/%s", pg_data, "pg_dwb");
 	snprintf(pg_tblspc, MAXPGPATH, "%s/%s", pg_data, PG_TBLSPC_DIR);
 
 	/*
@@ -123,6 +126,25 @@ sync_pgdata(const char *pg_data,
 			pg_log_error("could not stat file \"%s\": %m", pg_wal);
 		else if (S_ISLNK(st.st_mode))
 			xlog_is_symlink = true;
+	}
+
+	/*
+	 * Likewise for the double write buffer ring.  Unlike pg_wal, pg_dwb is
+	 * created lazily at the first double_writes startup, so its absence is
+	 * normal and not worth a complaint; any other lstat() failure is.
+	 */
+	dwb_is_symlink = false;
+
+	{
+		struct stat st;
+
+		if (lstat(pg_dwb, &st) < 0)
+		{
+			if (errno != ENOENT)
+				pg_log_error("could not stat file \"%s\": %m", pg_dwb);
+		}
+		else if (S_ISLNK(st.st_mode))
+			dwb_is_symlink = true;
 	}
 
 	switch (sync_method)
@@ -141,8 +163,9 @@ sync_pgdata(const char *pg_data,
 				 * On Linux, we don't have to open every single file one by
 				 * one.  We can use syncfs() to sync whole filesystems.  We
 				 * only expect filesystem boundaries to exist where we
-				 * tolerate symlinks, namely pg_wal and the tablespaces, so we
-				 * call syncfs() for each of those directories.
+				 * tolerate symlinks, namely pg_wal, pg_dwb and the
+				 * tablespaces, so we call syncfs() for each of those
+				 * directories.
 				 */
 
 				/* Sync the top level pgdata directory. */
@@ -181,6 +204,10 @@ sync_pgdata(const char *pg_data,
 				/* If pg_wal is a symlink, process that too. */
 				if (xlog_is_symlink)
 					do_syncfs(pg_wal);
+
+				/* Likewise for a symlinked double write buffer ring. */
+				if (dwb_is_symlink)
+					do_syncfs(pg_dwb);
 #endif							/* HAVE_SYNCFS */
 			}
 			break;
@@ -200,6 +227,8 @@ sync_pgdata(const char *pg_data,
 				walkdir(pg_data, pre_sync_fname, false, exclude_dir);
 				if (xlog_is_symlink)
 					walkdir(pg_wal, pre_sync_fname, false, NULL);
+				if (dwb_is_symlink)
+					walkdir(pg_dwb, pre_sync_fname, false, NULL);
 				if (sync_data_files)
 					walkdir(pg_tblspc, pre_sync_fname, true, NULL);
 #endif
@@ -208,15 +237,17 @@ sync_pgdata(const char *pg_data,
 				 * Now we do the fsync()s in the same order.
 				 *
 				 * The main call ignores symlinks, so in addition to specially
-				 * processing pg_wal if it's a symlink, pg_tblspc has to be
-				 * visited separately with process_symlinks = true.  Note that
-				 * if there are any plain directories in pg_tblspc, they'll
-				 * get fsync'd twice. That's not an expected case so we don't
-				 * worry about optimizing it.
+				 * processing pg_wal and pg_dwb if they are symlinks,
+				 * pg_tblspc has to be visited separately with
+				 * process_symlinks = true.  Note that if there are any plain
+				 * directories in pg_tblspc, they'll get fsync'd twice. That's
+				 * not an expected case so we don't worry about optimizing it.
 				 */
 				walkdir(pg_data, fsync_fname, false, exclude_dir);
 				if (xlog_is_symlink)
 					walkdir(pg_wal, fsync_fname, false, NULL);
+				if (dwb_is_symlink)
+					walkdir(pg_dwb, fsync_fname, false, NULL);
 				if (sync_data_files)
 					walkdir(pg_tblspc, fsync_fname, true, NULL);
 

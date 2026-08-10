@@ -32,6 +32,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "access/xlogwarm.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -1852,6 +1853,14 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	ReplicationSlotsDropDBSlots(db_id);
 
 	/*
+	 * As in dbase_redo(): hold the replay warm pool off until the files are
+	 * gone.  A worker that was still finishing a read when recovery ended
+	 * could otherwise put a page of this database back into the buffer pool
+	 * after the drop below (see XLogWarmDropBegin()).
+	 */
+	XLogWarmDropBegin();
+
+	/*
 	 * Drop pages for this database that are in the shared buffer cache. This
 	 * is important to ensure that no remaining backend tries to write out a
 	 * dirty buffer to the dead database later...
@@ -1879,6 +1888,8 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * Remove all tablespace subdirs belonging to the database.
 	 */
 	remove_dbtablespaces(db_id);
+
+	XLogWarmDropEnd();
 
 	/*
 	 * Close pg_database, but keep lock till commit.
@@ -3431,6 +3442,13 @@ dbase_redo(XLogReaderState *record)
 		/* Drop any database-specific replication slots */
 		ReplicationSlotsDropDBSlots(xlrec->db_id);
 
+		/*
+		 * Keep the replay warm pool away until the directories are gone, so a
+		 * worker cannot load a page of this database into buffers behind the
+		 * drop below (see XLogWarmDropBegin()).
+		 */
+		XLogWarmDropBegin();
+
 		/* Drop pages for this database that are in the shared buffer cache */
 		DropDatabaseBuffers(xlrec->db_id);
 
@@ -3454,6 +3472,8 @@ dbase_redo(XLogReaderState *record)
 								dst_path)));
 			pfree(dst_path);
 		}
+
+		XLogWarmDropEnd();
 
 		if (InHotStandby)
 		{

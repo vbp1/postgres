@@ -26,6 +26,7 @@
 #include "pgstat.h"
 #include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
+#include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "storage/md.h"
@@ -407,6 +408,16 @@ ProcessSyncRequests(void)
 			 * DROP DATABASE likewise has to tell us to forget fsync requests
 			 * before it starts deletions.
 			 */
+
+			/*
+			 * This fsync also retires double write buffer batches: snapshot
+			 * the segment's DWB back-references now — bits published while
+			 * the fsync runs may cover writes it missed — and decrement
+			 * them once the segment is durable (or turns out dropped, which
+			 * makes its data-file writes moot).
+			 */
+			DWBSegmentFsyncBegin(&entry->tag);
+
 			for (failures = 0; !entry->canceled; failures++)
 			{
 				char		path[MAXPGPATH];
@@ -458,6 +469,9 @@ ProcessSyncRequests(void)
 				AbsorbSyncRequests();
 				absorb_counter = FSYNCS_PER_ABSORB; /* might as well... */
 			}					/* end retry loop */
+
+			/* durable or dropped either way: retire DWB references */
+			(void) DWBSegmentFsyncEnd(true);
 		}
 
 		/* We are done with this entry, remove it */

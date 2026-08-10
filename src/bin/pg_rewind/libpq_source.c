@@ -132,9 +132,12 @@ init_libpq_conn(PGconn *conn)
 	PQclear(res);
 
 	/*
-	 * Also check that full_page_writes is enabled.  We can get torn pages if
-	 * a page is modified while we read it with pg_read_binary_file(), and we
-	 * rely on full page images to fix them.
+	 * Also check that the source server actually writes full page images. We
+	 * can get torn pages if a page is modified while we read it with
+	 * pg_read_binary_file(), and we rely on full page images to fix them.
+	 * This GUC only has its usual meaning under io_torn_pages_protection =
+	 * "full_pages"; the other modes are refused outright based on the
+	 * source's pg_control (see the up-front check in pg_rewind.c).
 	 */
 	str = run_simple_query(conn, "SHOW full_page_writes");
 	if (strcmp(str, "on") != 0)

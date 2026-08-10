@@ -45,6 +45,7 @@
 #include "replication/walsender.h"
 #include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
+#include "storage/dwb.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -663,6 +664,12 @@ BaseInit(void)
 	 * drop ephemeral slots, which in turn triggers stats reporting.
 	 */
 	ReplicationSlotInitialize();
+
+	/*
+	 * Initialize the double write buffer's process-wide state, so that a
+	 * process holding staged writes when it exits gives them back.
+	 */
+	DWBInitBackend();
 }
 
 

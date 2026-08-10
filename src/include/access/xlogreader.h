@@ -116,6 +116,9 @@ typedef struct XLogReaderRoutine
 
 #define XL_ROUTINE(...) &(XLogReaderRoutine){__VA_ARGS__}
 
+/* a block that was not published to the replay warm pool */
+#define XLOGWARM_NO_SLOT		(-1)
+
 typedef struct
 {
 	/* Is this block ref in use? */
@@ -128,6 +131,23 @@ typedef struct
 
 	/* Prefetching workspace. */
 	Buffer		prefetch_buffer;
+
+	/*
+	 * Warm pool workspace: the slot this block was published to and the
+	 * request it was published as, so the answer can be told apart from a
+	 * later request that recycled the slot.  XLOGWARM_NO_SLOT when the block
+	 * was never published (which is always the case in frontend code).
+	 */
+	int			warm_slot;
+	uint64		warm_request;
+
+	/*
+	 * True when prefetch_buffer above is an answer collected from the pool
+	 * rather than a buffer the cache lookup happened to find.  Only the
+	 * pool's own answers say anything about the pool when they turn out to be
+	 * stale.
+	 */
+	bool		warm_hint;
 
 	/* copy of the fork_flags field from the XLogRecordBlockHeader */
 	uint8		flags;
