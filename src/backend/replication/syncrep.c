@@ -193,6 +193,17 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 	Assert(dlist_node_is_detached(&MyProc->syncRepLinks));
 	Assert(WalSndCtl != NULL);
 
+	/*
+	 * A published watermark that already covers this LSN says a valid quorum
+	 * acknowledged it, which is the same answer the check below the lock
+	 * would give.  The watermark only ever moves forward, so a stale read can
+	 * only send us to take the lock for nothing, never past a wait we owe.
+	 * How often this exit fires depends on the wait mode: it needs the
+	 * acknowledgement to have arrived before the committer got here.
+	 */
+	if (lsn <= (XLogRecPtr) pg_atomic_read_u64(&WalSndCtl->lsn_published[mode]))
+		return;
+
 	LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
 	Assert(MyProc->syncRepState == SYNC_REP_NOT_WAITING);
 
@@ -565,18 +576,24 @@ SyncRepReleaseWaiters(void)
 	if (WalSndCtl->lsn[SYNC_REP_WAIT_WRITE] < writePtr)
 	{
 		WalSndCtl->lsn[SYNC_REP_WAIT_WRITE] = writePtr;
+		pg_atomic_write_u64(&WalSndCtl->lsn_published[SYNC_REP_WAIT_WRITE],
+							(uint64) writePtr);
 		numwrite = SyncRepWakeQueue(false, SYNC_REP_WAIT_WRITE,
 									wakelist, &nwake);
 	}
 	if (WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH] < flushPtr)
 	{
 		WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH] = flushPtr;
+		pg_atomic_write_u64(&WalSndCtl->lsn_published[SYNC_REP_WAIT_FLUSH],
+							(uint64) flushPtr);
 		numflush = SyncRepWakeQueue(false, SYNC_REP_WAIT_FLUSH,
 									wakelist, &nwake);
 	}
 	if (WalSndCtl->lsn[SYNC_REP_WAIT_APPLY] < applyPtr)
 	{
 		WalSndCtl->lsn[SYNC_REP_WAIT_APPLY] = applyPtr;
+		pg_atomic_write_u64(&WalSndCtl->lsn_published[SYNC_REP_WAIT_APPLY],
+							(uint64) applyPtr);
 		numapply = SyncRepWakeQueue(false, SYNC_REP_WAIT_APPLY,
 									wakelist, &nwake);
 	}
