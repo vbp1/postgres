@@ -84,6 +84,7 @@
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc_hooks.h"
+#include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/wait_event.h"
 
@@ -100,7 +101,9 @@ static int	SyncRepWaitMode = SYNC_REP_NO_WAIT;
 
 static void SyncRepQueueInsert(int mode);
 static void SyncRepCancelWait(void);
-static int	SyncRepWakeQueue(bool all, int mode);
+static PGPROC **SyncRepWakeList(void);
+static int	SyncRepWakeQueue(bool all, int mode,
+							 PGPROC **wakelist, int *nwake);
 
 static bool SyncRepGetSyncRecPtr(XLogRecPtr *writePtr,
 								 XLogRecPtr *flushPtr,
@@ -491,6 +494,8 @@ SyncRepReleaseWaiters(void)
 	int			numwrite = 0;
 	int			numflush = 0;
 	int			numapply = 0;
+	PGPROC	  **wakelist;
+	int			nwake = 0;
 
 	/*
 	 * If this WALSender is serving a standby that is not on the list of
@@ -512,6 +517,8 @@ SyncRepReleaseWaiters(void)
 	 * We're a potential sync standby. Release waiters if there are enough
 	 * sync standbys and we are considered as sync.
 	 */
+	wakelist = SyncRepWakeList();
+
 	LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
 
 	/*
@@ -560,20 +567,37 @@ SyncRepReleaseWaiters(void)
 	if (WalSndCtl->lsn[SYNC_REP_WAIT_WRITE] < writePtr)
 	{
 		WalSndCtl->lsn[SYNC_REP_WAIT_WRITE] = writePtr;
-		numwrite = SyncRepWakeQueue(false, SYNC_REP_WAIT_WRITE);
+		numwrite = SyncRepWakeQueue(false, SYNC_REP_WAIT_WRITE,
+									wakelist, &nwake);
 	}
 	if (WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH] < flushPtr)
 	{
 		WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH] = flushPtr;
-		numflush = SyncRepWakeQueue(false, SYNC_REP_WAIT_FLUSH);
+		numflush = SyncRepWakeQueue(false, SYNC_REP_WAIT_FLUSH,
+									wakelist, &nwake);
 	}
 	if (WalSndCtl->lsn[SYNC_REP_WAIT_APPLY] < applyPtr)
 	{
 		WalSndCtl->lsn[SYNC_REP_WAIT_APPLY] = applyPtr;
-		numapply = SyncRepWakeQueue(false, SYNC_REP_WAIT_APPLY);
+		numapply = SyncRepWakeQueue(false, SYNC_REP_WAIT_APPLY,
+									wakelist, &nwake);
 	}
 
 	LWLockRelease(SyncRepLock);
+
+	/*
+	 * Wake the released backends now that the lock is down.  Each latch is a
+	 * kill() for a sleeping proc, and running one per released commit inside
+	 * the exclusive section makes every committer wait for those syscalls.
+	 * The procs below are off the queue with their state already complete, so
+	 * nothing here needs the lock's protection.  Nothing here can error out
+	 * either: only this process dying outright could leave a released proc
+	 * completed but unlatched, and the in-lock SetLatch had that same window.
+	 * A proc that noticed its state on its own and moved on, even into a new
+	 * wait, gets a spurious latch set, which every latch sleeper tolerates.
+	 */
+	for (int i = 0; i < nwake; i++)
+		SetLatch(&(wakelist[i]->procLatch));
 
 	elog(DEBUG3, "released %d procs up to write %X/%08X, %d procs up to flush %X/%08X, %d procs up to apply %X/%08X",
 		 numwrite, LSN_FORMAT_ARGS(writePtr),
@@ -903,15 +927,37 @@ SyncRepGetStandbyPriority(void)
 }
 
 /*
+ * Return the list a release collects the procs to latch into, allocating it
+ * the first time this process releases anybody.  It is sized for every
+ * backend to be waiting at once; a proc waits in at most one queue, so one
+ * list of that size is enough for a pass over all three.
+ */
+static PGPROC **
+SyncRepWakeList(void)
+{
+	static PGPROC **wakelist = NULL;
+
+	if (wakelist == NULL)
+		wakelist = (PGPROC **)
+			MemoryContextAlloc(TopMemoryContext,
+							   MaxBackends * sizeof(PGPROC *));
+	return wakelist;
+}
+
+/*
  * Walk the specified queue from head.  Set the state of any backends that
- * need to be woken, remove them from the queue, and then wake them.
- * Pass all = true to wake whole queue; otherwise, just wake up to
+ * need to be woken and remove them from the queue; the procs to wake are
+ * appended to wakelist for the caller to latch once the lock is down.
+ * Pass all = true to release the whole queue; otherwise, just release up to
  * the walsender's LSN.
  *
- * The caller must hold SyncRepLock in exclusive mode.
+ * The caller must hold SyncRepLock in exclusive mode, and must set the
+ * latches itself after releasing it.  Unlink, barrier and state stay together
+ * in here: a waiter reads syncRepState without the lock and must never find
+ * itself completed while still on the queue.
  */
 static int
-SyncRepWakeQueue(bool all, int mode)
+SyncRepWakeQueue(bool all, int mode, PGPROC **wakelist, int *nwake)
 {
 	int			numprocs = 0;
 	dlist_mutable_iter iter;
@@ -948,10 +994,9 @@ SyncRepWakeQueue(bool all, int mode)
 		 */
 		proc->syncRepState = SYNC_REP_WAIT_COMPLETE;
 
-		/*
-		 * Wake only when we have set state and removed from queue.
-		 */
-		SetLatch(&(proc->procLatch));
+		/* the list is sized to every process that can ever queue here */
+		Assert(*nwake < MaxBackends);
+		wakelist[(*nwake)++] = proc;
 
 		numprocs++;
 	}
@@ -974,6 +1019,9 @@ SyncRepUpdateSyncStandbysDefined(void)
 	if (sync_standbys_defined !=
 		((WalSndCtl->sync_standbys_status & SYNC_STANDBY_DEFINED) != 0))
 	{
+		PGPROC	  **wakelist = SyncRepWakeList();
+		int			nwake = 0;
+
 		LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
 
 		/*
@@ -986,7 +1034,7 @@ SyncRepUpdateSyncStandbysDefined(void)
 			int			i;
 
 			for (i = 0; i < NUM_SYNC_REP_WAIT_MODE; i++)
-				SyncRepWakeQueue(true, i);
+				SyncRepWakeQueue(true, i, wakelist, &nwake);
 		}
 
 		/*
@@ -1000,6 +1048,10 @@ SyncRepUpdateSyncStandbysDefined(void)
 			(sync_standbys_defined ? SYNC_STANDBY_DEFINED : 0);
 
 		LWLockRelease(SyncRepLock);
+
+		/* wake the released backends now that the lock is down */
+		for (int i = 0; i < nwake; i++)
+			SetLatch(&(wakelist[i]->procLatch));
 	}
 	else if ((WalSndCtl->sync_standbys_status & SYNC_STANDBY_INIT) == 0)
 	{
