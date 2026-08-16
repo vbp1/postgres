@@ -16,6 +16,7 @@
 #include "lib/ilist.h"
 #include "nodes/nodes.h"
 #include "nodes/replnodes.h"
+#include "port/atomics.h"
 #include "replication/syncrep.h"
 #include "storage/condition_variable.h"
 #include "storage/shmem.h"
@@ -94,6 +95,16 @@ typedef struct
 	 * waitLSN that follows this value. Protected by SyncRepLock.
 	 */
 	XLogRecPtr	lsn[NUM_SYNC_REP_WAIT_MODE];
+
+	/*
+	 * An atomic mirror of lsn[], written right after it under SyncRepLock and
+	 * only ever forward.  A committer whose LSN this mirror already covers
+	 * was acknowledged by a valid quorum and has nothing to wait for, so it
+	 * reads this before taking SyncRepLock at all.  On platforms where a
+	 * 64-bit atomic read is not a plain load, this read is itself a
+	 * compare-and-exchange or a spinlock acquisition.
+	 */
+	pg_atomic_uint64 lsn_published[NUM_SYNC_REP_WAIT_MODE];
 
 	/*
 	 * Status of data related to the synchronous standbys.  Waiting backends
